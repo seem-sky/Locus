@@ -1,3 +1,13 @@
+/***************************************************************
+ * @Author         : seem.sky@gmail.com
+ * @Email          : seem.sky@gmail.com
+ * @Description    :
+ * @FilePath       : \locus_unity\Editor\LocusBridge.LuaGc.cs
+ * @Date           : 2026-05-26 16:40:44
+ * @LastEditTime   : 2026-05-26 16:52:30
+ * @LastEditors    : seem.sky@gmail.com seem.sky@gmail.com
+***************************************************************/
+
 using UnityEngine;
 using UnityEditor;
 
@@ -501,10 +511,10 @@ namespace Locus
                     };
                 }
 
+                string runtimeMessage = "";
                 object activeEnv = LuaGcBootstrap.ResolveEnv();
                 bool runtimeAvailable = activeEnv != null
-                    && XLuaGcReflection.TrySample(activeEnv, out _, out _, out string runtimeMessage);
-
+                    && XLuaGcReflection.TrySample(activeEnv, out _, out _, out runtimeMessage);
                 return new LuaGcMonitorStatusPayload
                 {
                     active = true,
