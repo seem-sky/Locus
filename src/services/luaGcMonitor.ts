@@ -61,7 +61,7 @@ export function luaGcMonitorStart(options?: {
   sessionId?: string;
   sampleIntervalMs?: number;
 }): Promise<LuaGcMonitorStatus> {
-  return ipcInvoke<LuaGcMonitorStatus>("lua_gc_monitor_start", options ?? {});
+  return ipcInvoke<LuaGcMonitorStatus>("lua_gc_monitor_start", options);
 }
 
 export function luaGcMonitorStop(reason?: string): Promise<LuaGcMonitorStatus> {
@@ -69,7 +69,7 @@ export function luaGcMonitorStop(reason?: string): Promise<LuaGcMonitorStatus> {
 }
 
 export function luaGcMonitorStatus(): Promise<LuaGcMonitorStatus> {
-  return ipcInvoke<LuaGcMonitorStatus>("lua_gc_monitor_status");
+  return ipcInvoke<LuaGcMonitorStatus>("lua_gc_monitor_status", {});
 }
 
 export function luaGcMonitorGetSamples(options?: {
