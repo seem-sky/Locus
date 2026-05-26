@@ -31,8 +31,8 @@ const activeTool = ref(tools[0].id);
     </div>
     <div class="perf-content">
       <component
+        v-if="activeTool && tools.find(t => t.id === activeTool)"
         :is="tools.find(t => t.id === activeTool)?.component"
-        v-if="activeTool === 'lua-gc'"
         :open="true"
         :show-close="false"
       />
@@ -107,5 +107,6 @@ const activeTool = ref(tools[0].id);
   min-height: 0;
   overflow: hidden;
   position: relative;
+  padding: 0 0 0 16px;
 }
 </style>
