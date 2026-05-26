@@ -40,7 +40,7 @@ export function useLuaGcMonitor() {
     try {
       status.value = await luaGcMonitorStatus();
     } catch (e) {
-      error.value = e instanceof Error ? e.message : String(e);
+      error.value = (e as { message?: string })?.message ?? String(e);
     }
   }
 
@@ -52,7 +52,7 @@ export function useLuaGcMonitor() {
       });
       samples.value = response.samples;
     } catch (e) {
-      error.value = e instanceof Error ? e.message : String(e);
+      error.value = (e as { message?: string })?.message ?? String(e);
     }
   }
 
@@ -60,7 +60,7 @@ export function useLuaGcMonitor() {
     try {
       analysis.value = await luaGcMonitorGetAnalysis(status.value?.sessionId);
     } catch (e) {
-      error.value = e instanceof Error ? e.message : String(e);
+      error.value = (e as { message?: string })?.message ?? String(e);
     }
   }
 
@@ -74,7 +74,7 @@ export function useLuaGcMonitor() {
       await refreshSamples();
       await refreshAnalysis();
     } catch (e) {
-      error.value = e instanceof Error ? e.message : String(e);
+      error.value = (e as { message?: string })?.message ?? String(e);
     } finally {
       loading.value = false;
     }
@@ -87,7 +87,7 @@ export function useLuaGcMonitor() {
       status.value = await luaGcMonitorStop("user");
       await refreshAnalysis();
     } catch (e) {
-      error.value = e instanceof Error ? e.message : String(e);
+      error.value = (e as { message?: string })?.message ?? String(e);
     } finally {
       loading.value = false;
     }
@@ -102,7 +102,7 @@ export function useLuaGcMonitor() {
       analysis.value = null;
       await refreshStatus();
     } catch (e) {
-      error.value = e instanceof Error ? e.message : String(e);
+      error.value = (e as { message?: string })?.message ?? String(e);
     } finally {
       loading.value = false;
     }
@@ -118,7 +118,7 @@ export function useLuaGcMonitor() {
       });
       return path;
     } catch (e) {
-      error.value = e instanceof Error ? e.message : String(e);
+      error.value = (e as { message?: string })?.message ?? String(e);
       return "";
     } finally {
       loading.value = false;
