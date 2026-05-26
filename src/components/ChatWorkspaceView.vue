@@ -19,6 +19,8 @@ import {
 import ChatView from "./ChatView.vue";
 import ThinkingPanel from "./ThinkingPanel.vue";
 import ChatSidebarPanel from "./ChatSidebarPanel.vue";
+import BaseButton from "./ui/BaseButton.vue";
+import LucideIcon from "./icons/LucideIcon.vue";
 
 type ChatLayoutMode = "auto" | "horizontal" | "vertical";
 type ResolvedChatLayoutMode = "horizontal" | "vertical";
@@ -42,7 +44,6 @@ const modelStore = useModelStore();
 const notificationStore = useNotificationStore();
 const projectStore = useProjectStore();
 const { skillItems } = useSkills();
-
 const workspaceRef = ref<HTMLElement | null>(null);
 const workspaceWidth = ref(0);
 const isVerticalLayout = computed(() => props.layoutMode === "vertical");
