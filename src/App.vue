@@ -185,6 +185,10 @@ const agentView = createLazyViewState(
   () => import("./components/AgentView.vue"),
   "loadAgentView",
 );
+const performanceView = createLazyViewState(
+  () => import("./components/PerformanceOptimizationView.vue"),
+  "loadPerformanceView",
+);
 const settingsView = createLazyViewState(
   () => import("./components/SettingsView.vue"),
   "loadSettingsView",
@@ -213,6 +217,10 @@ const viewPackageViewError = viewPackageView.error;
 const agentViewComponent = agentView.component;
 const agentViewLoading = agentView.loading;
 const agentViewError = agentView.error;
+
+const performanceViewComponent = performanceView.component;
+const performanceViewLoading = performanceView.loading;
+const performanceViewError = performanceView.error;
 
 const settingsViewComponent = settingsView.component;
 const settingsViewLoading = settingsView.loading;
@@ -246,6 +254,11 @@ watch(() => uiStore.viewMounted, (mounted) => {
 watch(() => uiStore.agentMounted, (mounted) => {
   if (!mounted) return;
   void agentView.ensureLoaded();
+}, { immediate: true });
+
+watch(() => uiStore.performanceMounted, (mounted) => {
+  if (!mounted) return;
+  void performanceView.ensureLoaded();
 }, { immediate: true });
 
 watch(() => uiStore.settingsMounted, (mounted) => {
@@ -732,6 +745,11 @@ watch(() => projectStore.workingDir, () => {
         >{{ t("app.tab.agent") }}</button>
         <button
           class="tab-item"
+          :class="{ active: uiStore.activeTab === 'performance' }"
+          @click="uiStore.setTab('performance')"
+        >{{ t("perf.tab.performance") }}</button>
+        <button
+          class="tab-item"
           :class="{ active: uiStore.activeTab === 'settings' }"
           @click="uiStore.setTab('settings')"
         >{{ t("app.tab.settings") }}</button>
@@ -925,6 +943,19 @@ watch(() => projectStore.workingDir, () => {
           :class="{ 'is-loading': agentViewLoading, 'is-error': !!agentViewError }"
         >
           {{ agentViewError || t("common.loading") }}
+        </div>
+
+        <component
+          :is="performanceViewComponent"
+          v-if="uiStore.performanceMounted && performanceViewComponent"
+          v-show="uiStore.activeTab === 'performance'"
+        />
+        <div
+          v-else-if="uiStore.performanceMounted && uiStore.activeTab === 'performance'"
+          class="tab-loading-state"
+          :class="{ 'is-loading': performanceViewLoading, 'is-error': !!performanceViewError }"
+        >
+          {{ performanceViewError || t("common.loading") }}
         </div>
 
         <component
