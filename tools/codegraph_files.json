@@ -1,0 +1,28 @@
+{
+  "description": "Show project file structure from the CodeGraph index. Useful to see which paths and languages are indexed.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "path": {
+        "type": "string",
+        "description": "Project root directory. Defaults to the current working directory when omitted."
+      },
+      "filter": {
+        "type": "string",
+        "description": "Only files under this directory"
+      },
+      "pattern": {
+        "type": "string",
+        "description": "Glob pattern to filter files"
+      },
+      "format": {
+        "type": "string",
+        "description": "Output format: tree, flat, or grouped (default tree)"
+      },
+      "maxDepth": {
+        "type": "integer",
+        "description": "Maximum directory depth for tree format"
+      }
+    }
+  }
+}

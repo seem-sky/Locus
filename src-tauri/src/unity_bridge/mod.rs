@@ -1,5 +1,6 @@
 mod capture;
 mod focus;
+pub mod lua_gc_monitor;
 mod plugin;
 mod transport;
 
@@ -18,6 +19,13 @@ pub use capture::{capture_viewport, UnityViewportCapture};
 pub use plugin::{
     check_plugin_status, emit_plugin_status, find_plugin_source_dir, install_or_update_plugin,
     plugin_install_root, plugin_skills_root, PluginStatus,
+};
+pub use lua_gc_monitor::{
+    analyze_samples, bind_workspace_project_path, clear_project_samples, lua_gc_monitor_export,
+    lua_gc_monitor_get_analysis, lua_gc_monitor_get_samples, lua_gc_monitor_start,
+    lua_gc_monitor_status, lua_gc_monitor_stop, register_lua_gc_monitor_listeners, LuaGcAlert,
+    LuaGcAnalysis, LuaGcMonitorGetSamplesRequest, LuaGcMonitorSamplesResponse,
+    LuaGcMonitorStartRequest, LuaGcMonitorStatus, LuaGcSample,
 };
 pub use transport::{
     send_message, send_message_with_timeout, send_message_without_timeout, set_event_app_handle,
@@ -1851,6 +1859,7 @@ pub async fn start_unity_monitor(
 ) {
     stop_unity_monitor(monitor).await;
     set_event_app_handle(app_handle.clone());
+    register_lua_gc_monitor_listeners(&app_handle);
 
     let pipe_name = get_pipe_name(&project_path);
     eprintln!(

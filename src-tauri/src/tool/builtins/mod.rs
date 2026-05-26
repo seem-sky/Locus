@@ -1,5 +1,7 @@
+mod codegraph;
 mod filesystem;
 mod knowledge;
+mod lua_gc_analyze;
 mod misc;
 mod search;
 mod shell;
@@ -24,10 +26,12 @@ pub fn register_all(registry: &mut ToolRegistry) {
     registry.register_builtin(misc::web_fetch());
     registry.register_builtin(misc::todowrite());
     registry.register_builtin(misc::graph_view());
+    codegraph::register_all(registry);
 
     registry.register_builtin(filesystem::list());
     registry.register_builtin(unity::unity_execute());
     registry.register_builtin(unity::unity_run_states());
+    registry.register_builtin(lua_gc_analyze::lua_gc_analyze());
     registry.register_builtin(unity::unity_capture_viewport());
     registry.register_builtin(unity::unity_recompile());
     registry.register_builtin(unity::unity_ref_search());

@@ -20,6 +20,7 @@ pub mod tools {
     pub const GRAPH_VIEW: &str = include_str!("../../tools/graph_view.json");
     pub const UNITY_EXECUTE: &str = include_str!("../../tools/unity_execute.json");
     pub const UNITY_RUN_STATES: &str = include_str!("../../tools/unity_run_states.json");
+    pub const LUA_GC_ANALYZE: &str = include_str!("../../tools/lua_gc_analyze.json");
     pub const UNITY_CAPTURE_VIEWPORT: &str =
         include_str!("../../tools/unity_capture_viewport.json");
     pub const UNITY_REF_SEARCH: &str = include_str!("../../tools/unity_ref_search.json");
@@ -52,6 +53,14 @@ pub mod tools {
     pub const CONFIG_QUERY: &str = include_str!("../../tools/config_query.json");
     pub const TOOL_LOAD: &str = include_str!("../../tools/tool_load.json");
     pub const TOOL_CALL: &str = include_str!("../../tools/tool_call.json");
+    pub const CODEGRAPH_SEARCH: &str = include_str!("../../tools/codegraph_search.json");
+    pub const CODEGRAPH_CONTEXT: &str = include_str!("../../tools/codegraph_context.json");
+    pub const CODEGRAPH_CALLERS: &str = include_str!("../../tools/codegraph_callers.json");
+    pub const CODEGRAPH_CALLEES: &str = include_str!("../../tools/codegraph_callees.json");
+    pub const CODEGRAPH_IMPACT: &str = include_str!("../../tools/codegraph_impact.json");
+    pub const CODEGRAPH_FILES: &str = include_str!("../../tools/codegraph_files.json");
+    pub const CODEGRAPH_STATUS: &str = include_str!("../../tools/codegraph_status.json");
+    pub const CODEGRAPH_SYNC: &str = include_str!("../../tools/codegraph_sync.json");
 }
 
 #[derive(serde::Deserialize)]
@@ -100,6 +109,7 @@ mod tests {
             ("graph_view", tools::GRAPH_VIEW),
             ("unity_execute", tools::UNITY_EXECUTE),
             ("unity_run_states", tools::UNITY_RUN_STATES),
+            ("lua_gc_analyze", tools::LUA_GC_ANALYZE),
             ("unity_capture_viewport", tools::UNITY_CAPTURE_VIEWPORT),
             ("unity_ref_search", tools::UNITY_REF_SEARCH),
             ("unity_asset_search", tools::UNITY_ASSET_SEARCH),
@@ -131,6 +141,14 @@ mod tests {
             ("config_query", tools::CONFIG_QUERY),
             ("tool_load", tools::TOOL_LOAD),
             ("tool_call", tools::TOOL_CALL),
+            ("codegraph_search", tools::CODEGRAPH_SEARCH),
+            ("codegraph_context", tools::CODEGRAPH_CONTEXT),
+            ("codegraph_callers", tools::CODEGRAPH_CALLERS),
+            ("codegraph_callees", tools::CODEGRAPH_CALLEES),
+            ("codegraph_impact", tools::CODEGRAPH_IMPACT),
+            ("codegraph_files", tools::CODEGRAPH_FILES),
+            ("codegraph_status", tools::CODEGRAPH_STATUS),
+            ("codegraph_sync", tools::CODEGRAPH_SYNC),
         ];
 
         for (name, json_str) in tool_prompts {

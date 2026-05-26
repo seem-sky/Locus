@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { onMounted, onUnmounted } from "vue";
+import { onMounted, onUnmounted, ref } from "vue";
+import { ChartNoAxesCombined } from "lucide";
 import { t } from "../i18n";
 import {
   activateUnityEmbedForInput,
@@ -10,6 +11,9 @@ import {
 import { useUnityAssetDropTarget } from "../composables/useUnityAssetDropTarget";
 import ChatWorkspaceView from "./ChatWorkspaceView.vue";
 import TopBannerHost from "./TopBannerHost.vue";
+import LuaGcMonitorPanel from "./LuaGcMonitorPanel.vue";
+import BaseButton from "./ui/BaseButton.vue";
+import LucideIcon from "./icons/LucideIcon.vue";
 
 withDefaults(defineProps<{
   bootstrapped?: boolean;
@@ -18,6 +22,8 @@ withDefaults(defineProps<{
   bootstrapped: false,
   bootstrapError: null,
 });
+
+const luaGcPanelOpen = ref(false);
 
 const ACTIVATION_ALLOWED_SELECTOR = [
   "input",
@@ -232,6 +238,14 @@ onUnmounted(() => {
   >
     <TopBannerHost />
 
+    <div v-if="bootstrapped && !bootstrapError" class="unity-session-toolbar">
+      <BaseButton class="unity-lua-gc-btn" @click="luaGcPanelOpen = true">
+        <LucideIcon :icon="ChartNoAxesCombined" :size="14" />
+        {{ t("luaGc.openPanel") }}
+      </BaseButton>
+    </div>
+    <LuaGcMonitorPanel :open="luaGcPanelOpen" @close="luaGcPanelOpen = false" />
+
     <div v-if="bootstrapError" class="unity-session-state is-error">
       {{ bootstrapError }}
     </div>
@@ -249,6 +263,17 @@ onUnmounted(() => {
 </template>
 
 <style scoped>
+.unity-session-toolbar {
+  display: flex;
+  justify-content: flex-end;
+  padding: 6px 10px 0;
+  pointer-events: auto;
+}
+
+.unity-lua-gc-btn {
+  font-size: 12px;
+}
+
 .unity-session-view {
   display: flex;
   flex-direction: column;

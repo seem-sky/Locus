@@ -1,0 +1,21 @@
+{
+  "description": "Find all functions or methods that call a specific symbol (upstream callers). Use before editing a function, class, or method to assess blast radius.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "target": {
+        "type": "string",
+        "description": "Symbol name to look up (e.g. ToolRegistry::execute)"
+      },
+      "path": {
+        "type": "string",
+        "description": "Project root directory. Defaults to the current working directory when omitted."
+      },
+      "limit": {
+        "type": "integer",
+        "description": "Maximum results (default 20)"
+      }
+    },
+    "required": ["target"]
+  }
+}

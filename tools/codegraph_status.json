@@ -1,0 +1,12 @@
+{
+  "description": "Show CodeGraph index status and statistics for a project (file count, node/edge counts, freshness).",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "path": {
+        "type": "string",
+        "description": "Project root directory. Defaults to the current working directory when omitted."
+      }
+    }
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "description": "Analyze what code is affected if you change a symbol (upstream impact / blast radius). Run before modifying functions, classes, methods, or exported APIs.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "target": {
+        "type": "string",
+        "description": "Symbol name to analyze"
+      },
+      "path": {
+        "type": "string",
+        "description": "Project root directory. Defaults to the current working directory when omitted."
+      },
+      "depth": {
+        "type": "integer",
+        "description": "Traversal depth (default 2)"
+      }
+    },
+    "required": ["target"]
+  }
+}

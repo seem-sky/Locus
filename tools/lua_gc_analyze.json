@@ -1,0 +1,17 @@
+{
+  "description": "Analyze the active or specified Lua GC monitor session for allocation hotspots, sustained GC debt, leak risk, and phase anomalies. Use after Play Mode recording (built-in Lua GC panel or lua_gc_monitor_start). Returns rule-based alerts, tuning suggestions, and a short tail of recent samples. Pair with knowledge/skill/gc.md for static optimization patterns.",
+  "parameters": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "sessionId": {
+        "type": "string",
+        "description": "Optional session id. Defaults to the active monitor session for the current Unity project."
+      },
+      "maxSamplePoints": {
+        "type": "integer",
+        "description": "Maximum recent samples to include in the summary payload (default 50, max 500)."
+      }
+    }
+  }
+}

@@ -53,6 +53,22 @@ Locus 当前支持 Windows 系统上的 Unity 2021 或更高版本。
 
 如果您在更低 Unity 版本中发现兼容性问题，欢迎通过 Issue 反馈。我们会尽可能修复；涉及较大修改的兼容性修复，可能会作为分支方案处理。
 
+## CodeGraph（AI 辅助开发）
+
+本仓库集成 [CodeGraph](https://github.com/colbymchenry/codegraph)，供 Cursor 等 MCP Agent 在对话或改代码前查询符号、调用链与影响范围。
+
+**每台机器一次性配置：**
+
+```powershell
+npm install -g @colbymchenry/codegraph
+cd <仓库根目录>
+codegraph init -i
+```
+
+**Cursor：** 启用项目 `.cursor/mcp.json` 中的 `codegraph` MCP 服务器后重启 Cursor。Agent 会通过 `.cursor/rules/codegraph.mdc` 被要求在回答结构性问题或修改符号前先调用 `codegraph_context` / `codegraph_impact`。
+
+大改或拉取代码后执行 `codegraph sync`。`.codegraph/` 下的索引库仅保存在本机，不提交到 Git。
+
 ## 从源代码构建
 
 当前仓库使用 `bun` + `Tauri 2`，目前以 Windows 作为主要开发与构建平台。

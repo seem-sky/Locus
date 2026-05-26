@@ -126,9 +126,18 @@ pub fn default_load_mode_for_builtin_tool(name: &str) -> ToolLoadMode {
             | "knowledge_delete"
             | "knowledge_move"
             | "graph_view"
+            | "codegraph_search"
+            | "codegraph_context"
+            | "codegraph_callers"
+            | "codegraph_callees"
+            | "codegraph_impact"
+            | "codegraph_files"
+            | "codegraph_status"
+            | "codegraph_sync"
             | "skill_create"
             | "unity_capture_viewport"
             | "unity_run_states"
+            | "lua_gc_analyze"
             | "web_fetch"
     ) {
         ToolLoadMode::Lazy

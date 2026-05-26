@@ -1,0 +1,21 @@
+{
+  "description": "Find all functions or methods that a specific symbol calls (downstream callees).",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "target": {
+        "type": "string",
+        "description": "Symbol name to look up"
+      },
+      "path": {
+        "type": "string",
+        "description": "Project root directory. Defaults to the current working directory when omitted."
+      },
+      "limit": {
+        "type": "integer",
+        "description": "Maximum results (default 20)"
+      }
+    },
+    "required": ["target"]
+  }
+}

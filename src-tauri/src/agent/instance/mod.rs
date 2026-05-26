@@ -2436,6 +2436,14 @@ impl AgentInstance {
             | "unity_yaml_list"
             | "unity_yaml_search"
             | "unity_yaml_read"
+            | "codegraph_search"
+            | "codegraph_context"
+            | "codegraph_callers"
+            | "codegraph_callees"
+            | "codegraph_impact"
+            | "codegraph_files"
+            | "codegraph_status"
+            | "codegraph_sync"
             | "knowledge_list"
             | "knowledge_query"
             | "knowledge_read"
@@ -3433,6 +3441,22 @@ impl AgentInstance {
                 }
             }
             "grep" | "list" => {
+                if let Some(p) = args.get("path").and_then(|v| v.as_str()) {
+                    if let Some(resolved) = self.resolve_path_against_working_dir(p) {
+                        args["path"] = serde_json::Value::String(resolved);
+                    }
+                } else if self.has_selected_working_dir() {
+                    args["path"] = serde_json::Value::String(self.working_dir.clone());
+                }
+            }
+            "codegraph_search"
+            | "codegraph_context"
+            | "codegraph_callers"
+            | "codegraph_callees"
+            | "codegraph_impact"
+            | "codegraph_files"
+            | "codegraph_status"
+            | "codegraph_sync" => {
                 if let Some(p) = args.get("path").and_then(|v| v.as_str()) {
                     if let Some(resolved) = self.resolve_path_against_working_dir(p) {
                         args["path"] = serde_json::Value::String(resolved);
@@ -7772,6 +7796,14 @@ impl AgentInstance {
                 | "skill_reload"
                 | "config_query"
                 | "tool_load"
+                | "codegraph_search"
+                | "codegraph_context"
+                | "codegraph_callers"
+                | "codegraph_callees"
+                | "codegraph_impact"
+                | "codegraph_files"
+                | "codegraph_status"
+                | "codegraph_sync"
         )
     }
 

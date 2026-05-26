@@ -53,6 +53,22 @@ Locus currently supports Unity 2021 or later on Windows.
 
 If you encounter compatibility issues on older Unity versions, please report them through Issues. We will try to fix them where practical; compatibility fixes that require substantial changes may be handled as branch-specific solutions.
 
+## CodeGraph (AI-assisted development)
+
+This repo includes [CodeGraph](https://github.com/colbymchenry/codegraph) for structural code intelligence in Cursor and other MCP agents.
+
+**One-time setup (each machine):**
+
+```powershell
+npm install -g @colbymchenry/codegraph
+cd <repo-root>
+codegraph init -i
+```
+
+**Cursor:** enable the `codegraph` MCP server in project `.cursor/mcp.json`, then restart Cursor. Agents are instructed (via `.cursor/rules/codegraph.mdc`) to run `codegraph_context` / `codegraph_impact` before answering structural questions or editing symbols.
+
+After large pulls or refactors: `codegraph sync`. The index database under `.codegraph/` is local-only and not committed.
+
 ## Build from Source
 
 This repository uses `bun` + `Tauri 2`, with Windows as the primary development and build platform.

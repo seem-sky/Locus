@@ -1103,6 +1103,15 @@ namespace Locus
                     case "view_binding_apply":
                         return await HandleViewBindingApply(reqId, msg.message);
 
+                    case "lua_gc_monitor_start":
+                        return HandleLuaGcMonitorStart(reqId, msg.message);
+
+                    case "lua_gc_monitor_stop":
+                        return HandleLuaGcMonitorStop(reqId, msg.message);
+
+                    case "lua_gc_monitor_status":
+                        return HandleLuaGcMonitorStatus(reqId);
+
                     case "capture_viewport":
                         return await HandleCaptureViewport(reqId, msg.message);
 

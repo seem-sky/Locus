@@ -1,0 +1,25 @@
+{
+  "description": "Search for symbols in the codebase using the CodeGraph index. Prefer this over grep when looking up functions, classes, methods, components, or other named symbols — returns kind, file path, line numbers, and signature. Requires a CodeGraph index (run codegraph init in the project if missing).",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "query": {
+        "type": "string",
+        "description": "Symbol name or search text"
+      },
+      "path": {
+        "type": "string",
+        "description": "Project root directory. Defaults to the current working directory when omitted."
+      },
+      "limit": {
+        "type": "integer",
+        "description": "Maximum results (default 10)"
+      },
+      "kind": {
+        "type": "string",
+        "description": "Filter by node kind (function, class, method, component, etc.)"
+      }
+    },
+    "required": ["query"]
+  }
+}

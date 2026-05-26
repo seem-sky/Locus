@@ -1,0 +1,29 @@
+{
+  "description": "Build focused CodeGraph context for a task or area of the codebase. Returns markdown with relevant symbols and optional source snippets. Use before answering architecture or flow questions, or before editing unfamiliar code.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "task": {
+        "type": "string",
+        "description": "Natural-language description of what you need to understand or do"
+      },
+      "path": {
+        "type": "string",
+        "description": "Project root directory. Defaults to the current working directory when omitted."
+      },
+      "maxNodes": {
+        "type": "integer",
+        "description": "Maximum symbols to include (default 50)"
+      },
+      "maxCode": {
+        "type": "integer",
+        "description": "Maximum code blocks to include (default 10)"
+      },
+      "noCode": {
+        "type": "boolean",
+        "description": "Exclude source code blocks from the output"
+      }
+    },
+    "required": ["task"]
+  }
+}

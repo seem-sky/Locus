@@ -31,6 +31,7 @@ Use this workflow when the user asks for a Locus View, View Package, or frontend
    - `inspector-form` for field-oriented Unity asset, GameObject, Component, Material, or ScriptableObject editing.
    - `node-graph` for built-in graph editors with nodes, parameters, node links, and port links.
    - `link-board` for source-to-target mapping interfaces.
+   - `lua-gc-monitor` for read-only Lua/xLua GC session dashboards (live charts stay in the built-in **Lua GC** panel).
 
 2. Load View tools with `tool_load`:
    - `view_list`

@@ -346,13 +346,19 @@ pub fn supported_view_templates() -> Vec<ViewTemplateSummary> {
             description: "Two-column link mapping scaffold with serialized connections."
                 .to_string(),
         },
+        ViewTemplateSummary {
+            id: "lua-gc-monitor".to_string(),
+            name: "Lua GC Monitor".to_string(),
+            description: "Read-only dashboard for Lua/xLua GC monitor session metrics."
+                .to_string(),
+        },
     ]
 }
 
 fn is_supported_template(template: &str) -> bool {
     matches!(
         template,
-        "blank" | "inspector-form" | "node-graph" | "link-board"
+        "blank" | "inspector-form" | "node-graph" | "link-board" | "lua-gc-monitor"
     )
 }
 
@@ -764,7 +770,30 @@ fn find_view_package_roots_by_id(views_root: &Path, id: &str) -> Result<Vec<Path
     Ok(roots)
 }
 
+/// Seeds the read-only Lua GC monitor View package when missing (Unity projects only).
+pub fn ensure_lua_gc_monitor_view_package(working_dir: &str) {
+    if !crate::unity_bridge::is_unity_project(working_dir) {
+        return;
+    }
+    let Ok(root) = view_package_root(working_dir, "lua-gc-monitor") else {
+        return;
+    };
+    if root.exists() {
+        return;
+    }
+    let _ = create_view_sync(
+        working_dir,
+        ViewCreateRequest {
+            id: "lua-gc-monitor".to_string(),
+            name: Some("Lua GC Monitor".to_string()),
+            template: Some("lua-gc-monitor".to_string()),
+            icon: Some("ChartNoAxesCombined".to_string()),
+        },
+    );
+}
+
 pub fn list_views_sync(working_dir: &str) -> Result<Vec<ViewPackageSummary>, String> {
+    ensure_lua_gc_monitor_view_package(working_dir);
     let views_root = views_root_for_workspace(working_dir)?;
     if !views_root.is_dir() {
         return Ok(Vec::new());
@@ -1816,6 +1845,7 @@ fn default_icon_for_template(template: &str) -> &'static str {
         "inspector-form" => "InspectionPanel",
         "node-graph" => "Network",
         "link-board" => "Link2",
+        "lua-gc-monitor" => "ChartNoAxesCombined",
         _ => "View",
     }
 }
@@ -1846,7 +1876,7 @@ fn template_manifest(id: &str, name: &str, template: &str, icon: Option<&str>) -
         bindings: "bindings.json".to_string(),
         scripts,
         capabilities: ViewCapabilities {
-            unity: template == "inspector-form",
+            unity: matches!(template, "inspector-form" | "lua-gc-monitor"),
             bindings: template == "inspector-form",
             write_back: false,
         },
@@ -1884,6 +1914,10 @@ fn template_files(id: &str, name: &str, template: &str) -> Vec<(&'static str, St
             files.push(("src/App.vue", link_board_app_vue(name)));
             files.push(("src/style.css", link_board_style_css()));
         }
+        "lua-gc-monitor" => {
+            files.push(("src/App.vue", lua_gc_monitor_app_vue(name)));
+            files.push(("src/style.css", lua_gc_monitor_style_css()));
+        }
         _ => {
             files.push(("src/App.vue", blank_app_vue(name)));
             files.push(("src/style.css", blank_style_css()));
@@ -1914,6 +1948,109 @@ export const viewState = reactive({
   dirty: false,
   status: "idle",
 });
+"#
+    .to_string()
+}
+
+fn lua_gc_monitor_app_vue(name: &str) -> String {
+    format!(
+        r##"<template>
+  <main class="view-shell lua-gc-view">
+    <header class="view-header">
+      <span class="view-kicker">Lua GC Monitor</span>
+      <h1>{name}</h1>
+      <p class="view-lead">
+        Read-only session dashboard. Live charts and recording controls live in the built-in Locus panel.
+      </p>
+    </header>
+
+    <section class="view-panel lua-gc-metrics">
+      <div class="view-row">
+        <label>Session</label>
+        <span>{{ summary.sessionId || "—" }}</span>
+      </div>
+      <div class="view-row">
+        <label>Status</label>
+        <span>{{ summary.active ? "Recording" : "Idle" }}</span>
+      </div>
+      <div class="view-row">
+        <label>Memory (KB)</label>
+        <span>{{ summary.memoryKb ?? "—" }}</span>
+      </div>
+      <div class="view-row">
+        <label>GC debt (KB)</label>
+        <span>{{ summary.gcDebtKb ?? "—" }}</span>
+      </div>
+      <div class="view-row">
+        <label>Samples</label>
+        <span>{{ summary.sampleCount ?? 0 }}</span>
+      </div>
+    </section>
+
+    <section class="view-panel lua-gc-actions">
+      <p class="view-hint">
+        Open the chat session toolbar button <strong>Lua GC</strong> for real-time curves, alerts, and export.
+      </p>
+      <p class="view-hint">
+        Customize this View package to call <code>lua_gc_monitor_get_samples</code> from a host bridge or poll exported JSON under <code>Library/Locus/LuaGc/</code>.
+      </p>
+    </section>
+  </main>
+</template>
+
+<script setup>
+import {{ reactive }} from "vue";
+
+const summary = reactive({{
+  sessionId: "",
+  active: false,
+  memoryKb: null,
+  gcDebtKb: null,
+  sampleCount: 0,
+}});
+</script>
+"##
+    )
+}
+
+fn lua_gc_monitor_style_css() -> String {
+    r#":root {
+  color-scheme: light dark;
+  font-family: var(--font-ui);
+}
+
+body {
+  margin: 0;
+  background: var(--bg-color);
+  color: var(--text-color);
+  font-family: var(--font-ui);
+}
+
+.lua-gc-view .view-lead {
+  margin: 6px 0 0;
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.lua-gc-metrics .view-row span {
+  font-variant-numeric: tabular-nums;
+}
+
+.lua-gc-actions {
+  padding: 12px;
+}
+
+.view-hint {
+  margin: 0 0 8px;
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.view-hint code {
+  font-size: 11px;
+}
 "#
     .to_string()
 }
@@ -2713,6 +2850,46 @@ mod tests {
 
         assert!(ids.contains(&"node-graph".to_string()));
         assert!(ids.contains(&"link-board".to_string()));
+        assert!(ids.contains(&"lua-gc-monitor".to_string()));
+    }
+
+    #[test]
+    fn create_lua_gc_monitor_template_writes_package() {
+        let temp = tempdir().unwrap();
+        let working_dir = temp.path().to_string_lossy().to_string();
+        let created = create_view_sync(
+            &working_dir,
+            super::ViewCreateRequest {
+                id: "lua-gc-monitor".to_string(),
+                name: Some("Lua GC Monitor".to_string()),
+                template: Some("lua-gc-monitor".to_string()),
+                icon: Some("ChartNoAxesCombined".to_string()),
+            },
+        )
+        .expect("create view");
+
+        assert_eq!(created.manifest.template, "lua-gc-monitor");
+        assert!(created.manifest.capabilities.unity);
+        let app = created
+            .files
+            .iter()
+            .find(|file| file.rel_path == "src/App.vue")
+            .expect("app file");
+        assert!(app.content.contains("lua-gc-metrics"));
+    }
+
+    #[test]
+    fn ensure_lua_gc_monitor_view_package_seeds_unity_project() {
+        let temp = tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("Assets")).unwrap();
+        std::fs::create_dir_all(temp.path().join("ProjectSettings")).unwrap();
+        let working_dir = temp.path().to_string_lossy().to_string();
+        super::ensure_lua_gc_monitor_view_package(&working_dir);
+        assert!(
+            temp.path()
+                .join("Locus/views/lua-gc-monitor/view.json")
+                .is_file()
+        );
     }
 
     #[test]

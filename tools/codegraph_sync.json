@@ -1,0 +1,12 @@
+{
+  "description": "Sync the CodeGraph index with filesystem changes since the last index. Use after large pulls or refactors when search/callers results seem stale.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "path": {
+        "type": "string",
+        "description": "Project root directory. Defaults to the current working directory when omitted."
+      }
+    }
+  }
+}

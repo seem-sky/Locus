@@ -14,8 +14,8 @@
       },
       "template": {
         "type": "string",
-        "enum": ["blank", "inspector-form", "node-graph", "link-board"],
-        "description": "Built-in View template to copy. Supported values: blank, inspector-form, node-graph, link-board."
+        "enum": ["blank", "inspector-form", "node-graph", "link-board", "lua-gc-monitor"],
+        "description": "Built-in View template to copy. Supported values: blank, inspector-form, node-graph, link-board, lua-gc-monitor."
       },
       "icon": {
         "type": ["string", "null"],
