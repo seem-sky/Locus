@@ -19,8 +19,6 @@ import {
 import ChatView from "./ChatView.vue";
 import ThinkingPanel from "./ThinkingPanel.vue";
 import ChatSidebarPanel from "./ChatSidebarPanel.vue";
-import BaseButton from "./ui/BaseButton.vue";
-import LucideIcon from "./icons/LucideIcon.vue";
 
 type ChatLayoutMode = "auto" | "horizontal" | "vertical";
 type ResolvedChatLayoutMode = "horizontal" | "vertical";

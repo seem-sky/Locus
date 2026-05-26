@@ -19,9 +19,6 @@ const emit = defineEmits<{
   close: [];
 }>();
 
-// emit is used conditionally in template (modal mode)
-void emit;
-
 const monitor = useLuaGcMonitor();
 const chartRef = ref<HTMLCanvasElement | null>(null);
 const exportPath = ref("");
@@ -69,11 +66,25 @@ async function handleExport(format: "json" | "csv") {
   const path = await monitor.exportData(format);
   if (path) exportPath.value = path;
 }
+
+function handleClose() {
+  emit("close");
+}
 </script>
 
-<template v-if="props.showClose">
-  <div v-if="open" class="lua-gc-panel-backdrop" @click.self="emit('close')">
-    <section class="lua-gc-panel" role="dialog" :aria-label="t('luaGc.title')">
+<template>
+  <div
+    v-if="open"
+    :class="props.showClose ? 'lua-gc-panel-backdrop' : 'lua-gc-panel lua-gc-panel--standalone'"
+    :style="!props.showClose ? 'width:100%;height:100%;' : ''"
+    @click.self="props.showClose ? handleClose() : undefined"
+  >
+    <section
+      class="lua-gc-panel"
+      :class="{ 'lua-gc-panel--standalone': !props.showClose }"
+      role="dialog"
+      :aria-label="t('luaGc.title')"
+    >
       <header class="lua-gc-header">
         <div class="lua-gc-title-row">
           <LucideIcon :icon="ChartNoAxesCombined" :size="16" />
@@ -85,136 +96,15 @@ async function handleExport(format: "json" | "csv") {
             {{ monitor.status.value?.active ? t("luaGc.status.recording") : t("luaGc.status.idle") }}
           </span>
         </div>
-        <button type="button" class="lua-gc-close" :aria-label="t('common.close')" @click="emit('close')">
+        <button
+          v-if="props.showClose"
+          type="button"
+          class="lua-gc-close"
+          :aria-label="t('common.close')"
+          @click="handleClose"
+        >
           &times;
         </button>
-      </header>
-
-      <p v-if="monitor.error.value" class="lua-gc-error">{{ monitor.error.value }}</p>
-      <p
-        v-else-if="monitor.status.value && !monitor.status.value.runtimeAvailable"
-        class="lua-gc-hint"
-      >
-        {{ monitor.status.value.runtimeMessage || t("luaGc.runtimeMissing") }}
-      </p>
-
-      <div class="lua-gc-metrics">
-        <div class="lua-gc-metric">
-          <span class="lua-gc-metric-label">{{ t("luaGc.metrics.memory") }}</span>
-          <span class="lua-gc-metric-value">
-            {{ monitor.latestSample.value ? monitor.latestSample.value.memoryKb.toFixed(1) : "—" }} KB
-          </span>
-        </div>
-        <div class="lua-gc-metric">
-          <span class="lua-gc-metric-label">{{ t("luaGc.metrics.debt") }}</span>
-          <span class="lua-gc-metric-value">
-            {{ monitor.latestSample.value ? monitor.latestSample.value.gcDebtKb.toFixed(1) : "—" }} KB
-          </span>
-        </div>
-        <div class="lua-gc-metric">
-          <span class="lua-gc-metric-label">{{ t("luaGc.metrics.allocRate") }}</span>
-          <span class="lua-gc-metric-value">
-            {{ monitor.latestSample.value ? monitor.latestSample.value.allocKbSinceLast.toFixed(1) : "—" }} KB
-          </span>
-        </div>
-        <div class="lua-gc-metric">
-          <span class="lua-gc-metric-label">{{ t("luaGc.metrics.samples") }}</span>
-          <span class="lua-gc-metric-value">{{ monitor.samples.value.length }}</span>
-        </div>
-      </div>
-
-      <div class="lua-gc-chart-wrap">
-        <canvas ref="chartRef" class="lua-gc-chart" />
-      </div>
-
-      <div class="lua-gc-legend">
-        <label><input v-model="monitor.showMemory.value" type="checkbox" /> {{ t("luaGc.legend.memory") }}</label>
-        <label><input v-model="monitor.showDebt.value" type="checkbox" /> {{ t("luaGc.legend.debt") }}</label>
-        <label><input v-model="monitor.showAlloc.value" type="checkbox" /> {{ t("luaGc.legend.alloc") }}</label>
-      </div>
-
-      <div class="lua-gc-controls">
-        <label class="lua-gc-interval">
-          <span>{{ t("luaGc.interval") }}</span>
-          <input
-            v-model.number="monitor.sampleIntervalMs.value"
-            type="number"
-            min="50"
-            max="2000"
-            step="50"
-            :disabled="monitor.status.value?.active"
-          />
-          <span>ms</span>
-        </label>
-        <div class="lua-gc-actions">
-          <BaseButton
-            v-if="!monitor.status.value?.active"
-            :disabled="monitor.loading.value"
-            @click="monitor.start()"
-          >
-            {{ t("luaGc.start") }}
-          </BaseButton>
-          <BaseButton
-            v-else
-            :disabled="monitor.loading.value"
-            @click="monitor.stop()"
-          >
-            {{ t("luaGc.stop") }}
-          </BaseButton>
-          <BaseButton :disabled="monitor.loading.value" @click="monitor.clear()">
-            {{ t("luaGc.clear") }}
-          </BaseButton>
-          <BaseButton :disabled="monitor.loading.value" @click="handleExport('json')">
-            {{ t("luaGc.exportJson") }}
-          </BaseButton>
-          <BaseButton :disabled="monitor.loading.value" @click="handleExport('csv')">
-            {{ t("luaGc.exportCsv") }}
-          </BaseButton>
-        </div>
-      </div>
-
-      <p v-if="exportPath" class="lua-gc-export-path">{{ t("luaGc.exportedTo", exportPath) }}</p>
-
-      <section v-if="monitor.analysis.value" class="lua-gc-analysis">
-        <h3 class="lua-gc-section-title">{{ t("luaGc.analysisTitle") }}</h3>
-        <ul v-if="monitor.analysis.value.alerts.length" class="lua-gc-alerts">
-          <li
-            v-for="(alert, index) in monitor.analysis.value.alerts"
-            :key="`${alert.kind}-${index}`"
-            :class="`lua-gc-alert lua-gc-alert-${alert.severity}`"
-          >
-            {{ alert.message }}
-          </li>
-        </ul>
-        <p v-else class="lua-gc-hint">{{ t("luaGc.noAlerts") }}</p>
-        <ul class="lua-gc-suggestions">
-          <li
-            v-for="(item, index) in monitor.analysis.value.suggestions"
-            :key="index"
-          >
-            {{ item }}
-          </li>
-        </ul>
-      </section>
-    </section>
-  </div>
-</template>
-
-<!-- showClose=false: standalone page mode -->
-<template v-else>
-  <div v-if="open" class="lua-gc-panel lua-gc-panel--standalone">
-    <section class="lua-gc-panel" role="dialog" :aria-label="t('luaGc.title')">
-      <header class="lua-gc-header">
-        <div class="lua-gc-title-row">
-          <LucideIcon :icon="ChartNoAxesCombined" :size="16" />
-          <h2 class="lua-gc-title">{{ t("luaGc.title") }}</h2>
-          <span
-            class="lua-gc-status-pill"
-            :class="monitor.status.value?.active ? 'is-active' : 'is-idle'"
-          >
-            {{ monitor.status.value?.active ? t("luaGc.status.recording") : t("luaGc.status.idle") }}
-          </span>
-        </div>
       </header>
 
       <p v-if="monitor.error.value" class="lua-gc-error">{{ monitor.error.value }}</p>
@@ -352,6 +242,15 @@ async function handleExport(format: "json" | "csv") {
   background: var(--panel-bg);
   box-shadow: 0 16px 48px rgba(15, 23, 42, 0.18);
   overflow: auto;
+}
+
+.lua-gc-panel--standalone {
+  width: 100%;
+  height: 100%;
+  max-height: none;
+  border-radius: 0;
+  border: none;
+  box-shadow: none;
 }
 
 .lua-gc-header {
@@ -525,20 +424,5 @@ async function handleExport(format: "json" | "csv") {
 
 .lua-gc-alert-info {
   color: var(--text-secondary);
-}
-
-/* Standalone page mode */
-.lua-gc-panel.lua-gc-panel--standalone {
-  width: 100%;
-  height: 100%;
-}
-
-.lua-gc-panel--standalone .lua-gc-panel {
-  width: 100%;
-  height: 100%;
-  max-height: none;
-  border-radius: 0;
-  border: none;
-  box-shadow: none;
 }
 </style>
