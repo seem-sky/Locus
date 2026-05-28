@@ -12,6 +12,7 @@ use crate::commands::asset::{
 };
 use crate::error::AppError;
 use crate::keychain;
+use crate::session::store::SessionStore;
 use crate::unity_bridge::UnityMonitorHandle;
 use crate::workspace::Workspace;
 use crate::AssetDbWatcherHandle;
@@ -316,6 +317,7 @@ fn spawn_background_asset_hash_reconcile(
 #[tauri::command]
 pub async fn set_working_dir(
     path: String,
+    store: State<'_, Arc<SessionStore>>,
     workspace: State<'_, Arc<Workspace>>,
     unity_monitor: State<'_, UnityMonitorHandle>,
     ref_graph_state: State<'_, AssetDbState>,
@@ -368,6 +370,24 @@ pub async fn set_working_dir(
     // a re-`set_working_dir` of the same project should not erase its history.
     let prev_cwd = workspace.path.read().await.clone();
     let is_real_switch = prev_cwd != canonical;
+
+    // Check and initialize CodeGraph for the project if needed
+    if is_real_switch {
+        match crate::process_util::ensure_codegraph_initialized(std::path::Path::new(&canonical)) {
+            Ok(true) => {
+                switch_timer.mark("codegraph_initialized");
+                eprintln!("[Locus] CodeGraph initialized for new project");
+            }
+            Ok(false) => {
+                switch_timer.mark("codegraph_already_initialized");
+            }
+            Err(e) => {
+                switch_timer.mark("codegraph_init_failed");
+                eprintln!("[Locus] warning: CodeGraph initialization failed: {}", e);
+            }
+        }
+    }
+
     if is_real_switch {
         reconcile_task_state.cancel_current("workspace switch");
         let cancelled = scan_task_state.cancel_current_and_wait("workspace switch");
@@ -426,6 +446,13 @@ pub async fn set_working_dir(
         *wid = Some(ws_id.clone());
     }
     switch_timer.mark("workspace_id_state_committed");
+
+    // Update all sessions with workspace_id = NULL to have the new workspace_id.
+    // This ensures sessions created before workspace was set are properly associated.
+    if let Err(e) = store.inner().migrate_sessions_workspace_id(&ws_id) {
+        eprintln!("[Locus] warning: failed to migrate sessions workspace_id: {}", e);
+    }
+    switch_timer.mark("sessions_workspace_migrated");
 
     if is_real_switch {
         super::reset_unity_embed_control_window(&app_handle);
@@ -1418,6 +1445,20 @@ pub async fn save_tool_permissions(
     let json = serde_json::to_string_pretty(&normalized)
         .map_err(|e| format!("Failed to serialize tool permissions: {}", e))?;
     std::fs::write(&path, json).map_err(|e| format!("Failed to save tool permissions: {}", e))?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn set_workspace_locale(
+    force_zh: bool,
+    workspace: State<'_, Arc<crate::workspace::Workspace>>,
+) -> Result<(), AppError> {
+    let working_dir = workspace.path.read().await.clone();
+    if working_dir.trim().is_empty() {
+        return Ok(());
+    }
+    crate::workspace::update_workspace_force_zh(&working_dir, force_zh)
+        .map_err(|e| format!("Failed to update workspace locale: {}", e))?;
     Ok(())
 }
 

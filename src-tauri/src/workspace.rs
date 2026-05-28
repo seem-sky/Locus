@@ -7,6 +7,8 @@ use std::sync::{Mutex, MutexGuard};
 pub struct WorkspaceConfig {
     #[serde(rename = "workspace_id", alias = "workspaceId")]
     pub workspace_id: String,
+    #[serde(default, rename = "forceZh", alias = "forceZh")]
+    pub force_zh: bool,
 }
 
 pub struct Workspace {
@@ -83,6 +85,15 @@ pub fn write_workspace_config(dir: &str, config: &WorkspaceConfig) -> Result<(),
         .map_err(|e| format!("Failed to serialize workspace config: {}", e))?;
     std::fs::write(&config_path, &json)
         .map_err(|e| format!("Failed to write workspace config: {}", e))
+}
+
+pub fn update_workspace_force_zh(dir: &str, force_zh: bool) -> Result<(), String> {
+    let mut config = read_workspace_config(dir).unwrap_or_else(|_| WorkspaceConfig {
+        workspace_id: String::new(),
+        force_zh: false,
+    });
+    config.force_zh = force_zh;
+    write_workspace_config(dir, &config)
 }
 
 fn extract_unity_yaml_scalar(content: &str, key: &str) -> Option<String> {
@@ -197,6 +208,7 @@ mod tests {
     fn workspace_config_serializes_workspace_id_in_snake_case() {
         let cfg = WorkspaceConfig {
             workspace_id: "stable-id".to_string(),
+            force_zh: false,
         };
         let value = serde_json::to_value(&cfg).expect("workspace config should serialize");
         assert_eq!(

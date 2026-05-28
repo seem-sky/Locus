@@ -1928,6 +1928,37 @@ impl SessionStore {
         }
     }
 
+    pub fn update_session_workspace_id(&self, id: &str, workspace_id: &str) -> Result<(), String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let now = Self::now_ts();
+        // Update the session and all its descendant sessions
+        conn.execute(
+            "WITH RECURSIVE descendants(id) AS (
+                SELECT id FROM sessions WHERE id = ?1
+                UNION ALL
+                SELECT sessions.id FROM sessions JOIN descendants ON sessions.parent_session_id = descendants.id
+            )
+            UPDATE sessions SET workspace_id = ?2, updated_at = ?3 WHERE id IN (SELECT id FROM descendants)",
+            params![id, workspace_id, now],
+        )
+        .map_err(|e| format!("Failed to update session workspace id: {}", e))?;
+        Ok(())
+    }
+
+    /// Migrate all sessions with workspace_id = NULL to have the given workspace_id.
+    /// This is called when a workspace is set to associate sessions created before
+    /// the workspace was established.
+    pub fn migrate_sessions_workspace_id(&self, workspace_id: &str) -> Result<(), String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let now = Self::now_ts();
+        conn.execute(
+            "UPDATE sessions SET workspace_id = ?1, updated_at = ?2 WHERE workspace_id IS NULL",
+            params![workspace_id, now],
+        )
+        .map_err(|e| format!("Failed to migrate sessions workspace id: {}", e))?;
+        Ok(())
+    }
+
     pub fn rename_session(&self, id: &str, title: &str) -> Result<(), String> {
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
         conn.execute(
@@ -1941,9 +1972,15 @@ impl SessionStore {
     pub fn archive_session(&self, id: &str) -> Result<(), String> {
         let now = Self::now_ts();
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        // Archive the session and all its descendant sessions
         conn.execute(
-            "UPDATE sessions SET archived_at = ?1, updated_at = ?1 WHERE id = ?2",
-            params![now, id],
+            "WITH RECURSIVE descendants(id) AS (
+                SELECT id FROM sessions WHERE id = ?1
+                UNION ALL
+                SELECT sessions.id FROM sessions JOIN descendants ON sessions.parent_session_id = descendants.id
+            )
+            UPDATE sessions SET archived_at = ?2, updated_at = ?2 WHERE id IN (SELECT id FROM descendants)",
+            params![id, now],
         )
         .map_err(|e| format!("Failed to archive session: {}", e))?;
         Ok(())
