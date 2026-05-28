@@ -1,0 +1,21 @@
+{
+  "name": "@colbymchenry/codegraph",
+  "version": "0.9.4",
+  "description": "Local-first code intelligence for AI agents (MCP). Self-contained — bundles its own runtime.",
+  "bin": {
+    "codegraph": "npm-shim.js"
+  },
+  "optionalDependencies": {
+    "@colbymchenry/codegraph-darwin-arm64": "0.9.4",
+    "@colbymchenry/codegraph-darwin-x64": "0.9.4",
+    "@colbymchenry/codegraph-linux-arm64": "0.9.4",
+    "@colbymchenry/codegraph-linux-x64": "0.9.4",
+    "@colbymchenry/codegraph-win32-arm64": "0.9.4",
+    "@colbymchenry/codegraph-win32-x64": "0.9.4"
+  },
+  "files": [
+    "npm-shim.js",
+    "README.md"
+  ],
+  "license": "MIT"
+}

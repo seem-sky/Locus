@@ -1,0 +1,20 @@
+{
+  "name": "Implementer",
+  "description": "Code implementation agent: implements code changes based on analysis and requirements.",
+  "tools": [
+    "read",
+    "write",
+    "edit",
+    "bash",
+    "grep",
+    "list",
+    "codegraph_search",
+    "codegraph_context",
+    "codegraph_callers",
+    "codegraph_callees"
+  ],
+  "sub_agents": [],
+  "default": false,
+  "default_effort": "medium",
+  "model_recommendation": "large"
+}

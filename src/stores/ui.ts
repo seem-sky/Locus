@@ -17,8 +17,8 @@ interface NativeWindowClientSizeEvent {
 }
 
 export const useUiStore = defineStore("ui", () => {
-  const activeTab = ref<"chat" | "collab" | "knowledge" | "asset" | "views" | "agent" | "settings" | "performance">("chat");
-  const settingsCategoryHint = ref<"api" | "models" | "permissions" | "proxy" | "general" | "display" | "shortcuts" | "knowledge" | "archived" | "console" | "about" | null>(null);
+  const activeTab = ref<"chat" | "collab" | "knowledge" | "asset" | "views" | "agent" | "settings">("chat");
+  const settingsCategoryHint = ref<"api" | "models" | "permissions" | "proxy" | "general" | "display" | "notifications" | "shortcuts" | "knowledge" | "archived" | "console" | "about" | null>(null);
   const alwaysOnTop = ref(false);
   const isMaximized = ref(false);
   const isWindowResizing = ref(false);
@@ -38,7 +38,6 @@ export const useUiStore = defineStore("ui", () => {
   const viewMounted = ref(false);
   const agentMounted = ref(false);
   const settingsMounted = ref(false);
-  const performanceMounted = ref(false);
 
   let appWindow: TauriWindow | null = null;
   let unlistenResize: UnlistenFn | null = null;
@@ -193,7 +192,6 @@ export const useUiStore = defineStore("ui", () => {
     if (tab === "views") viewMounted.value = true;
     if (tab === "agent") agentMounted.value = true;
     if (tab === "settings") settingsMounted.value = true;
-    if (tab === "performance") performanceMounted.value = true;
   }
 
   function openSettingsCategory(category: NonNullable<typeof settingsCategoryHint.value>) {
@@ -288,7 +286,6 @@ export const useUiStore = defineStore("ui", () => {
     viewMounted,
     agentMounted,
     settingsMounted,
-    performanceMounted,
     init,
     cleanup,
     setTab,
