@@ -7,6 +7,43 @@ export interface TokenUsageMetric {
   value: number;
 }
 
+export function formatTokenCount(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
+  return n.toString();
+}
+
+export function sessionInputTokenTotal(usage: TokenUsage): number {
+  return usage.totalInputTokens + usage.totalCacheReadTokens + usage.totalCacheWriteTokens;
+}
+
+export function hasSessionTokenUsage(usage: TokenUsage): boolean {
+  return sessionInputTokenTotal(usage) > 0 || usage.totalOutputTokens > 0;
+}
+
+export function hasContextWindowUsage(usage: TokenUsage): boolean {
+  return usage.contextTokens > 0 && usage.contextLimit > 0;
+}
+
+export function shouldShowTokenUsageBar(usage: TokenUsage): boolean {
+  return hasSessionTokenUsage(usage) || hasContextWindowUsage(usage);
+}
+
+export function metricI18nKey(key: TokenUsageMetric["key"]): string {
+  switch (key) {
+    case "input":
+      return "chat.tokenUsage.metric.input";
+    case "uncached-input":
+      return "chat.tokenUsage.metric.uncached";
+    case "cached-input-write":
+      return "chat.tokenUsage.metric.cacheWrite";
+    case "cached-input-read":
+      return "chat.tokenUsage.metric.cacheRead";
+    case "output":
+      return "chat.tokenUsage.metric.output";
+  }
+}
+
 export function buildTokenUsageMetrics(usage: TokenUsage): TokenUsageMetric[] {
   const hasCache = usage.totalCacheReadTokens > 0 || usage.totalCacheWriteTokens > 0;
 

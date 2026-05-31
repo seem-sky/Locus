@@ -91,4 +91,22 @@ describe("displayUserMessageContent", () => {
   it("returns empty content for injection-only messages", () => {
     expect(displayUserMessageContent("<system-reminder>\nEnv\n</system-reminder>")).toBe("");
   });
+
+  it("hides legacy dev workflow continuation nudges", () => {
+    expect(displayUserMessageContent(
+      "[Dev workflow continuation]\nDo not end the turn yet. You wrote a modification plan (or said you would) but did not call ask_user_question.",
+    )).toBe("");
+  });
+
+  it("hides dev workflow continuation nudges wrapped in system reminders", () => {
+    expect(displayUserMessageContent(
+      "<system-reminder>\nDo not end the turn yet. Dispatch task(subagent_type=\"implementer\") now.\n</system-reminder>",
+    )).toBe("");
+  });
+
+  it("hides implicit Chinese language requirement prefix from legacy messages", () => {
+    expect(displayUserMessageContent(
+      "【语言要求：全程使用简体中文，包括 thinking / 推理过程，禁止英文思考】\n\n创建 test1.cs",
+    )).toBe("创建 test1.cs");
+  });
 });

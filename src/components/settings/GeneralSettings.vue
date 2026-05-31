@@ -38,6 +38,8 @@ import type {
 import { confirm, open } from "@tauri-apps/plugin-dialog";
 import { normalizeAppError } from "../../services/errors";
 import { useNotificationStore } from "../../stores/notification";
+import { useAgentResponseSettings } from "../../composables/useAgentResponseSettings";
+import WorkspaceBrowseFilterSettings from "./WorkspaceBrowseFilterSettings.vue";
 
 defineProps<{
   locale: string;
@@ -52,6 +54,7 @@ const emit = defineEmits<{
 }>();
 
 const notificationStore = useNotificationStore();
+const { state: agentResponseSettings, set: setAgentResponseSetting } = useAgentResponseSettings();
 const initialDebugMode = getCachedDebugMode();
 const debugEnabled = ref(initialDebugMode ?? false);
 const debugReady = ref(initialDebugMode !== null);
@@ -660,6 +663,20 @@ async function selectPythonRuntime(selectedId: string) {
   </div>
 
   <div class="settings-section">
+    <div class="section-label">{{ t("settings.general.sessionTitle") }}</div>
+    <p class="section-desc">{{ t("settings.general.sessionDesc") }}</p>
+    <label class="debug-toggle">
+      <BaseSwitch
+        :model-value="agentResponseSettings.forceChineseChat"
+        :aria-label="t('settings.general.forceChineseChat')"
+        @update:model-value="setAgentResponseSetting('forceChineseChat', $event)"
+      />
+      <span class="debug-toggle-label">{{ t("settings.general.forceChineseChat") }}</span>
+    </label>
+    <p class="section-desc">{{ t("settings.general.forceChineseChatDesc") }}</p>
+  </div>
+
+  <div class="settings-section">
     <div class="section-label">{{ t("settings.general.closeBehavior") }}</div>
     <p class="section-desc">{{ t("settings.general.closeBehaviorDesc") }}</p>
     <BaseSegmented
@@ -850,6 +867,8 @@ async function selectPythonRuntime(selectedId: string) {
   </div>
 
   <div class="settings-section">
+    <WorkspaceBrowseFilterSettings />
+
     <div class="section-label">{{ t("settings.general.resetOnboarding") }}</div>
     <p class="section-desc">{{ t("settings.general.resetOnboardingDesc") }}</p>
     <div v-if="!resetConfirm">

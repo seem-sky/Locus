@@ -29,6 +29,7 @@ fn event_session_id(event: &StreamEvent) -> &str {
         | StreamEvent::ToolCallRoundDone { session_id, .. }
         | StreamEvent::Done { session_id, .. }
         | StreamEvent::KnowledgeProposal { session_id, .. }
+        | StreamEvent::MemoryProposal { session_id, .. }
         | StreamEvent::UsageUpdate { session_id, .. }
         | StreamEvent::AskUser { session_id, .. }
         | StreamEvent::ToolConfirm { session_id, .. }
@@ -58,6 +59,7 @@ fn event_type(event: &StreamEvent) -> &'static str {
         StreamEvent::ToolCallRoundDone { .. } => "toolCallRoundDone",
         StreamEvent::Done { .. } => "done",
         StreamEvent::KnowledgeProposal { .. } => "knowledgeProposal",
+        StreamEvent::MemoryProposal { .. } => "memoryProposal",
         StreamEvent::UsageUpdate { .. } => "usageUpdate",
         StreamEvent::AskUser { .. } => "askUser",
         StreamEvent::ToolConfirm { .. } => "toolConfirm",
@@ -95,6 +97,7 @@ fn run_status_for_event(event: &StreamEvent) -> Option<(&'static str, Option<Str
         StreamEvent::Cancelled { .. } => Some((RUN_STATUS_CANCELLED, None)),
         StreamEvent::Error { error, .. } => Some((RUN_STATUS_ERROR, Some(error.message.clone()))),
         StreamEvent::KnowledgeProposal { .. }
+        | StreamEvent::MemoryProposal { .. }
         | StreamEvent::PendingInputQueued { .. }
         | StreamEvent::PendingInputAccepted { .. } => None,
     }

@@ -68,7 +68,7 @@ async function previewWebpage() {
     const result = await knowledgePreviewWebpage(url.value);
     previewData.value = result;
     importTitle.value = title.value.trim() || result.title;
-    editableContent.value = result.markdown;
+    editableContent.value = result.content;
     step.value = "preview";
   } catch (err) {
     errorMessage.value = normalizeAppError(err).message;
@@ -89,20 +89,17 @@ async function importFromPreview() {
       url: url.value,
       targetPath: props.targetPath,
       title: importTitle.value.trim() || undefined,
-      previewContent: {
-        markdown: editableContent.value,
-        charCount: editableContent.value.length,
-      },
     });
 
     if (result.success) {
-      successMessage.value = t("knowledge.webpage.import.success",
-        result.title,
-        result.charCount,
+      successMessage.value = t(
+        "knowledge.webpage.import.success",
+        importTitle.value,
+        editableContent.value.length,
       );
       emit("imported", result);
     } else {
-      errorMessage.value = result.error || t("knowledge.webpage.import.unknownError");
+      errorMessage.value = t("knowledge.webpage.import.unknownError");
       emit("import-error", errorMessage.value);
     }
   } catch (err) {

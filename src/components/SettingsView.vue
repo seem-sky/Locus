@@ -23,6 +23,7 @@ import ModelDefaultsPanel from "./settings/ModelDefaults.vue";
 import ToolPermissions from "./settings/ToolPermissions.vue";
 import ArchivedSessionsSettings from "./settings/ArchivedSessionsSettings.vue";
 import KnowledgeSettings from "./settings/KnowledgeSettings.vue";
+import MemorySettings from "./settings/MemorySettings.vue";
 import SubscriptionDisclaimerModal from "./SubscriptionDisclaimerModal.vue";
 import { useUiStore } from "../stores/ui";
 import { useChatStore } from "../stores/chat";
@@ -154,6 +155,16 @@ watch(
             <path d="M8 1a3.5 3.5 0 0 0-3.5 3.5v1H3.25A1.25 1.25 0 0 0 2 6.75v7A1.25 1.25 0 0 0 3.25 15h9.5A1.25 1.25 0 0 0 14 13.75v-7A1.25 1.25 0 0 0 12.75 5.5H11.5v-1A3.5 3.5 0 0 0 8 1zm-2 4.5v-1a2 2 0 1 1 4 0v1H6z"/>
           </svg>
           <span>{{ t("settings.tab.permissions") }}</span>
+        </button>
+        <button
+          class="sidebar-item"
+          :class="{ active: activeCategory === 'memory' }"
+          @click="activeCategory = 'memory'"
+        >
+          <svg viewBox="0 0 16 16" fill="currentColor" width="14" height="14">
+            <path d="M8 1.5a3.75 3.75 0 1 0 0 7.5 3.75 3.75 0 0 0 0-7.5zM4.25 4.25a3.75 3.75 0 1 1 7.5 0 3.75 3.75 0 0 1-7.5 0zM2.5 12.25c0-1.38 2.24-2.25 5.5-2.25s5.5.87 5.5 2.25V14a.75.75 0 0 1-.75.75h-9.5A.75.75 0 0 1 2.5 14v-1.75z"/>
+          </svg>
+          <span>{{ t("settings.tab.memory") }}</span>
         </button>
         <button
           class="sidebar-item"
@@ -292,6 +303,10 @@ watch(
 
       <template v-if="activeCategory === 'knowledge'">
         <KnowledgeSettings />
+      </template>
+
+      <template v-if="activeCategory === 'memory'">
+        <MemorySettings />
       </template>
 
       <template v-if="activeCategory === 'proxy'">

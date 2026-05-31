@@ -22,21 +22,22 @@ describe("View sidebar settings", () => {
     expect(skill).not.toContain("# View Package");
   });
 
-  it("lets display settings control the session list View section", () => {
+  it("keeps View sidebar UI code in the session panel but hides it from the main navigation", () => {
     const displaySettings = read("src/composables/useDisplaySettings.ts");
     const displayPanel = read("src/components/settings/DisplaySettings.vue");
     const chatView = read("src/components/ChatView.vue");
+    const app = read("src/App.vue");
     const sessionPanel = read("src/components/chat/SessionPanel.vue");
     const zh = read("src/language/zh.json");
     const en = read("src/language/en.json");
 
-    expect(displaySettings).toContain("showViewsInSessionPanel: boolean;");
-    expect(displaySettings).toContain("showViewsInSessionPanel: true,");
-    expect(displayPanel).toContain(":model-value=\"display.showViewsInSessionPanel\"");
-    expect(displayPanel).toContain("@update:model-value=\"setDisplay('showViewsInSessionPanel', $event)\"");
-    expect(chatView).toContain(":show-views=\"displaySettings.showViewsInSessionPanel\"");
+    expect(displaySettings).not.toContain("showViewsInSessionPanel");
+    expect(displayPanel).not.toContain("showViewsInSessionPanel");
+    expect(chatView).not.toContain(":show-views=");
+    expect(app).not.toContain("setTab('views')");
+    expect(app).not.toContain("ViewPackageView");
 
-    expect(sessionPanel).toContain("const showSessionViews = computed(() => props.showViews !== false)");
+    expect(sessionPanel).toContain("const showSessionViews = computed(() => false)");
     expect(sessionPanel).toContain("const DEFAULT_VIEW_SECTION_RATIO = 1 / 3;");
     expect(sessionPanel).toContain("flex: 1 1 66.667%;");
     expect(sessionPanel).toContain("flex: 0 0 33.333%;");
@@ -67,8 +68,6 @@ describe("View sidebar settings", () => {
     expect(sessionPanel).toContain("@click=\"closeViewCreateFolder\"");
     expect(sessionPanel).not.toContain("sp-view-refresh");
 
-    expect(zh).toContain('"settings.display.showViewsInSessionPanel": "会话列表中显示视图"');
-    expect(en).toContain('"settings.display.showViewsInSessionPanel": "Show Views in session list"');
     expect(zh).toContain('"view.list.helpLabel": "视图（实验性）"');
     expect(zh).toContain('"view.list.helpBody": "视图是实验性功能，用于通过 Locus 自身的前端创建、打开和运行项目编辑器。Agent 可以把 Vue 前端界面、运行脚本和 Unity 数据绑定组合为一个 View package，并在 Locus 中作为独立工具运行。"');
     expect(zh).toContain('"view.list.helpCreate": "在会话输入 /view 加上需求后，Agent 会进入 View workflow，按需求创建或更新 View package。生成后的视图会出现在当前工作区的 Locus/View 列表中，点击名称即可打开。"');

@@ -361,6 +361,89 @@ describe("reduceStreamEvent", () => {
       });
     });
 
+    it("attaches RTK execution meta to bash tool calls", () => {
+      const executionMeta = {
+        rtk: {
+          enabled: true,
+          available: true,
+          rewritten: true,
+          originalCommand: "git status",
+          executedCommand: "rtk git status",
+        },
+      };
+      const state = makeState({
+        isStreaming: true,
+        activeToolCalls: [{ id: "tc1", name: "bash", arguments: "{}", status: "running" }],
+      });
+      const event: StreamEvent = {
+        runId: "test-run",
+        type: "toolCallDone",
+        sessionId: "s1",
+        toolCallId: "tc1",
+        toolName: "bash",
+        output: "Exit code: 0\n",
+        outcome: "done",
+        executionMeta,
+      };
+      const mutations = reduceStreamEvent(state, event);
+
+      expect(mutations).toContainEqual({
+        type: "updateToolCall",
+        id: "tc1",
+        updates: {
+          status: "done",
+          output: "Exit code: 0\n",
+          progress: null,
+          executionMeta,
+        },
+      });
+    });
+
+    it("falls back to RTK progress payload when executionMeta is missing", () => {
+      const progressMeta = {
+        enabled: true,
+        available: true,
+        rewritten: true,
+        originalCommand: "git status",
+        executedCommand: "rtk git status",
+      };
+      const state = makeState({
+        isStreaming: true,
+        activeToolCalls: [{
+          id: "tc1",
+          name: "bash",
+          arguments: "{}",
+          status: "running",
+          progress: {
+            title: "RTK",
+            info: JSON.stringify(progressMeta),
+            state: "rtk",
+          },
+        }],
+      });
+      const event: StreamEvent = {
+        runId: "test-run",
+        type: "toolCallDone",
+        sessionId: "s1",
+        toolCallId: "tc1",
+        toolName: "bash",
+        output: "Exit code: 0\n",
+        outcome: "done",
+      };
+      const mutations = reduceStreamEvent(state, event);
+
+      expect(mutations).toContainEqual({
+        type: "updateToolCall",
+        id: "tc1",
+        updates: {
+          status: "done",
+          output: "Exit code: 0\n",
+          progress: null,
+          executionMeta: { rtk: progressMeta },
+        },
+      });
+    });
+
     it("attaches image results to completed tool calls", () => {
       const image = { data: "iVBORw0KGgo=", mimeType: "image/png" };
       const state = makeState({ isStreaming: true, activeToolCalls: [{ id: "tc1", name: "unity_capture_viewport", arguments: "{}", status: "running" }] });
@@ -522,6 +605,45 @@ describe("reduceStreamEvent", () => {
                 mode: "replace",
                 target: "project-understanding.md",
                 draft: "# Project Understanding",
+              },
+            ],
+            createdAt: 1,
+            updatedAt: 1,
+          },
+        },
+      };
+
+      const mutations = reduceStreamEvent(makeState(), event);
+      expect(mutations).toContainEqual({
+        type: "upsertMessage",
+        message: event.message,
+      });
+    });
+  });
+
+  describe("memoryProposal", () => {
+    it("upserts memory proposal messages into the stream", () => {
+      const event: StreamEvent = {
+        runId: "test-run",
+        type: "memoryProposal",
+        sessionId: "s1",
+        message: {
+          id: "mp-msg-1",
+          role: "assistant",
+          content: "",
+          createdAt: 1,
+          memoryProposal: {
+            proposalId: "mp-1",
+            status: "pending",
+            confidence: 0.91,
+            verify: "none",
+            estTokens: 80,
+            items: [
+              {
+                category: "user",
+                content: "Prefer concise Chinese replies.",
+                tags: ["locale"],
+                scope: "user",
               },
             ],
             createdAt: 1,

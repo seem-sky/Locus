@@ -29,6 +29,17 @@ src-tauri/gen/managed-python/pip.pyz
 src-tauri/gen/managed-git/windows-*/
 src-tauri/gen/managed-git/manifest.json
 src-tauri/gen/ort-runtime/windows-*/
+src-tauri/gen/codegraph-bundle/node_modules/
+src-tauri/gen/codegraph-bundle/node.exe
+src-tauri/gen/codegraph-bundle/lib/
+src-tauri/gen/codegraph-bundle/bin/
+src-tauri/gen/codegraph-bundle/manifest.json
+src-tauri/gen/agentmemory-bundle/node_modules/
+src-tauri/gen/agentmemory-bundle/bin/
+src-tauri/gen/agentmemory-bundle/manifest.json
+src-tauri/gen/rtk/rtk.exe
+src-tauri/gen/rtk/rtk
+src-tauri/gen/rtk/manifest.json
 
 # Editor directories and files
 .vscode/

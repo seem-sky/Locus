@@ -19,6 +19,8 @@ import { useNotificationStore } from "../stores/notification";
 import { useProjectStore } from "../stores/project";
 import { traceToolBlockLayoutChange } from "../services/layoutDiagnostics";
 import { resolveViewToolOpenId } from "./viewToolCallActions";
+import { resolveRtkDisplayForToolCall } from "../composables/rtkExecutionMeta";
+import { resolveToolCallDisplayShape } from "../composables/toolCallBatches";
 
 import type { ToolCallDisplay, FileDiffPayload } from "../types";
 
@@ -80,6 +82,16 @@ const showRecompileHint = computed(() =>
   && props.toolCall.status === "running"
   && !unityBackgroundHookSolved.value,
 );
+const rtkDisplay = computed(() => resolveRtkDisplayForToolCall(props.toolCall));
+const rtkStatusLabel = computed(() => {
+  if (!rtkDisplay.value) return "";
+  switch (rtkDisplay.value.status) {
+    case "rewritten": return t("tool.rtk.status.rewritten");
+    case "passthrough": return t("tool.rtk.status.passthrough");
+    case "unavailable": return t("tool.rtk.status.unavailable");
+    case "disabled": return t("tool.rtk.status.disabled");
+  }
+});
 const toolBlockOverride = computed(() => resolveToolBlockOverride(props.toolCall.name));
 const toolLayoutKey = computed(() => props.toolCall.id || props.toolCall.name);
 const toolLayoutToolCallIds = computed(() => props.toolCall.id);
@@ -186,7 +198,7 @@ const displayName = computed(() => {
       return "task";
     }
   }
-  return props.toolCall.name;
+  return resolveToolCallDisplayShape(props.toolCall).name;
 });
 
 const isEditTool = computed(() => props.toolCall.name === "edit");
@@ -477,6 +489,17 @@ const highlightedOutput = computed(() => {
           <span v-else class="tool-call-status-dot"></span>
         </span>
         <span class="tool-call-name">{{ displayName }}</span>
+        <span
+          v-if="rtkDisplay"
+          class="tool-call-rtk-inline"
+          :title="rtkStatusLabel"
+        >
+          <span
+            class="tool-call-rtk-badge"
+            :class="`status-${rtkDisplay.status}`"
+          >RTK</span>
+          <span class="tool-call-rtk-status-text">{{ rtkStatusLabel }}</span>
+        </span>
         <span v-if="argsSummary" class="tool-call-summary">{{ argsSummary }}</span>
       </button>
       <button
@@ -509,6 +532,22 @@ const highlightedOutput = computed(() => {
       <div class="recompile-hint-sub">{{ t("tool.recompile.sub") }}</div>
     </div>
     <div v-if="expanded" class="tool-call-detail">
+      <div v-if="rtkDisplay" class="tool-call-section tool-call-rtk-section">
+        <div class="tool-call-section-label">{{ t("tool.rtk.section") }}</div>
+        <div class="tool-call-rtk-panel" :class="`status-${rtkDisplay.status}`">
+          <div class="tool-call-rtk-status">{{ rtkStatusLabel }}</div>
+          <div v-if="rtkDisplay.executedCommand && rtkDisplay.status === 'rewritten'" class="tool-call-rtk-command">
+            <span class="tool-call-rtk-command-label">{{ t("tool.rtk.original") }}</span>
+            <code class="tool-call-rtk-command-value ui-select-text">{{ rtkDisplay.originalCommand }}</code>
+            <span class="tool-call-rtk-command-label">{{ t("tool.rtk.executed") }}</span>
+            <code class="tool-call-rtk-command-value ui-select-text">{{ rtkDisplay.executedCommand }}</code>
+          </div>
+          <div v-else-if="rtkDisplay.originalCommand" class="tool-call-rtk-command">
+            <span class="tool-call-rtk-command-label">{{ t("tool.rtk.command") }}</span>
+            <code class="tool-call-rtk-command-value ui-select-text">{{ rtkDisplay.originalCommand }}</code>
+          </div>
+        </div>
+      </div>
       <div class="tool-call-section">
         <div class="tool-call-section-label">{{ t("tool.section.args") }}</div>
         <template v-if="isEditTool && editDiffData">
@@ -745,6 +784,100 @@ const highlightedOutput = computed(() => {
   color: var(--text-color);
   font-size: 12px;
   flex-shrink: 0;
+}
+
+.tool-call-rtk-inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 1;
+  min-width: 0;
+  max-width: 42%;
+}
+
+.tool-call-rtk-status-text {
+  color: var(--text-secondary);
+  font-size: 10px;
+  line-height: 1.2;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tool-call-rtk-badge {
+  flex-shrink: 0;
+  padding: 0 5px;
+  border-radius: 4px;
+  border: 1px solid transparent;
+  font-family: var(--font-mono-identifier);
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 16px;
+  letter-spacing: 0.04em;
+}
+
+.tool-call-rtk-badge.status-rewritten {
+  color: var(--accent-color);
+  border-color: color-mix(in srgb, var(--accent-color) 34%, transparent);
+  background: color-mix(in srgb, var(--accent-color) 12%, transparent);
+}
+
+.tool-call-rtk-badge.status-passthrough {
+  color: var(--text-secondary);
+  border-color: color-mix(in srgb, var(--border-color) 80%, transparent);
+  background: color-mix(in srgb, var(--hover-bg) 70%, transparent);
+}
+
+.tool-call-rtk-badge.status-unavailable,
+.tool-call-rtk-badge.status-disabled {
+  color: var(--status-warn-fg);
+  border-color: color-mix(in srgb, var(--status-warn-border) 80%, transparent);
+  background: color-mix(in srgb, var(--status-warn-bg) 70%, transparent);
+}
+
+.tool-call-rtk-panel {
+  padding: 6px 8px;
+  border-radius: 5px;
+  border: 1px solid var(--border-color);
+  background: color-mix(in srgb, var(--panel-bg) 88%, transparent);
+}
+
+.tool-call-rtk-panel.status-rewritten {
+  border-color: color-mix(in srgb, var(--accent-color) 24%, var(--border-color));
+}
+
+.tool-call-rtk-panel.status-unavailable,
+.tool-call-rtk-panel.status-disabled {
+  border-color: color-mix(in srgb, var(--status-warn-border) 70%, var(--border-color));
+}
+
+.tool-call-rtk-status {
+  font-size: 11px;
+  color: var(--text-secondary);
+  margin-bottom: 4px;
+}
+
+.tool-call-rtk-command {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.tool-call-rtk-command-label {
+  font-size: 10px;
+  color: var(--text-secondary);
+}
+
+.tool-call-rtk-command-value {
+  display: block;
+  margin-bottom: 4px;
+  padding: 4px 6px;
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--hover-bg) 76%, transparent);
+  font-family: var(--font-mono-identifier);
+  font-size: 11px;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 .tool-call-summary {

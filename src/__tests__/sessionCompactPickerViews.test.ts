@@ -9,16 +9,16 @@ function read(relPath: string) {
 }
 
 describe("Session compact picker Views", () => {
-  it("renders the session View tree when the session View setting is enabled", () => {
+  it("keeps view tree code present but hidden from the compact picker", () => {
     const chatView = read("src/components/ChatView.vue");
     const compactPicker = read("src/components/chat/SessionCompactPicker.vue");
 
-    expect(chatView).toContain(":show-views=\"displaySettings.showViewsInSessionPanel\"");
+    expect(chatView).not.toContain(":show-views=");
     expect(chatView).toContain(":working-dir=\"workingDir\"");
 
-    expect(compactPicker).toContain("showViews?: boolean;");
+    expect(compactPicker).not.toContain("showViews?: boolean;");
     expect(compactPicker).toContain("workingDir?: string;");
-    expect(compactPicker).toContain("const showSessionViews = computed(() => props.showViews !== false)");
+    expect(compactPicker).toContain("const showSessionViews = computed(() => false)");
     expect(compactPicker).toContain("viewTree()");
     expect(compactPicker).toContain("view-package-reloaded");
     expect(compactPicker).toContain("view-tree-changed");

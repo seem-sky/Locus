@@ -8,7 +8,7 @@ const hasFooter = computed(() => !!slots.footer);
 </script>
 
 <template>
-  <div class="chat-input-shell">
+  <div class="chat-input-shell" data-composer-asset-ref-drop>
     <div v-if="hasTopBar" class="chat-input-shell-topbar">
       <div class="chat-input-shell-topbar-start">
         <slot name="top-start" />

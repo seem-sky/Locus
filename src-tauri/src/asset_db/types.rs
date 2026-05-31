@@ -142,6 +142,11 @@ impl AssetRoot {
     /// directories falls into `Other` (which is still indexed but never
     /// matches a `RootIn` filter).
     pub fn from_rel_path(path: &str) -> Self {
+        if let Some(rest) = path.strip_prefix("Assets.Lua") {
+            if rest.is_empty() || rest.starts_with('/') {
+                return Self::Assets;
+            }
+        }
         if let Some(rest) = path.strip_prefix("Assets") {
             if rest.is_empty() || rest.starts_with('/') {
                 return Self::Assets;

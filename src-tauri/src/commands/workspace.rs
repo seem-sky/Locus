@@ -16,7 +16,10 @@ use crate::session::store::SessionStore;
 use crate::unity_bridge::UnityMonitorHandle;
 use crate::workspace::Workspace;
 use crate::AssetDbWatcherHandle;
+use crate::CodegraphWatcherHandle;
 use crate::KnowledgeFsWatcherHandle;
+
+use super::workspace_browse_filters;
 
 const ENDPOINT_TEST_HTML_RESPONSE_CODE: &str = "endpoint_test.html_response";
 
@@ -323,6 +326,7 @@ pub async fn set_working_dir(
     ref_graph_state: State<'_, AssetDbState>,
     watcher_handle: State<'_, AssetDbWatcherHandle>,
     knowledge_watcher_handle: State<'_, KnowledgeFsWatcherHandle>,
+    codegraph_watcher_handle: State<'_, CodegraphWatcherHandle>,
     last_scan_info: State<'_, LastScanInfoState>,
     scan_phase_state: State<'_, ScanPhaseState>,
     scan_task_state: State<'_, super::RefGraphScanTaskState>,
@@ -521,6 +525,38 @@ pub async fn set_working_dir(
                 );
                 eprintln!(
                     "[Locus] warning: failed to start knowledge watcher: {}",
+                    error
+                );
+            }
+        }
+    }
+
+    if is_real_switch {
+        let mut codegraph_watcher = codegraph_watcher_handle
+            .lock()
+            .map_err(|e| format!("Lock error: {}", e))?;
+        if let Some(old) = codegraph_watcher.take() {
+            old.stop();
+            switch_timer.mark("old_codegraph_watcher_stopped");
+            eprintln!("[Locus] stopped CodeGraph watcher (working dir changed)");
+        }
+        switch_timer.mark("codegraph_watcher_start_begin");
+        match crate::codegraph_watcher::CodegraphWatcher::start(
+            canonical.clone(),
+            workspace.inner().clone(),
+        ) {
+            Ok(watcher) => {
+                *codegraph_watcher = Some(watcher);
+                switch_timer.mark("codegraph_watcher_start_done");
+                eprintln!("[Locus] CodeGraph watcher started for new working dir");
+            }
+            Err(error) => {
+                switch_timer.mark_detail(
+                    "codegraph_watcher_start_failed",
+                    format!(" error={}", error),
+                );
+                eprintln!(
+                    "[Locus] warning: failed to start CodeGraph watcher: {}",
                     error
                 );
             }
@@ -1500,6 +1536,48 @@ pub async fn set_workspace_locale(
     Ok(())
 }
 
+#[tauri::command]
+pub async fn get_workspace_browse_filters(
+    workspace: State<'_, Arc<crate::workspace::Workspace>>,
+) -> Result<workspace_browse_filters::WorkspaceBrowseFiltersPayload, AppError> {
+    let working_dir = workspace.path.read().await.clone();
+    if working_dir.trim().is_empty() {
+        return Ok(workspace_browse_filters::WorkspaceBrowseFiltersPayload::default());
+    }
+    let stored = crate::workspace::read_workspace_browse_filters(&working_dir);
+    Ok(workspace_browse_filters::WorkspaceBrowseFiltersPayload {
+        blocked_folder_names: stored.blocked_folder_names,
+        blocked_file_names: stored.blocked_file_names,
+        blocked_extensions: stored.blocked_extensions,
+    })
+}
+
+#[tauri::command]
+pub async fn set_workspace_browse_filters(
+    browse_filters: workspace_browse_filters::WorkspaceBrowseFiltersPayload,
+    workspace: State<'_, Arc<crate::workspace::Workspace>>,
+) -> Result<(), AppError> {
+    let working_dir = workspace.path.read().await.clone();
+    if working_dir.trim().is_empty() {
+        return Err(AppError::new(
+            "workspace.missing",
+            "Open a workspace before saving browse filters",
+        ));
+    }
+    let normalized =
+        workspace_browse_filters::WorkspaceBrowseFilters::from_payload(Some(browse_filters));
+    crate::workspace::update_workspace_browse_filters(
+        &working_dir,
+        crate::workspace::WorkspaceBrowseFiltersConfig {
+            blocked_folder_names: normalized.blocked_folder_names,
+            blocked_file_names: normalized.blocked_file_names,
+            blocked_extensions: normalized.blocked_extensions,
+        },
+    )
+    .map_err(|e| format!("Failed to update workspace browse filters: {}", e))?;
+    Ok(())
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DirEntry {
@@ -1591,13 +1669,69 @@ const WORKSPACE_HIDDEN_DIRS: &[&str] = &[
     "build",
     "Library",
     "Temp",
-    "Logs",
     "obj",
 ];
 
-const ASSET_ROOT_DIRS: &[&str] = &["Assets", "Packages", "ProjectSettings"];
-const LINKED_ASSET_ROOT_DIRS: &[&str] = &["Assets", "Packages"];
+const ASSET_ROOT_DIRS: &[&str] = &["Assets", "Assets.Lua", "Packages", "ProjectSettings"];
+const LINKED_ASSET_ROOT_DIRS: &[&str] = &["Assets", "Assets.Lua", "Packages"];
 const WORKSPACE_SEARCH_MAX_DEPTH: usize = 64;
+
+/// Resolve a workspace file path, applying well-known aliases when the direct
+/// path does not exist. Some Unity/xLua projects use a top-level `Assets.Lua`
+/// directory; models often mis-resolve it as `Assets/Lua/...`.
+pub(crate) fn resolve_workspace_file_path(
+    workspace_root: Option<&std::path::Path>,
+    raw_path: &str,
+) -> std::path::PathBuf {
+    let trimmed = raw_path.trim();
+    if trimmed.is_empty() {
+        return std::path::PathBuf::new();
+    }
+
+    let path = std::path::Path::new(trimmed);
+    let candidate = if path.is_absolute() {
+        path.to_path_buf()
+    } else if let Some(root) = workspace_root.filter(|root| !root.as_os_str().is_empty()) {
+        root.join(path)
+    } else {
+        path.to_path_buf()
+    };
+
+    if path_exists(&candidate) {
+        return candidate;
+    }
+
+    if let Some(remapped) = remap_assets_lua_mispath(workspace_root, &candidate) {
+        if path_exists(&remapped) {
+            return remapped;
+        }
+    }
+
+    candidate
+}
+
+fn path_exists(path: &std::path::Path) -> bool {
+    std::fs::metadata(path).is_ok()
+}
+
+fn remap_assets_lua_mispath(
+    workspace_root: Option<&std::path::Path>,
+    path: &std::path::Path,
+) -> Option<std::path::PathBuf> {
+    let workspace_root = workspace_root?;
+    if !workspace_root.join("Assets.Lua").is_dir() {
+        return None;
+    }
+
+    let unified = path.to_string_lossy().replace('\\', "/");
+    let lower = unified.to_ascii_lowercase();
+    const WRONG: &str = "assets/lua/";
+    const RIGHT: &str = "Assets.Lua/";
+    let idx = lower.find(WRONG)?;
+    let mut fixed = unified;
+    fixed.replace_range(idx..idx + WRONG.len(), RIGHT);
+    Some(std::path::PathBuf::from(fixed))
+}
 
 pub(crate) fn normalize_workspace_sub_path(sub_path: &str) -> Result<String, AppError> {
     let unified = sub_path.replace('\\', "/");
@@ -1671,7 +1805,13 @@ fn resolve_workspace_dir_target(
         .into())
 }
 
-fn should_skip_workspace_entry(file_name: &str, is_dir: bool, exclude_meta: bool) -> bool {
+fn should_skip_workspace_entry(
+    file_name: &str,
+    rel_path: &str,
+    is_dir: bool,
+    exclude_meta: bool,
+    browse_filters: Option<&workspace_browse_filters::WorkspaceBrowseFilters>,
+) -> bool {
     if file_name.starts_with('.') {
         return true;
     }
@@ -1680,7 +1820,16 @@ fn should_skip_workspace_entry(file_name: &str, is_dir: bool, exclude_meta: bool
         return true;
     }
 
-    is_dir && WORKSPACE_HIDDEN_DIRS.contains(&file_name)
+    if is_dir && WORKSPACE_HIDDEN_DIRS.contains(&file_name) {
+        return true;
+    }
+
+    workspace_browse_filters::should_skip_with_browse_filters(
+        file_name,
+        rel_path,
+        is_dir,
+        browse_filters,
+    )
 }
 
 fn join_workspace_rel_path(sub_path: &str, file_name: &str) -> String {
@@ -1770,6 +1919,7 @@ fn collect_dir_entries(
     target: &std::path::Path,
     sub_path: &str,
     exclude_meta: bool,
+    browse_filters: Option<&workspace_browse_filters::WorkspaceBrowseFilters>,
 ) -> Result<Vec<DirEntry>, AppError> {
     let mut entries: Vec<DirEntry> = Vec::new();
     let read_dir =
@@ -1785,7 +1935,13 @@ fn collect_dir_entries(
 
         let is_dir = entry_is_dir(&entry, &rel_path);
 
-        if should_skip_workspace_entry(&file_name, is_dir, exclude_meta) {
+        if should_skip_workspace_entry(
+            &file_name,
+            &rel_path,
+            is_dir,
+            exclude_meta,
+            browse_filters,
+        ) {
             continue;
         }
 
@@ -1902,6 +2058,7 @@ fn collect_workspace_search_entries(
     root_rel_path: &str,
     include_files: bool,
     query: &str,
+    browse_filters: Option<&workspace_browse_filters::WorkspaceBrowseFilters>,
     results: &mut Vec<WorkspaceSearchEntry>,
 ) -> Result<(), AppError> {
     let initial_linked_visit_keys = path_is_symlink_dir(root_dir).then(|| Arc::new(HashSet::new()));
@@ -1940,7 +2097,13 @@ fn collect_workspace_search_entries(
                 continue;
             }
             let is_dir = entry_is_dir(&entry, &rel_path);
-            if should_skip_workspace_entry(&file_name, is_dir, false) {
+            if should_skip_workspace_entry(
+                &file_name,
+                &rel_path,
+                is_dir,
+                false,
+                browse_filters,
+            ) {
                 continue;
             }
 
@@ -1983,6 +2146,7 @@ fn search_workspace_entries_in_dir(
     workspace_root: &std::path::Path,
     query: &str,
     limit: usize,
+    browse_filters: Option<&workspace_browse_filters::WorkspaceBrowseFilters>,
 ) -> Result<Vec<WorkspaceSearchEntry>, AppError> {
     if !workspace_root.is_dir() {
         return Ok(Vec::new());
@@ -1999,7 +2163,13 @@ fn search_workspace_entries_in_dir(
             continue;
         }
         let is_dir = entry_is_dir(&entry, &rel_path);
-        if should_skip_workspace_entry(&file_name, is_dir, false) {
+        if should_skip_workspace_entry(
+            &file_name,
+            &rel_path,
+            is_dir,
+            false,
+            browse_filters,
+        ) {
             continue;
         }
 
@@ -2022,6 +2192,7 @@ fn search_workspace_entries_in_dir(
             &rel_path,
             include_files,
             query,
+            browse_filters,
             &mut results,
         )?;
     }
@@ -2045,6 +2216,7 @@ fn search_workspace_entries_in_dir(
 #[tauri::command]
 pub async fn list_dir_entries(
     sub_path: String,
+    browse_filters: Option<workspace_browse_filters::WorkspaceBrowseFiltersPayload>,
     workspace: State<'_, Arc<Workspace>>,
 ) -> Result<Vec<DirEntry>, AppError> {
     let cwd = workspace.path.read().await.clone();
@@ -2053,7 +2225,9 @@ pub async fn list_dir_entries(
         return Ok(vec![]);
     }
 
-    collect_dir_entries(&target, &normalized_sub_path, false)
+    let filters = workspace_browse_filters::WorkspaceBrowseFilters::from_payload(browse_filters);
+    let filters_ref = filters.is_active().then_some(&filters);
+    collect_dir_entries(&target, &normalized_sub_path, false, filters_ref)
 }
 
 #[tauri::command]
@@ -2062,6 +2236,7 @@ pub async fn list_dir_entries_page(
     offset: Option<usize>,
     limit: Option<usize>,
     exclude_meta: Option<bool>,
+    browse_filters: Option<workspace_browse_filters::WorkspaceBrowseFiltersPayload>,
     workspace: State<'_, Arc<Workspace>>,
     dir_entries_cache: State<'_, DirEntriesPageCache>,
 ) -> Result<DirEntriesPage, AppError> {
@@ -2079,20 +2254,25 @@ pub async fn list_dir_entries_page(
     let offset = offset.unwrap_or(0);
     let limit = limit.unwrap_or(200).clamp(1, 2_000);
     let exclude_meta = exclude_meta.unwrap_or(false);
+    let filters = workspace_browse_filters::WorkspaceBrowseFilters::from_payload(browse_filters);
+    let filters_ref = filters.is_active().then_some(&filters);
     let cache_key = format!(
-        "{}::{}::{}",
+        "{}::{}::{}::{}",
         cwd,
         normalized_sub_path,
-        u8::from(exclude_meta)
+        u8::from(exclude_meta),
+        filters.cache_key()
     );
 
     let listing = if offset == 0 {
-        let entries = collect_dir_entries(&target, &normalized_sub_path, exclude_meta)?;
+        let entries =
+            collect_dir_entries(&target, &normalized_sub_path, exclude_meta, filters_ref)?;
         dir_entries_cache.insert(cache_key.clone(), entries)
     } else if let Some(cached) = dir_entries_cache.get(&cache_key) {
         cached
     } else {
-        let entries = collect_dir_entries(&target, &normalized_sub_path, exclude_meta)?;
+        let entries =
+            collect_dir_entries(&target, &normalized_sub_path, exclude_meta, filters_ref)?;
         dir_entries_cache.insert(cache_key.clone(), entries)
     };
 
@@ -2112,6 +2292,7 @@ pub async fn list_dir_entries_page(
 pub async fn search_workspace_entries(
     query: String,
     limit: Option<usize>,
+    browse_filters: Option<workspace_browse_filters::WorkspaceBrowseFiltersPayload>,
     workspace: State<'_, Arc<Workspace>>,
 ) -> Result<Vec<WorkspaceSearchEntry>, AppError> {
     let cwd = workspace.path.read().await.clone();
@@ -2125,7 +2306,9 @@ pub async fn search_workspace_entries(
     }
 
     let limit = limit.unwrap_or(200).clamp(1, 500);
-    search_workspace_entries_in_dir(std::path::Path::new(&cwd), trimmed, limit)
+    let filters = workspace_browse_filters::WorkspaceBrowseFilters::from_payload(browse_filters);
+    let filters_ref = filters.is_active().then_some(&filters);
+    search_workspace_entries_in_dir(std::path::Path::new(&cwd), trimmed, limit, filters_ref)
 }
 
 #[tauri::command]
@@ -2444,7 +2627,8 @@ mod tests {
     use super::{
         collect_dir_entries, normalize_custom_endpoint_config,
         normalize_tool_permission_mode_request, normalize_workspace_sub_path,
-        resolve_workspace_dir_target, search_workspace_entries_in_dir, workspace_search_score,
+        resolve_workspace_dir_target, resolve_workspace_file_path,
+        search_workspace_entries_in_dir, workspace_search_score,
         CustomEndpoint,
     };
     use std::path::Path;
@@ -2636,6 +2820,10 @@ mod tests {
             normalize_workspace_sub_path("Assets\\Linked\\Hero.cs").unwrap(),
             "Assets/Linked/Hero.cs"
         );
+        assert_eq!(
+            normalize_workspace_sub_path("Assets.Lua/Games/Texas/foo.lua").unwrap(),
+            "Assets.Lua/Games/Texas/foo.lua"
+        );
         assert!(normalize_workspace_sub_path("../Assets").is_err());
         assert!(normalize_workspace_sub_path("Assets/../ProjectSettings").is_err());
         assert!(normalize_workspace_sub_path("C:/outside").is_err());
@@ -2660,13 +2848,13 @@ mod tests {
             .expect("write asset file");
 
         let generic_results =
-            search_workspace_entries_in_dir(temp.path(), "UnityEditor.Overlays", 100)
+            search_workspace_entries_in_dir(temp.path(), "UnityEditor.Overlays", 100, None)
                 .expect("search generic workspace");
         assert!(generic_results.iter().any(|entry| {
             entry.rel_path == "UIElementsSchema/UnityEditor.Overlays.xsd" && !entry.is_dir
         }));
 
-        let folder_results = search_workspace_entries_in_dir(temp.path(), "Scripts", 100)
+        let folder_results = search_workspace_entries_in_dir(temp.path(), "Scripts", 100, None)
             .expect("search workspace folders");
         assert!(folder_results
             .iter()
@@ -2692,7 +2880,8 @@ mod tests {
         }
 
         let assets_entries =
-            collect_dir_entries(&workspace.join("Assets"), "Assets", true).expect("list Assets");
+            collect_dir_entries(&workspace.join("Assets"), "Assets", true, None)
+                .expect("list Assets");
         assert!(assets_entries
             .iter()
             .any(|entry| entry.rel_path == "Assets/Linked" && entry.is_dir));
@@ -2703,7 +2892,7 @@ mod tests {
         assert_eq!(normalized, "Assets/Linked");
 
         let linked_entries =
-            collect_dir_entries(&target, &normalized, true).expect("list symlinked folder");
+            collect_dir_entries(&target, &normalized, true, None).expect("list symlinked folder");
         assert!(linked_entries
             .iter()
             .any(|entry| entry.rel_path == "Assets/Linked/Nested" && entry.is_dir));
@@ -2731,7 +2920,8 @@ mod tests {
         let workspace_str = workspace.to_string_lossy();
         assert!(resolve_workspace_dir_target(&workspace_str, "Docs").is_err());
 
-        let root_entries = collect_dir_entries(&workspace, "", true).expect("list workspace root");
+        let root_entries =
+            collect_dir_entries(&workspace, "", true, None).expect("list workspace root");
         assert!(!root_entries.iter().any(|entry| entry.rel_path == "Docs"));
     }
 
@@ -2749,7 +2939,8 @@ mod tests {
         }
 
         let results =
-            search_workspace_entries_in_dir(&workspace, "Secret", 100).expect("search workspace");
+            search_workspace_entries_in_dir(&workspace, "Secret", 100, None)
+                .expect("search workspace");
         assert!(!results
             .iter()
             .any(|entry| entry.rel_path == "Docs/Secret.txt"));
@@ -2769,10 +2960,34 @@ mod tests {
         }
 
         let results =
-            search_workspace_entries_in_dir(&workspace, "Loop", 100).expect("search workspace");
+            search_workspace_entries_in_dir(&workspace, "Loop", 100, None)
+                .expect("search workspace");
         assert!(results
             .iter()
             .any(|entry| entry.rel_path == "Assets/Loop" && entry.is_dir));
         assert!(results.len() < 20);
+    }
+
+    #[test]
+    fn resolve_workspace_file_path_remaps_assets_lua_alias() {
+        let temp = tempdir().expect("create temp dir");
+        let workspace = temp.path().join("project");
+        let target = workspace
+            .join("Assets.Lua")
+            .join("Games")
+            .join("Texas")
+            .join("foo.lua");
+        std::fs::create_dir_all(target.parent().expect("parent dir")).expect("create dirs");
+        std::fs::write(&target, "print('ok')").expect("write lua file");
+
+        let resolved = resolve_workspace_file_path(
+            Some(&workspace),
+            "Assets/Lua/Games/Texas/foo.lua",
+        );
+        assert_eq!(resolved, target);
+
+        let absolute_wrong = workspace.join("Assets").join("Lua").join("Games").join("Texas").join("foo.lua");
+        let resolved_absolute = resolve_workspace_file_path(Some(&workspace), &absolute_wrong.to_string_lossy());
+        assert_eq!(resolved_absolute, target);
     }
 }

@@ -26,11 +26,15 @@ pub mod keychain;
 pub mod knowledge_index;
 pub mod knowledge_store;
 mod knowledge_watcher;
+mod codegraph_watcher;
+pub mod agentmemory;
+pub mod memory;
 mod llm;
 pub(crate) mod merge;
 pub mod network;
 pub mod process_util;
 pub mod prompt;
+mod rtk;
 pub mod python_runtime;
 mod session;
 mod tool;
@@ -48,6 +52,7 @@ mod windows_window_frame;
 mod workspace;
 
 use agent::definition::AgentDefRegistry;
+use agent::workflow::DevWorkflowGateStore;
 use agent::instance::{AssistantStreamState, RawContextStore};
 use commands::AppKnowledgeDir;
 
@@ -199,6 +204,8 @@ use config::{AppCloseBehavior, AppConfig};
 pub type AssetDbWatcherHandle = Arc<std::sync::Mutex<Option<AssetDbWatcher>>>;
 pub type KnowledgeFsWatcherHandle =
     Arc<std::sync::Mutex<Option<knowledge_watcher::KnowledgeFsWatcher>>>;
+pub type CodegraphWatcherHandle =
+    Arc<std::sync::Mutex<Option<codegraph_watcher::CodegraphWatcher>>>;
 use session::store::SessionStore;
 use tool::ToolRegistry;
 use unity_bridge::UnityMonitorHandle;
@@ -235,8 +242,17 @@ pub struct PendingKnowledgeProposalDraft {
     pub proposal: session::models::KnowledgeProposal,
 }
 
+#[derive(Debug, Clone)]
+pub struct PendingMemoryProposalDraft {
+    pub run_id: String,
+    pub proposal: session::models::MemoryProposal,
+}
+
 pub type KnowledgeProposalDraftStore =
     Arc<tokio::sync::Mutex<HashMap<String, PendingKnowledgeProposalDraft>>>;
+
+pub type MemoryProposalDraftStore =
+    Arc<tokio::sync::Mutex<HashMap<String, PendingMemoryProposalDraft>>>;
 
 pub type UndoManagerHandle = Arc<vcs::UndoManager>;
 
@@ -369,7 +385,10 @@ pub fn run() {
             let data_dir = commands::prepare_runtime_storage_dir(&app.handle().clone())
                 .map_err(|e| format!("Failed to prepare app storage dir: {}", e))?;
             if let Ok(resource_dir) = app.path().resource_dir() {
-                process_util::set_managed_git_resource_dir(resource_dir);
+                process_util::set_managed_git_resource_dir(resource_dir.clone());
+                tool::builtins::codegraph::set_managed_codegraph_resource_dir(resource_dir.clone());
+                rtk::set_managed_rtk_resource_dir(resource_dir.clone());
+                crate::agentmemory::resolve::set_managed_agentmemory_resource_dir(resource_dir);
             }
             commands::restore_saved_git_override(&app.handle().clone());
 
@@ -544,6 +563,8 @@ pub fn run() {
                 Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
 
             let active_tasks: ActiveTasks = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+            let dev_workflow_gates: DevWorkflowGateStore =
+                Arc::new(Mutex::new(HashMap::new()));
             let pending_input_queue: PendingInputQueueHandle =
                 Arc::new(std::sync::Mutex::new(session::pending_inputs::PendingInputQueue::default()));
 
@@ -552,6 +573,9 @@ pub fn run() {
                 Arc::new(tokio::sync::Mutex::new(HashMap::new()));
             let knowledge_proposal_drafts: KnowledgeProposalDraftStore =
                 Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+            let memory_proposal_drafts: MemoryProposalDraftStore =
+                Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+            let memory_store = Arc::new(crate::agentmemory::AgentMemoryState::new());
 
             let undo_manager: UndoManagerHandle = Arc::new(vcs::UndoManager::new(vcs::GitProvider));
             let view_automation_store = Arc::new(view::ViewAutomationStore::default());
@@ -659,6 +683,8 @@ pub fn run() {
 
             let watcher_handle: AssetDbWatcherHandle = Arc::new(std::sync::Mutex::new(None));
             let knowledge_watcher_handle: KnowledgeFsWatcherHandle =
+                Arc::new(std::sync::Mutex::new(None));
+            let codegraph_watcher_handle: CodegraphWatcherHandle =
                 Arc::new(std::sync::Mutex::new(None));
             let watcher_tuning = Arc::new(crate::asset_db::watcher::WatcherTuning::new());
             let ref_graph_scan_task_state = commands::RefGraphScanTaskState::new();
@@ -794,6 +820,23 @@ pub fn run() {
                     }
                 }
             }
+
+            if !initial_working_dir_copy.trim().is_empty() {
+                match codegraph_watcher::CodegraphWatcher::start(
+                    initial_working_dir_copy.clone(),
+                    workspace.clone(),
+                ) {
+                    Ok(watcher) => {
+                        *codegraph_watcher_handle.lock().unwrap() = Some(watcher);
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "[Locus] warning: failed to start CodeGraph watcher: {}",
+                            error
+                        );
+                    }
+                }
+            }
             startup_for_setup.mark("setup_watchers_ready");
 
             app.manage(config);
@@ -809,11 +852,14 @@ pub fn run() {
             app.manage(workspace.clone());
             app.manage(raw_context_store);
             app.manage(active_tasks);
+            app.manage(dev_workflow_gates);
+            app.manage(commands::AgentResponseSettingsState::new());
             app.manage(pending_input_queue);
             app.manage(unity_monitor.clone());
             app.manage(ref_graph_state);
             app.manage(watcher_handle);
             app.manage(knowledge_watcher_handle);
+            app.manage(codegraph_watcher_handle);
             app.manage(crate::asset_db::watcher::WatcherTuningState(watcher_tuning));
             app.manage(ref_graph_scan_task_state);
             app.manage(asset_reconcile_task_state);
@@ -824,6 +870,10 @@ pub fn run() {
             app.manage(question_store);
             app.manage(agent_graph_tool_store);
             app.manage(knowledge_proposal_drafts);
+            app.manage(memory_proposal_drafts);
+            memory_store.set_export_root(data_dir.join("agentmemory"));
+            let memory_store_for_startup = memory_store.clone();
+            app.manage(memory_store);
             app.manage(undo_manager);
             app.manage(view_automation_store);
             app.manage(tool_permission_mode);
@@ -834,6 +884,26 @@ pub fn run() {
             app.manage(feishu_reference_import_state);
             app.manage(log_store_for_setup.clone());
             startup_for_setup.mark("setup_state_managed");
+
+            tauri::async_runtime::spawn(async move {
+                let result = tauri::async_runtime::spawn_blocking(move || {
+                    memory_store_for_startup.ensure_ready()
+                })
+                .await;
+
+                match result {
+                    Ok(Ok(())) => eprintln!("[Locus] agentmemory service ready"),
+                    Ok(Err(error)) => eprintln!(
+                        "[Locus] warning: agentmemory autostart skipped or failed: {}",
+                        error
+                    ),
+                    Err(error) => eprintln!(
+                        "[Locus] warning: agentmemory autostart task failed: {}",
+                        error
+                    ),
+                }
+            });
+
             startup_for_setup.mark("setup_backend_ready");
 
             let main_window_config = app
@@ -927,6 +997,7 @@ pub fn run() {
             commands::fork_session,
             commands::fork_session_from_message,
             commands::chat,
+            commands::set_agent_response_settings,
             commands::queue_chat_input,
             commands::insert_pending_chat_input,
             commands::list_agents,
@@ -972,6 +1043,8 @@ pub fn run() {
             commands::open_dir_in_file_explorer,
             commands::list_dir_entries,
             commands::list_dir_entries_page,
+            commands::get_workspace_browse_filters,
+            commands::set_workspace_browse_filters,
             commands::search_workspace_entries,
             commands::save_raw_context,
             commands::get_todos,
@@ -979,6 +1052,20 @@ pub fn run() {
             commands::stale_knowledge_proposals,
             commands::ignore_knowledge_proposal,
             commands::apply_knowledge_proposal,
+            commands::stale_memory_proposals,
+            commands::ignore_memory_proposal,
+            commands::apply_memory_proposal,
+            commands::memory_list,
+            commands::memory_get,
+            commands::memory_create,
+            commands::memory_update,
+            commands::memory_delete,
+            commands::memory_pin,
+            commands::memory_tag_update,
+            commands::memory_retrieve,
+            commands::agentmemory_status,
+            commands::agentmemory_start,
+            commands::agentmemory_stop,
             commands::check_unity_connection,
             commands::check_unity_connection_status,
             commands::lua_gc_monitor_start,
@@ -1105,6 +1192,8 @@ pub fn run() {
             commands::knowledge_delete_unity_reference_docs,
             commands::knowledge_delete_feishu_reference_docs,
             commands::knowledge_delete_external_reference_directory,
+            commands::knowledge_preview_webpage,
+            commands::knowledge_import_webpage,
             commands::knowledge_create,
             commands::knowledge_delete,
             commands::knowledge_move,

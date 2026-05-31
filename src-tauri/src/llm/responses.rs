@@ -512,6 +512,7 @@ fn collect_tool_calls(map: HashMap<u32, PendingToolCall>) -> Result<Vec<ToolCall
             outcome: None,
             recorded_output: None,
             nested_tool_calls: None,
+            execution_meta: None,
         });
     }
 
@@ -952,6 +953,7 @@ mod tests {
             thinking_duration: None,
             thinking_signature: None,
             knowledge_proposal: None,
+            memory_proposal: None,
             render_parts: None,
         }
     }
@@ -975,6 +977,7 @@ mod tests {
             thinking_duration: None,
             thinking_signature: None,
             knowledge_proposal: None,
+            memory_proposal: None,
             render_parts: None,
         }
     }
@@ -1003,6 +1006,7 @@ mod tests {
             thinking_duration: None,
             thinking_signature: None,
             knowledge_proposal: None,
+            memory_proposal: None,
             render_parts: None,
         }
     }
@@ -1026,6 +1030,7 @@ mod tests {
             thinking_duration: None,
             thinking_signature: None,
             knowledge_proposal: None,
+            memory_proposal: None,
             render_parts: None,
         }
     }
@@ -1115,6 +1120,7 @@ mod tests {
                 outcome: None,
                 recorded_output: None,
                 nested_tool_calls: None,
+                execution_meta: None,
             }],
         )]);
 

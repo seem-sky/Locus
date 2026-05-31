@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+pub use crate::memory::{MemoryCategory, MemoryScope};
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionSummary {
@@ -119,6 +121,8 @@ pub struct ToolCallInfo {
     pub recorded_output: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nested_tool_calls: Option<Vec<ToolCallInfo>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_meta: Option<serde_json::Value>,
 }
 
 impl ToolCallInfo {
@@ -163,6 +167,12 @@ pub enum AssistantRenderPart {
     },
     #[serde(rename_all = "camelCase")]
     KnowledgeProposal {
+        id: String,
+        order: RenderOrderKey,
+        message: Box<ChatMessage>,
+    },
+    #[serde(rename_all = "camelCase")]
+    MemoryProposal {
         id: String,
         order: RenderOrderKey,
         message: Box<ChatMessage>,
@@ -312,6 +322,30 @@ pub struct KnowledgeProposal {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct MemoryProposalItem {
+    pub category: MemoryCategory,
+    pub content: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    pub scope: MemoryScope,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryProposal {
+    pub proposal_id: String,
+    pub status: KnowledgeProposalStatus,
+    pub confidence: f32,
+    pub verify: KnowledgeProposalVerify,
+    pub est_tokens: u32,
+    #[serde(default)]
+    pub items: Vec<MemoryProposalItem>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ChatMessage {
     pub id: String,
     pub role: MessageRole,
@@ -343,6 +377,8 @@ pub struct ChatMessage {
     pub thinking_signature: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub knowledge_proposal: Option<KnowledgeProposal>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_proposal: Option<MemoryProposal>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub render_parts: Option<Vec<AssistantRenderPart>>,
 }

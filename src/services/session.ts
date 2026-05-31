@@ -27,6 +27,8 @@ export interface ChatParams {
   userIntent?: UserIntentMeta | null;
   subagentModels?: Record<string, string> | null;
   knowledgeMode?: KnowledgeAccessMode | null;
+  /** UI locale (`zh` / `en`) — keeps subagent response language aligned with the main session. */
+  responseLocale?: string | null;
 }
 
 export interface CreateSessionParams {
@@ -95,6 +97,21 @@ export function applyKnowledgeProposal(
     sessionId,
     proposalId,
   });
+}
+
+export function staleMemoryProposals(sessionId: string): Promise<void> {
+  return ipcInvoke("stale_memory_proposals", { sessionId });
+}
+
+export function ignoreMemoryProposal(sessionId: string, proposalId: string): Promise<void> {
+  return ipcInvoke("ignore_memory_proposal", { sessionId, proposalId });
+}
+
+export function applyMemoryProposal(
+  sessionId: string,
+  proposalId: string,
+): Promise<void> {
+  return ipcInvoke("apply_memory_proposal", { sessionId, proposalId });
 }
 
 export function createSession(params: CreateSessionParams): Promise<string> {

@@ -1,4 +1,5 @@
 import type { AssistantRenderPart, ChatMessage, ImageAttachment, ToolCallDisplay, ToolCallInfo } from "../types";
+import { normalizeExecutionMeta } from "./rtkExecutionMeta";
 
 const INTERRUPTED_TOOL_RESULT = "工具执行被用户中止，未返回结果。";
 const GENERIC_ARGUMENT_ALIAS_GROUPS: Array<readonly [string, readonly string[]]> = [
@@ -587,6 +588,10 @@ export function buildMessageToolCall(
   };
   if (images && images.length > 0) {
     display.images = images;
+  }
+  const normalizedExecutionMeta = normalizeExecutionMeta(toolCall);
+  if (normalizedExecutionMeta) {
+    display.executionMeta = normalizedExecutionMeta;
   }
   return display;
 }

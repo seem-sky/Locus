@@ -292,6 +292,7 @@ pub async fn stream_chat<F, G, H>(
     base_url: Option<&str>,
     request_session_id: Option<&str>,
     thinking_level: Option<&str>,
+    trailing_system_reminder: Option<&str>,
     on_text_delta: F,
     on_thinking_delta: G,
     on_tool_call_start: H,
@@ -322,7 +323,7 @@ where
     let anthropic_tools = converted_tools;
     let oauth_tool_aliases = Some(tool_aliases);
 
-    let system_blocks = build_oauth_system_blocks(system_parts);
+    let system_blocks = build_oauth_system_blocks(system_parts, trailing_system_reminder);
     let (thinking_field, output_config, standard_max_tokens) =
         build_thinking_params(&effective_model, thinking_level);
     let max_tokens = u64::from(standard_max_tokens);
@@ -1124,6 +1125,7 @@ where
                 outcome: None,
                 recorded_output: None,
                 nested_tool_calls: None,
+                execution_meta: None,
             }
         })
         .collect();
@@ -1397,7 +1399,10 @@ fn build_anthropic_messages(
     messages
 }
 
-fn build_oauth_system_blocks(system_parts: &[&str]) -> serde_json::Value {
+fn build_oauth_system_blocks(
+    system_parts: &[&str],
+    trailing_reminder: Option<&str>,
+) -> serde_json::Value {
     let mut blocks: Vec<serde_json::Value> = Vec::new();
 
     blocks.push(serde_json::json!({
@@ -1423,6 +1428,13 @@ fn build_oauth_system_blocks(system_parts: &[&str]) -> serde_json::Value {
             "type": "text",
             "text": cleaned,
             "cache_control": { "type": "ephemeral", "ttl": CACHE_TTL },
+        }));
+    }
+
+    if let Some(reminder) = trailing_reminder.filter(|value| !value.trim().is_empty()) {
+        blocks.push(serde_json::json!({
+            "type": "text",
+            "text": reminder,
         }));
     }
 
@@ -2076,6 +2088,7 @@ mod tests {
             thinking_duration: None,
             thinking_signature: thinking_signature.map(str::to_string),
             knowledge_proposal: None,
+            memory_proposal: None,
             render_parts: None,
         }
     }
@@ -2160,6 +2173,7 @@ mod tests {
             thinking_duration: None,
             thinking_signature: None,
             knowledge_proposal: None,
+            memory_proposal: None,
             render_parts: None,
         }];
 
@@ -2336,6 +2350,7 @@ mod tests {
                 thinking_duration: None,
                 thinking_signature: None,
                 knowledge_proposal: None,
+            memory_proposal: None,
                 render_parts: None,
             },
             ChatMessage {
@@ -2356,6 +2371,7 @@ mod tests {
                 thinking_duration: None,
                 thinking_signature: None,
                 knowledge_proposal: None,
+            memory_proposal: None,
                 render_parts: None,
             },
             ChatMessage {
@@ -2376,6 +2392,7 @@ mod tests {
                 thinking_duration: None,
                 thinking_signature: None,
                 knowledge_proposal: None,
+            memory_proposal: None,
                 render_parts: None,
             },
         ];
@@ -2393,7 +2410,7 @@ mod tests {
             })
             .filter(|block| block.get("cache_control").is_some())
             .count();
-        let system_cache_blocks = build_oauth_system_blocks(&["system prompt"])
+        let system_cache_blocks = build_oauth_system_blocks(&["system prompt"], None)
             .as_array()
             .into_iter()
             .flat_map(|blocks| blocks.iter())
@@ -2427,6 +2444,7 @@ mod tests {
                 outcome: None,
                 recorded_output: None,
                 nested_tool_calls: None,
+                execution_meta: None,
             }]),
             tool_call_id: None,
             images: None,
@@ -2435,6 +2453,7 @@ mod tests {
             thinking_duration: None,
             thinking_signature: None,
             knowledge_proposal: None,
+            memory_proposal: None,
             render_parts: None,
         }];
 
@@ -2493,6 +2512,7 @@ mod tests {
                         outcome: None,
                         recorded_output: None,
                         nested_tool_calls: None,
+                        execution_meta: None,
                     },
                     ToolCallInfo {
                         id: "call_2".to_string(),
@@ -2504,6 +2524,7 @@ mod tests {
                         outcome: None,
                         recorded_output: None,
                         nested_tool_calls: None,
+                        execution_meta: None,
                     },
                 ]),
                 tool_call_id: None,
@@ -2513,6 +2534,7 @@ mod tests {
                 thinking_duration: None,
                 thinking_signature: None,
                 knowledge_proposal: None,
+            memory_proposal: None,
                 render_parts: None,
             },
             ChatMessage {
@@ -2533,6 +2555,7 @@ mod tests {
                 thinking_duration: None,
                 thinking_signature: None,
                 knowledge_proposal: None,
+            memory_proposal: None,
                 render_parts: None,
             },
         ];
@@ -2584,6 +2607,7 @@ mod tests {
                     outcome: None,
                     recorded_output: None,
                     nested_tool_calls: None,
+                    execution_meta: None,
                 }]),
                 tool_call_id: None,
                 images: None,
@@ -2592,6 +2616,7 @@ mod tests {
                 thinking_duration: None,
                 thinking_signature: None,
                 knowledge_proposal: None,
+            memory_proposal: None,
                 render_parts: None,
             },
             ChatMessage {
@@ -2615,6 +2640,7 @@ mod tests {
                 thinking_duration: None,
                 thinking_signature: None,
                 knowledge_proposal: None,
+            memory_proposal: None,
                 render_parts: None,
             },
         ];

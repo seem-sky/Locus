@@ -400,9 +400,57 @@ describe("display settings transcript alignment", () => {
     expect(transcript).toContain("hasThinkingContent: hasVisibleCompletedThinkingContent.value,");
     expect(transcript).toContain("function shouldRenderTransientThinkingSegment(");
     expect(transcript).toContain("return !!part.active || (!shouldHideThinkingBlocks() && part.content.trim().length > 0);");
+    expect(transcript).toContain("function shouldShowInlineThinkingContent(");
+    expect(transcript).toContain("function toggleThinkingCollapse(");
+    expect(transcript).toContain("class=\"chat-transcript-thinking-body\"");
+    expect(transcript).toContain(":class=\"{ 'is-expanded': isThinkingExpanded(segment.key) }\"");
     expect(transcript).toMatch(/if \(part\.kind === "thinking"\) \{\s+if \(!shouldRenderTransientThinkingSegment\(part\)\) continue;\s+flushPendingTools\(\);/);
 
     expect(zh).toContain('"settings.display.hideThinkingBlocks": "隐藏已完成思考块"');
     expect(en).toContain('"settings.display.hideThinkingBlocks": "Hide completed thinking blocks"');
+  });
+
+  it("adds a thinking auto-expand toggle that defaults to on", () => {
+    const displaySettings = read("src/composables/useDisplaySettings.ts");
+    const displayPanel = read("src/components/settings/DisplaySettings.vue");
+    const transcript = read("src/components/chat/ChatTranscript.vue");
+    const zh = read("src/language/zh.json");
+    const en = read("src/language/en.json");
+
+    expect(displaySettings).toContain("thinkingAutoExpand: boolean;");
+    expect(displaySettings).toContain("thinkingAutoExpand: true,");
+
+    expect(displayPanel).toContain(":model-value=\"display.thinkingAutoExpand\"");
+    expect(displayPanel).toContain(":aria-label=\"t('settings.display.thinkingAutoExpand')\"");
+    expect(displayPanel).toContain("@update:model-value=\"setDisplay('thinkingAutoExpand', $event)\"");
+    expect(displayPanel).toContain("{{ t(\"settings.display.thinkingAutoExpand\") }}");
+
+    expect(transcript).toContain("function shouldAutoExpandThinking()");
+    expect(transcript).toContain("displaySettings.thinkingAutoExpand !== false");
+
+    expect(zh).toContain('"settings.display.thinkingAutoExpand": "自动展开会话中的思考过程"');
+    expect(en).toContain('"settings.display.thinkingAutoExpand": "Auto-expand thinking content in the chat transcript"');
+  });
+
+  it("adds a thinking panel auto-open toggle that defaults to off", () => {
+    const displaySettings = read("src/composables/useDisplaySettings.ts");
+    const displayPanel = read("src/components/settings/DisplaySettings.vue");
+    const chatStore = read("src/stores/chat.ts");
+    const zh = read("src/language/zh.json");
+    const en = read("src/language/en.json");
+
+    expect(displaySettings).toContain("thinkingAutoOpen: boolean;");
+    expect(displaySettings).toContain("thinkingAutoOpen: false,");
+
+    expect(displayPanel).toContain(":model-value=\"display.thinkingAutoOpen\"");
+    expect(displayPanel).toContain(":aria-label=\"t('settings.display.thinkingAutoOpen')\"");
+    expect(displayPanel).toContain("@update:model-value=\"setDisplay('thinkingAutoOpen', $event)\"");
+    expect(displayPanel).toContain("{{ t(\"settings.display.thinkingAutoOpen\") }}");
+
+    expect(chatStore).toContain("useDisplaySettings().state.thinkingAutoOpen");
+    expect(chatStore).toContain("showThinkingPanel.value = true");
+
+    expect(zh).toContain('"settings.display.thinkingAutoOpen": "开始思考时自动打开思考过程面板"');
+    expect(en).toContain('"settings.display.thinkingAutoOpen": "Auto-open thinking panel when thinking starts"');
   });
 });

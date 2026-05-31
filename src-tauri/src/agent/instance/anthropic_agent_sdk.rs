@@ -97,6 +97,7 @@ impl<'a> ClaudeSdkRoundHost<'a> {
         output: &str,
         outcome: ToolCallOutcome,
         images: Option<&[ImageData]>,
+        execution_meta: Option<serde_json::Value>,
     ) {
         emit_stream(
             self.app_handle,
@@ -108,6 +109,7 @@ impl<'a> ClaudeSdkRoundHost<'a> {
                 output: output.to_string(),
                 outcome,
                 images: images.map(|items| items.to_vec()),
+                execution_meta,
             },
         );
         if let Some(ref parent) = self.agent.parent_tool_call {
@@ -125,6 +127,7 @@ impl<'a> ClaudeSdkRoundHost<'a> {
                     truncated_output,
                     outcome,
                     images.map(|items| items.to_vec()),
+                    None,
                 ),
             );
         }
@@ -209,6 +212,7 @@ impl<'a> ClaudeSdkRoundHost<'a> {
                     recorded_output: None,
                     nested_tool_calls: None,
                     order: None,
+                    execution_meta: None,
                 });
         }
 
@@ -230,6 +234,7 @@ impl<'a> ClaudeSdkRoundHost<'a> {
                     recorded_output: None,
                     nested_tool_calls: None,
                     order: None,
+                    execution_meta: None,
                 });
         }
 
@@ -249,6 +254,7 @@ impl<'a> ClaudeSdkRoundHost<'a> {
                     recorded_output: None,
                     nested_tool_calls: None,
                     order: None,
+                    execution_meta: None,
                 };
             }
         }
@@ -263,6 +269,7 @@ impl<'a> ClaudeSdkRoundHost<'a> {
             recorded_output: None,
             nested_tool_calls: None,
             order: None,
+            execution_meta: None,
         }
     }
 }
@@ -541,6 +548,7 @@ impl<'a> ClaudeSdkHost for ClaudeSdkRoundHost<'a> {
                 &stored_output,
                 result.outcome.as_stream_outcome(),
                 result.images.as_deref(),
+                result.execution_meta.clone(),
             );
 
             self.completed_tool_ids.insert(tool_call.id.clone());
@@ -584,6 +592,7 @@ impl AgentInstance {
             .build_request_tool_names_for_mode_and_skills(
                 dynamic_tool_loading_mode,
                 active_skill_tool_names,
+                Some(initial_mode),
             )
             .await;
         let api_tools = self.build_api_tools(&request_tools).await;

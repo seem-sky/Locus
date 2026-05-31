@@ -7,6 +7,7 @@ import { useChatChangesStore } from "../stores/chatChanges";
 import { acquireSelectionLock } from "../composables/useSelectionLock";
 import TodoPanel from "./TodoPanel.vue";
 import ChatChangesPanel from "./ChatChangesPanel.vue";
+import ThinkingPanel from "./ThinkingPanel.vue";
 
 const props = withDefaults(defineProps<{
   todos: TodoItem[];
@@ -24,9 +25,22 @@ const props = withDefaults(defineProps<{
 const chatStore = useChatStore();
 const changesStore = useChatChangesStore();
 
+const showThinkingSection = computed(() => chatStore.showThinkingPanel);
 const showTodoSection = computed(() => chatStore.showTodoPanel);
 const showChangesSection = computed(() => changesStore.currentPanelVisible);
-const hasBothSections = computed(() => showTodoSection.value && showChangesSection.value);
+const hasTodoAndChangesSections = computed(() => showTodoSection.value && showChangesSection.value);
+const visibleSectionCount = computed(() =>
+  Number(showThinkingSection.value)
+  + Number(showTodoSection.value)
+  + Number(showChangesSection.value),
+);
+const hasMultipleSections = computed(() => visibleSectionCount.value > 1);
+const thinkingPanelContent = computed(() =>
+  chatStore.thinkingPanelContent || chatStore.streamingThinking,
+);
+const thinkingPanelIsLive = computed(() =>
+  chatStore.isThinking && !chatStore.thinkingPanelContent,
+);
 
 const STORAGE_KEY_SIDEBAR_WIDTH = "locus:chatSidebarWidth";
 const STORAGE_KEY_SIDEBAR_HEIGHT = "locus:chatSidebarHeight";
@@ -95,6 +109,7 @@ function clampSidebarHeight(next: number) {
 function closeSidebar() {
   chatStore.closeTodoPanel();
   changesStore.closePanel();
+  chatStore.showThinkingPanel = false;
 }
 
 function onSidebarResizeMouseDown(event: MouseEvent) {
@@ -185,13 +200,28 @@ onUnmounted(() => {
     <aside
       class="chat-sidebar-panel"
       :class="{
-        'has-both-sections': hasBothSections,
-        'todo-only': showTodoSection && !showChangesSection,
-        'changes-only': showChangesSection && !showTodoSection,
+        'has-multiple-sections': hasMultipleSections,
+        'thinking-only': showThinkingSection && !showTodoSection && !showChangesSection,
+        'todo-only': showTodoSection && !showChangesSection && !showThinkingSection,
+        'changes-only': showChangesSection && !showTodoSection && !showThinkingSection,
+        'has-both-sections': hasTodoAndChangesSections,
       }"
       :style="sidebarStyle"
     >
       <button class="chat-sidebar-close" :title="t('todo.close')" @click="closeSidebar">&times;</button>
+
+      <ThinkingPanel
+        v-if="showThinkingSection"
+        class="chat-sidebar-section chat-sidebar-section-thinking embedded"
+        :thinking="thinkingPanelContent"
+        :is-thinking="thinkingPanelIsLive"
+        @close="chatStore.showThinkingPanel = false"
+      />
+
+      <div
+        v-if="showThinkingSection && (showTodoSection || showChangesSection)"
+        class="chat-sidebar-divider"
+      ></div>
 
       <TodoPanel
         v-if="showTodoSection"
@@ -205,7 +235,7 @@ onUnmounted(() => {
         @close="chatStore.closeTodoPanel()"
       />
 
-      <div v-if="hasBothSections" class="chat-sidebar-divider"></div>
+      <div v-if="hasTodoAndChangesSections" class="chat-sidebar-divider"></div>
 
       <ChatChangesPanel
         v-if="showChangesSection"
@@ -288,6 +318,12 @@ onUnmounted(() => {
   min-height: 220px;
 }
 
+.chat-sidebar-panel.has-multiple-sections .chat-sidebar-section-thinking {
+  flex: 0 1 34%;
+  min-height: 160px;
+}
+
+.chat-sidebar-panel.thinking-only .chat-sidebar-section-thinking,
 .chat-sidebar-panel.todo-only .chat-sidebar-section,
 .chat-sidebar-panel.changes-only .chat-sidebar-section {
   flex: 1 1 auto;
@@ -330,13 +366,15 @@ onUnmounted(() => {
 }
 
 :deep(.todo-panel.embedded),
-:deep(.changes-panel.embedded) {
+:deep(.changes-panel.embedded),
+:deep(.thinking-panel.embedded) {
   flex: 1;
   min-height: 0;
 }
 
 :deep(.todo-panel.embedded .panel-header),
-:deep(.changes-panel.embedded .panel-header) {
+:deep(.changes-panel.embedded .panel-header),
+:deep(.thinking-panel.embedded .panel-header) {
   padding-right: 48px;
 }
 </style>

@@ -341,6 +341,7 @@ pub fn build_compact_request(messages: &[ChatMessage]) -> Vec<ChatMessage> {
         thinking_duration: None,
         thinking_signature: None,
         knowledge_proposal: None,
+            memory_proposal: None,
         render_parts: None,
     });
 
@@ -495,6 +496,7 @@ fn build_omitted_messages_marker(count: usize, created_at: i64) -> ChatMessage {
         thinking_duration: None,
         thinking_signature: None,
         knowledge_proposal: None,
+            memory_proposal: None,
         render_parts: None,
     }
 }
@@ -604,6 +606,7 @@ pub fn build_compact_request_with_budget(
         thinking_duration: None,
         thinking_signature: None,
         knowledge_proposal: None,
+            memory_proposal: None,
         render_parts: None,
     });
 
@@ -1606,6 +1609,7 @@ pub fn build_post_compact_message(
         thinking_duration: None,
         thinking_signature: None,
         knowledge_proposal: None,
+            memory_proposal: None,
         render_parts: None,
     }
 }
@@ -1650,6 +1654,7 @@ mod tests {
             thinking_duration: None,
             thinking_signature: None,
             knowledge_proposal: None,
+            memory_proposal: None,
             render_parts: None,
         }
     }
@@ -1792,6 +1797,7 @@ mod tests {
                     outcome: None,
                     recorded_output: Some("recorded output should be stripped".repeat(200)),
                     nested_tool_calls: None,
+                execution_meta: None,
                 }]),
                 None,
             ));
@@ -1838,6 +1844,7 @@ mod tests {
                     outcome: None,
                     recorded_output: None,
                     nested_tool_calls: None,
+                execution_meta: None,
                 }]),
                 None,
             ));
@@ -1898,6 +1905,7 @@ mod tests {
                     outcome: None,
                     recorded_output: None,
                     nested_tool_calls: None,
+                execution_meta: None,
                 }]),
                 None,
             ));
@@ -1936,6 +1944,7 @@ mod tests {
                     outcome: None,
                     recorded_output: None,
                     nested_tool_calls: None,
+                execution_meta: None,
                 }]),
                 None,
             ),
@@ -1966,6 +1975,7 @@ mod tests {
                     outcome: None,
                     recorded_output: None,
                     nested_tool_calls: None,
+                execution_meta: None,
                 }]),
                 None,
             ),
@@ -2178,6 +2188,7 @@ mod tests {
                     outcome: None,
                     recorded_output: None,
                     nested_tool_calls: None,
+                execution_meta: None,
                 }]),
                 None,
             ),
@@ -2231,6 +2242,7 @@ mod tests {
                     outcome: None,
                     recorded_output: None,
                     nested_tool_calls: None,
+                execution_meta: None,
                 }]),
                 None,
             ),
@@ -2279,6 +2291,7 @@ mod tests {
                     outcome: None,
                     recorded_output: None,
                     nested_tool_calls: None,
+                execution_meta: None,
                 }]),
                 None,
             ),
@@ -2339,6 +2352,7 @@ mod tests {
                     outcome: None,
                     recorded_output: None,
                     nested_tool_calls: None,
+                execution_meta: None,
                 }]),
                 None,
             ),

@@ -17,8 +17,8 @@ import {
   type ResizeObserverHandle,
 } from "../composables/resizeObserver";
 import ChatView from "./ChatView.vue";
-import ThinkingPanel from "./ThinkingPanel.vue";
 import ChatSidebarPanel from "./ChatSidebarPanel.vue";
+import ChatProjectViewPanel from "./ChatProjectViewPanel.vue";
 
 type ChatLayoutMode = "auto" | "horizontal" | "vertical";
 type ResolvedChatLayoutMode = "horizontal" | "vertical";
@@ -46,26 +46,27 @@ const workspaceRef = ref<HTMLElement | null>(null);
 const workspaceWidth = ref(0);
 const isVerticalLayout = computed(() => props.layoutMode === "vertical");
 const showAssistantSidebar = computed(() =>
-  props.active && (chatStore.showTodoPanel || chatChangesStore.currentPanelVisible),
+  props.active && (
+    chatStore.showTodoPanel
+    || chatChangesStore.currentPanelVisible
+    || chatStore.showThinkingPanel
+  ),
+);
+const showProjectViewPanel = computed(() =>
+  props.active && chatStore.showProjectViewPanel,
 );
 const ASSISTANT_PANEL_MIN_CHAT_WIDTH = 560;
 const ASSISTANT_SIDEBAR_SIDE_MAX_WIDTH = 520;
 const ASSISTANT_SIDEBAR_RESIZE_HANDLE_WIDTH = 3;
 const ASSISTANT_SIDEBAR_MAX_WORKSPACE_RATIO = 0.34;
-const THINKING_PANEL_SIDE_WIDTH = 340;
 const SIDEBAR_ENTER_TRANSITION_MS = 200;
 const SIDEBAR_EXIT_TRANSITION_MS = 180;
-const fixedAuxiliarySideWidth = computed(() =>
-  chatStore.showThinkingPanel ? THINKING_PANEL_SIDE_WIDTH : 0,
-);
-const assistantSidebarMaxSideWidth = computed(() => {
-  const width = workspaceWidth.value;
-  if (!showAssistantSidebar.value || width <= 0) {
+function assistantSidebarMaxSideWidthFor(width: number, panelVisible: boolean) {
+  if (!panelVisible || width <= 0) {
     return ASSISTANT_SIDEBAR_SIDE_MAX_WIDTH;
   }
 
   const remainingWidthBound = width
-    - fixedAuxiliarySideWidth.value
     - ASSISTANT_SIDEBAR_RESIZE_HANDLE_WIDTH
     - ASSISTANT_PANEL_MIN_CHAT_WIDTH;
   const ratioBound = Math.floor(width * ASSISTANT_SIDEBAR_MAX_WORKSPACE_RATIO);
@@ -73,7 +74,14 @@ const assistantSidebarMaxSideWidth = computed(() => {
     0,
     Math.min(ASSISTANT_SIDEBAR_SIDE_MAX_WIDTH, remainingWidthBound, ratioBound),
   );
-});
+}
+
+const assistantSidebarMaxSideWidth = computed(() =>
+  assistantSidebarMaxSideWidthFor(workspaceWidth.value, showAssistantSidebar.value),
+);
+const projectViewPanelMaxSideWidth = computed(() =>
+  assistantSidebarMaxSideWidthFor(workspaceWidth.value, showProjectViewPanel.value),
+);
 let workspaceResizeObserver: ResizeObserverHandle | null = null;
 
 function handleLayoutModeChange(_mode: ResolvedChatLayoutMode) {}
@@ -417,12 +425,23 @@ onUnmounted(() => {
       @launch-unity-project="projectStore.launchUnityProject"
       @layout-mode-change="handleLayoutModeChange"
     />
-    <ThinkingPanel
-      v-if="active && chatStore.showThinkingPanel"
-      :thinking="chatStore.thinkingPanelContent || chatStore.streamingThinking"
-      :is-thinking="chatStore.isThinking && !chatStore.thinkingPanelContent"
-      @close="chatStore.showThinkingPanel = false"
-    />
+    <Transition
+      :css="false"
+      @before-enter="beforeEnterSidebarPanel"
+      @enter="enterSidebarPanel"
+      @after-enter="afterEnterSidebarPanel"
+      @before-leave="beforeLeaveSidebarPanel"
+      @leave="leaveSidebarPanel"
+      @after-leave="afterLeaveSidebarPanel"
+    >
+      <ChatProjectViewPanel
+        v-if="showProjectViewPanel"
+        :layout="isVerticalLayout ? 'bottom' : 'side'"
+        :max-side-width="projectViewPanelMaxSideWidth"
+        :storage-scope="sessionPanelStorageScope"
+        :working-dir="projectStore.workingDir"
+      />
+    </Transition>
     <Transition
       :css="false"
       @before-enter="beforeEnterSidebarPanel"
@@ -463,15 +482,5 @@ onUnmounted(() => {
 
 .chat-workspace-view.is-vertical-layout {
   flex-direction: column;
-}
-
-.chat-workspace-view.is-vertical-layout :deep(.thinking-panel) {
-  width: 100%;
-  min-width: 0;
-  height: 220px;
-  min-height: 180px;
-  border-left: none;
-  border-top: 1px solid var(--border-color);
-  flex-shrink: 0;
 }
 </style>

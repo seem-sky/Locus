@@ -12,17 +12,25 @@ import {
   unityFolderIconClass,
   unityFolderIconNode,
 } from "../icons/unityAssetIcons";
+import {
+  consumeAssetRefPointerClickSuppression,
+  useAssetRefPointerDragSource,
+} from "../../composables/useAssetRefPointerDrag";
 
 type AssetFolderNode = Extract<AssetExplorerNode, { kind: "folder" }>;
 
-const props = defineProps<{
+const props = withDefaults(defineProps<{
   tree: AssetExplorerNode[];
   selectedPath: string | null;
   isPathExpanded: (path: string) => boolean;
-}>();
+  assetRefDraggable?: boolean;
+}>(), {
+  assetRefDraggable: false,
+});
 
 const emit = defineEmits<{
   (e: "select", node: AssetExplorerNode): void;
+  (e: "preview", node: AssetExplorerNode): void;
   (e: "toggle", path: string): void;
   (e: "loadMore", path: string): void;
 }>();
@@ -78,12 +86,25 @@ const visibleRows = computed<VisibleEntry[]>(() => {
   return out;
 });
 
+const assetRefPointerDrag = useAssetRefPointerDragSource();
+
 function rowClick(entry: Extract<VisibleEntry, { kind: "row" }>) {
+  if (consumeAssetRefPointerClickSuppression()) return;
   if (entry.isFolder) {
     emit("toggle", entry.node.path);
     return;
   }
   emit("select", entry.node);
+}
+
+function rowDblClick(entry: Extract<VisibleEntry, { kind: "row" }>) {
+  if (entry.isFolder) return;
+  emit("preview", entry.node);
+}
+
+function onAssetRowPointerDown(entry: Extract<VisibleEntry, { kind: "row" }>, event: PointerEvent) {
+  if (!props.assetRefDraggable) return;
+  assetRefPointerDrag.onFileRowPointerDown(entry.node.path, event);
 }
 
 function indentPx(node: AssetExplorerNode): number {
@@ -132,13 +153,20 @@ function fileIconClass(node: AssetExplorerNode) {
           v-for="entry in [asVisibleEntry(item)]"
           :key="entry.key"
         >
-          <button
+          <div
             v-if="entry.kind === 'row'"
-            type="button"
             class="alx-row"
             :class="{ selected: selectedPath === entry.node.path }"
             :style="{ paddingLeft: `${indentPx(entry.node)}px` }"
+            :draggable="false"
+            role="button"
+            tabindex="0"
+            :data-asset-ref-path="assetRefDraggable ? entry.node.path : undefined"
             @click="rowClick(entry)"
+            @dblclick.stop="rowDblClick(entry)"
+            @keydown.enter.prevent="rowClick(entry)"
+            @keydown.space.prevent="rowClick(entry)"
+            @pointerdown="onAssetRowPointerDown(entry, $event)"
           >
             <span
               v-if="entry.isFolder"
@@ -171,7 +199,7 @@ function fileIconClass(node: AssetExplorerNode) {
             <span class="alx-name" :class="{ 'alx-name-root': entry.node.kind === 'folder' && entry.node.isRoot }">
               {{ entry.node.name }}
             </span>
-          </button>
+          </div>
 
           <div
             v-else
@@ -240,6 +268,14 @@ function fileIconClass(node: AssetExplorerNode) {
 .alx-row:focus-visible {
   outline: 2px solid var(--accent-color);
   outline-offset: -2px;
+}
+
+.alx-row[data-asset-ref-path] {
+  cursor: grab;
+}
+
+body.asset-ref-pointer-dragging .alx-row[data-asset-ref-path] {
+  cursor: grabbing;
 }
 
 .alx-branch,

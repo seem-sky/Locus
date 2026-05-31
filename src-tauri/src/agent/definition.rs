@@ -452,4 +452,30 @@ mod tests {
             .all(|(id, _)| id != "doc" && id != "wiki"));
         assert!(descriptions.iter().any(|(id, _)| id == "knowledge"));
     }
+
+    #[test]
+    fn dev_agent_registers_workflow_rules() {
+        let agent_dir = repo_agent_dir();
+        let configs = crate::commands::merged_rule_config_for_agent(
+            &Some(agent_dir),
+            "",
+            "dev",
+        );
+        for rule in ["multi_stage_editing.md", "complex_task_workflow.md"] {
+            let cfg = configs
+                .get(rule)
+                .unwrap_or_else(|| panic!("dev rule '{}' should exist", rule));
+            assert!(cfg.enabled, "dev rule '{}' should be enabled", rule);
+        }
+    }
+
+    #[test]
+    fn dev_agent_lists_implementer_optimizer_and_reviewer_subagents() {
+        let registry = AgentDefRegistry::load(Some(repo_agent_dir().as_path()), None);
+        let dev = registry.get("dev").expect("dev agent");
+        assert!(dev.sub_agents.iter().any(|id| id == "explorer"));
+        assert!(dev.sub_agents.iter().any(|id| id == "implementer"));
+        assert!(dev.sub_agents.iter().any(|id| id == "optimizer"));
+        assert!(dev.sub_agents.iter().any(|id| id == "reviewer"));
+    }
 }

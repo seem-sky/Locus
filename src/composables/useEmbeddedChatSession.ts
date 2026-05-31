@@ -8,7 +8,8 @@ import {
   watch,
   type MaybeRefOrGetter,
 } from "vue";
-import { t } from "../i18n";
+import { locale, t } from "../i18n";
+import { resolveChatResponseLocale } from "./useAgentResponseSettings";
 import { normalizeAppError } from "../services/errors";
 import { getLocusRuntime, type RuntimeUnsubscribe } from "../services/locusRuntime";
 import * as sessionService from "../services/session";
@@ -341,19 +342,21 @@ function clearState(state: EmbeddedChatState) {
 
 function updateProposalStatus(
   state: EmbeddedChatState,
-  status: "stale" | "applying" | "applied" | "invalidated",
+  status: "pending" | "stale" | "applying" | "applied" | "invalidated",
   proposalId?: string,
+  kind: "knowledge" | "memory" = "knowledge",
 ) {
   let changed = false;
   state.messages = state.messages.map((message) => {
-    const proposal = message.knowledgeProposal;
+    const proposal = kind === "memory" ? message.memoryProposal : message.knowledgeProposal;
+    const field = kind === "memory" ? "memoryProposal" : "knowledgeProposal";
     if (!proposal) return message;
     if (proposalId && proposal.proposalId !== proposalId) return message;
     if (!proposalId && proposal.status !== "pending") return message;
     changed = true;
     return {
       ...message,
-      knowledgeProposal: {
+      [field]: {
         ...proposal,
         status,
         updatedAt: Math.floor(Date.now() / 1000),
@@ -361,6 +364,22 @@ function updateProposalStatus(
     };
   });
   return changed;
+}
+
+function stalePendingProposals(state: EmbeddedChatState) {
+  const knowledgeChanged = updateProposalStatus(state, "stale", undefined, "knowledge");
+  const memoryChanged = updateProposalStatus(state, "stale", undefined, "memory");
+  if (!state.sessionId) return;
+  if (knowledgeChanged) {
+    sessionService.staleKnowledgeProposals(state.sessionId).catch((error: unknown) => {
+      console.warn("[embedded-chat] staleKnowledgeProposals failed:", error);
+    });
+  }
+  if (memoryChanged) {
+    sessionService.staleMemoryProposals(state.sessionId).catch((error: unknown) => {
+      console.warn("[embedded-chat] staleMemoryProposals failed:", error);
+    });
+  }
 }
 
 function resetRoundState(state: EmbeddedChatState) {
@@ -725,12 +744,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
     }
 
     const displayText = request.displayText ?? request.text;
-    const staleChanged = updateProposalStatus(state, "stale");
-    if (staleChanged && state.sessionId) {
-      sessionService.staleKnowledgeProposals(state.sessionId).catch((error: unknown) => {
-        console.warn("[embedded-chat] staleKnowledgeProposals failed:", error);
-      });
-    }
+    stalePendingProposals(state);
 
     if (state.isStreaming && state.sessionId && state.currentRunId) {
       const { state: chatInputSettings } = useChatInputSettings();
@@ -873,6 +887,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
         sessionType: options.sessionType ?? "chat",
         mode: request.mode ?? null,
         userIntent,
+        responseLocale: resolveChatResponseLocale(locale.value),
       });
 
       state.sessionId = launch.sessionId;
@@ -964,25 +979,50 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
   async function applyKnowledgeProposal(proposalId: string) {
     const state = activeState.value;
     if (!state.sessionId) return;
-    updateProposalStatus(state, "applying", proposalId);
+    updateProposalStatus(state, "applying", proposalId, "knowledge");
     try {
       await sessionService.applyKnowledgeProposal(state.sessionId, proposalId);
-      updateProposalStatus(state, "applied", proposalId);
+      updateProposalStatus(state, "applied", proposalId, "knowledge");
     } catch (error) {
       state.error = normalizeAppError(error).message;
-      updateProposalStatus(state, "stale", proposalId);
+      updateProposalStatus(state, "stale", proposalId, "knowledge");
     }
   }
 
   async function ignoreKnowledgeProposal(proposalId: string) {
     const state = activeState.value;
     if (!state.sessionId) return;
-    updateProposalStatus(state, "invalidated", proposalId);
+    updateProposalStatus(state, "invalidated", proposalId, "knowledge");
     try {
       await sessionService.ignoreKnowledgeProposal(state.sessionId, proposalId);
     } catch (error) {
       state.error = normalizeAppError(error).message;
-      updateProposalStatus(state, "stale", proposalId);
+      updateProposalStatus(state, "stale", proposalId, "knowledge");
+    }
+  }
+
+  async function applyMemoryProposal(proposalId: string) {
+    const state = activeState.value;
+    if (!state.sessionId) return;
+    updateProposalStatus(state, "applying", proposalId, "memory");
+    try {
+      await sessionService.applyMemoryProposal(state.sessionId, proposalId);
+      updateProposalStatus(state, "applied", proposalId, "memory");
+    } catch (error) {
+      state.error = normalizeAppError(error).message;
+      updateProposalStatus(state, "pending", proposalId, "memory");
+    }
+  }
+
+  async function ignoreMemoryProposal(proposalId: string) {
+    const state = activeState.value;
+    if (!state.sessionId) return;
+    updateProposalStatus(state, "invalidated", proposalId, "memory");
+    try {
+      await sessionService.ignoreMemoryProposal(state.sessionId, proposalId);
+    } catch (error) {
+      state.error = normalizeAppError(error).message;
+      updateProposalStatus(state, "stale", proposalId, "memory");
     }
   }
 
@@ -1081,5 +1121,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
     answerAllToolConfirms,
     applyKnowledgeProposal,
     ignoreKnowledgeProposal,
+    applyMemoryProposal,
+    ignoreMemoryProposal,
   };
 }

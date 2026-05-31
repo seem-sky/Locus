@@ -1,67 +1,54 @@
 ---
-description: CodeGraph MCP — mandatory pre-read and pre-edit code intelligence
+description: CodeGraph MCP — required for complex edits, optional for simple tasks
 alwaysApply: true
 ---
 <!-- CODEGRAPH_START -->
-## CodeGraph（必选）
+## CodeGraph（按任务复杂度选用）
 
-本项目已配置 CodeGraph MCP（`codegraph_*` 工具）。在**回答结构性问题**或**修改任何符号/文件**之前，必须先通过 CodeGraph 获取调用关系与影响范围，禁止仅凭 grep/Read 猜测结构。
+本项目已配置 CodeGraph MCP（`codegraph_*` 工具）。**简单任务不强制**；**复杂代码修改必须**先通过 CodeGraph 获取调用关系与影响范围，禁止仅凭 grep/Read 猜测结构。
 
 若 MCP 不可用，先运行 `codegraph status`；若未初始化，运行 `codegraph init -i` 并让用户重启 Cursor。
 
-### 必须遵守（MUST）
+### 何时必须（复杂代码修改）
 
-| 时机 | 必须执行 | 目的 |
-|------|----------|------|
-| 开始理解某功能/模块 | `codegraph_context`（任务描述）→ 必要时 **一次** `codegraph_explore` | 建立符号级上下文 |
-| 追踪「A 如何到 B」 | `codegraph_trace`（from→to）→ **一次** `codegraph_explore` | 整条调用链，含动态跳转 |
-| 查找符号定义/签名 | `codegraph_search` | 禁止先 grep 符号名 |
-| **编辑函数/方法/类/组件前** | `codegraph_impact`（target=符号，direction=upstream） | 汇报直接调用方与风险 |
-| 编辑后向用户总结 | 简要说明 impact 结果 | 让用户知晓爆炸半径 |
+满足**任一**即视为复杂，**修改前必须**跑 CodeGraph：
+
+| 信号 | 必须执行 |
+|------|----------|
+| 预计改动 **≥3** 个源文件，或 **≥2** 个顶层目录 | `codegraph_context` → 必要时 `codegraph_explore` |
+| 重构、新功能、架构变更、跨模块调用链 | `codegraph_context` / `codegraph_trace` |
+| 编辑具名函数、方法、类、对外 composable/store API | `codegraph_search` → `codegraph_impact`（upstream） |
+| 不确定爆炸半径 / 调用方 | `codegraph_impact` 或 `codegraph_callers` |
+| 追踪「A 如何到 B」 | `codegraph_trace` → **一次** `codegraph_explore` |
+| 回答架构 / 流程 /「谁调用谁」类问题 | `codegraph_context` → 必要时 **一次** `codegraph_explore` |
+
+复杂修改流程：`codegraph_search`（确认目标）→ `codegraph_impact` → 向用户说明影响面 → 最小编辑。
+
+### 何时可跳过（简单任务）
+
+满足**全部**时可不用 CodeGraph，直接 `read` / `grep` 定位后修改：
+
+- **1–2** 个文件、单目录、改动范围明确（文案、配置、注释、明显 typo、局部样式）
+- 不触及具名符号的对外契约（签名、导出 API、跨文件调用关系）
+- 用户明确说是 trivial / 一行修复，且已 `read` 目标位置
+
+简单任务仍须读清再改；只是不必为结构查询专门跑 CodeGraph。
 
 ### 禁止（NEVER）
 
-- **NEVER** 在未跑 `codegraph_impact` 的情况下修改具名函数、方法、类或对外导出的 composable/store API
-- **NEVER** 用 grep 替代 `codegraph_search` / `codegraph_callers` / `codegraph_callees` 做结构查询
+- **NEVER** 在**复杂修改**场景下，未跑 `codegraph_impact` 就改具名函数、方法、类或对外 API
+- **NEVER** 用 grep 替代 `codegraph_search` / `codegraph_callers` / `codegraph_callees` 做**复杂任务**的结构查询
 - **NEVER** 用 `codegraph_search` + 多次 `codegraph_node` 代替 `codegraph_context` / `codegraph_explore`
-- **NEVER** 为同一问题启动子 Agent 或大量 Read 重扫——索引已存在，用 CodeGraph
+- **NEVER** 为同一复杂问题启动子 Agent 或大量 Read 重扫——索引已存在，用 CodeGraph
 - **NEVER** 在同一轮刚改完文件后立即再查 CodeGraph（索引 debounce ~500ms）
 
 ### 与 GitNexus 的分工
 
-两者可同时启用，按场景选用，**改代码前至少完成 CodeGraph impact**：
-
 | 需求 | 优先工具 |
 |------|----------|
-| 定义、签名、谁调用谁、改 X 会破坏什么 | **CodeGraph**（`codegraph_*`） |
-| 执行流、业务流程、进程级 trace | **GitNexus**（`gitnexus_query` / `gitnexus_context`） |
+| 定义、签名、谁调用谁、改 X 会破坏什么 | **CodeGraph**（复杂修改时必选） |
+| 执行流、业务流程、进程级 trace | **GitNexus** |
 | 高风险重构 | `codegraph_impact` +（若索引陈旧）`gitnexus_impact` |
-
-### 标准工作流
-
-**对话 / 阅读代码：**
-
-```
-codegraph_context("<区域或任务>")
-  → codegraph_explore([关键符号])   # 仅一次，批量看源码
-  → 回答用户
-```
-
-**修改代码：**
-
-```
-codegraph_search("<符号名>")        # 确认唯一目标
-  → codegraph_impact(target, upstream)
-  → 向用户说明影响面
-  → 实施最小编辑
-```
-
-**跨文件调用链：**
-
-```
-codegraph_trace(from="<起点>", to="<终点>")
-  → codegraph_explore([链上 2–4 个关键符号])
-```
 
 ### 工具速查
 
@@ -76,5 +63,5 @@ codegraph_trace(from="<起点>", to="<终点>")
 | 多个符号源码一次看完 | `codegraph_explore` |
 | 索引是否健康？ | `codegraph_status` |
 
-字面量搜索（日志文案、注释、字符串常量）仍可用 grep；**符号与关系一律走 CodeGraph**。
+字面量搜索（日志文案、注释、字符串常量）仍可用 grep；**复杂任务中的符号与关系一律走 CodeGraph**。
 <!-- CODEGRAPH_END -->

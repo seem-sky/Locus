@@ -10,6 +10,7 @@ import {
   watch,
   type ComponentPublicInstance,
 } from "vue";
+import { storeToRefs } from "pinia";
 import { Check, ChevronRight, Folder, FolderOpen, HelpCircle, X } from "lucide";
 import { t } from "../../i18n";
 import { buildSessionTree, nodeContainsSession, nodeHasActiveDescendant } from "./sessionTree";
@@ -36,6 +37,7 @@ import {
 } from "../../services/view";
 import { openUnityEmbeddedSessionWindow } from "../../services/unity";
 import { getLocusRuntime, type RuntimeUnsubscribe } from "../../services/locusRuntime";
+import { useAgentStore } from "../../stores/agent";
 import { useNotificationStore } from "../../stores/notification";
 import { useProjectStore } from "../../stores/project";
 
@@ -120,7 +122,6 @@ const props = defineProps<{
   streamingSessionIds?: Set<string>;
   sessionPanelWidth: number;
   workingDir?: string;
-  showViews?: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -157,6 +158,17 @@ function persistExpandedState() {
 const { state: shortcutState } = useKeyboardShortcuts();
 const notificationStore = useNotificationStore();
 const projectStore = useProjectStore();
+const agentStore = useAgentStore();
+const { agents, subagents } = storeToRefs(agentStore);
+
+const agentNameById = computed(() => {
+  const map = new Map<string, string>();
+  for (const agent of [...agents.value, ...subagents.value]) {
+    map.set(agent.id, agent.name);
+  }
+  return map;
+});
+
 const newChatTitle = computed(() =>
   t("chat.session.newWithShortcut", formatShortcut(shortcutState.newChat)),
 );
@@ -179,7 +191,7 @@ const viewHelpDialogRef = ref<HTMLElement | null>(null);
 const hasWorkspace = computed(() => !!props.workingDir?.trim());
 const viewExpandedState = ref<Record<string, boolean>>(loadViewExpandedState());
 const sessionPanelRef = ref<HTMLElement | null>(null);
-const showSessionViews = computed(() => props.showViews !== false);
+const showSessionViews = computed(() => false);
 const viewSectionRatio = ref(loadViewSplitRatio());
 const canSubmitViewRename = computed(() => !!viewRenameDraft.value?.name.trim());
 let viewResizeMoveListener: ((event: MouseEvent) => void) | null = null;
@@ -1177,6 +1189,7 @@ watch(
 );
 
 onMounted(async () => {
+  void agentStore.loadAgents();
   viewReloadUnsubscribe = await getLocusRuntime().subscribe<ViewPackageSummary>(
     "view-package-reloaded",
     () => {
@@ -1288,6 +1301,21 @@ function rowRoleClass(node: SessionTreeNode): string {
 function sessionStatusLabel(status: SessionTreeNode["status"]): string {
   if (!status) return "";
   return t(`chat.session.status.${status}`);
+}
+
+function rowAgentId(node: SessionTreeNode): string | null {
+  if (node.kind !== "session") return null;
+  const agentId = node.agentId?.trim();
+  return agentId || null;
+}
+
+function agentDisplayLabel(agentId: string | null | undefined): string {
+  if (!agentId) return "";
+  return agentNameById.value.get(agentId) ?? agentId;
+}
+
+function shouldShowAgentBadge(node: SessionTreeNode): boolean {
+  return isSubagentNode(node) && !!rowAgentId(node);
 }
 
 /* Multi-selection state (Ctrl/Cmd toggle, Shift range) */
@@ -1621,6 +1649,11 @@ function ctxArchive() {
           <template v-else>
             <div class="sp-session-main">
               <span class="sp-session-title">{{ rowLabel(row.node) }}</span>
+              <span
+                v-if="shouldShowAgentBadge(row.node)"
+                class="sp-agent-badge"
+                :title="t('chat.session.subagentBadgeTitle', rowAgentId(row.node)!)"
+              >{{ agentDisplayLabel(rowAgentId(row.node)) }}</span>
               <div class="sp-session-meta">
                 <span
                   v-if="row.node.status && row.node.status !== 'running'"
@@ -2684,6 +2717,26 @@ function ctxArchive() {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.sp-tree-row.role-subagent .sp-session-title {
+  font-weight: 500;
+}
+
+.sp-agent-badge {
+  flex-shrink: 0;
+  max-width: 88px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--accent-color) 24%, var(--border-color));
+  background: color-mix(in srgb, var(--accent-color) 10%, var(--sidebar-bg));
+  color: color-mix(in srgb, var(--accent-color) 72%, var(--text-color));
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1.35;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .sp-session-meta {

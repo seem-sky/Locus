@@ -68,6 +68,25 @@ describe("buildSessionTree", () => {
     }
   });
 
+  it("sorts child sessions by updatedAt ascending", () => {
+    const sessions = [
+      makeSession({ id: "root-1", title: "Main Task", sessionType: "chat", updatedAt: 100 }),
+      makeSession({ id: "child-late", title: "sub:late task", sessionType: "chat", updatedAt: 30, parentSessionId: "root-1", agentId: "explorer" }),
+      makeSession({ id: "child-early", title: "sub:early task", sessionType: "chat", updatedAt: 10, parentSessionId: "root-1", agentId: "implementer" }),
+    ];
+
+    const tree = buildSessionTree({ sessions });
+
+    expect(tree).toHaveLength(1);
+    expect(tree[0].kind).toBe("session");
+    if (tree[0].kind === "session") {
+      expect(tree[0].children.map((child) => child.sourceSessionId)).toEqual([
+        "child-early",
+        "child-late",
+      ]);
+    }
+  });
+
   it("uses runtime status for queued knowledge sessions", () => {
     const sessions = [
       makeSession({

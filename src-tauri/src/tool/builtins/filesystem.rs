@@ -29,6 +29,18 @@ pub(super) fn read() -> ToolDef {
                     .max(1) as usize;
                 let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(2000) as usize;
 
+                let workspace_root = ctx
+                    .working_dir
+                    .as_deref()
+                    .map(std::path::Path::new)
+                    .filter(|root| !root.as_os_str().is_empty());
+                let file_path = crate::commands::resolve_workspace_file_path(
+                    workspace_root,
+                    &file_path,
+                )
+                .to_string_lossy()
+                .to_string();
+
                 let path = std::path::Path::new(&file_path);
 
                 let metadata = match tokio::fs::metadata(&file_path).await {
@@ -203,7 +215,7 @@ pub(super) fn write() -> ToolDef {
         name: "write".to_string(),
         description: prompt.description,
         parameters: prompt.parameters,
-        execute: make_exec(|args, _ctx| {
+        execute: make_exec(|args, ctx| {
             Box::pin(async move {
                 let file_path = match args.get("filePath").and_then(|v| v.as_str()) {
                     Some(p) => p.to_string(),
@@ -223,6 +235,18 @@ pub(super) fn write() -> ToolDef {
                         };
                     }
                 };
+
+                let workspace_root = ctx
+                    .working_dir
+                    .as_deref()
+                    .map(std::path::Path::new)
+                    .filter(|root| !root.as_os_str().is_empty());
+                let file_path = crate::commands::resolve_workspace_file_path(
+                    workspace_root,
+                    &file_path,
+                )
+                .to_string_lossy()
+                .to_string();
 
                 match tokio::fs::metadata(&file_path).await {
                     Ok(metadata) => {
@@ -291,6 +315,18 @@ pub(super) fn edit() -> ToolDef {
                         };
                     }
                 };
+
+                let workspace_root = ctx
+                    .working_dir
+                    .as_deref()
+                    .map(std::path::Path::new)
+                    .filter(|root| !root.as_os_str().is_empty());
+                let file_path = crate::commands::resolve_workspace_file_path(
+                    workspace_root,
+                    &file_path,
+                )
+                .to_string_lossy()
+                .to_string();
 
                 let metadata = match tokio::fs::metadata(&file_path).await {
                     Ok(m) => m,

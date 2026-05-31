@@ -1,10 +1,163 @@
+/*
+ * @Author         : seem.sky@gmail.com
+ * @Email          : seem.sky@gmail.com
+ * @Description    :
+ * @FilePath       : \src-tauri\src\tool\builtins\codegraph.rs
+ * @Date           : 2026-05-25 15:07:23
+ * @LastEditTime   : 2026-05-28 10:55:26
+ * @LastEditors    : seem.sky@gmail.com seem.sky@gmail.com
+ */
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use super::{make_exec, ToolDef, ToolExecutionContext, ToolResult};
 use crate::process_util::async_command;
 
+const CODEGRAPH_BUNDLE_HINT: &str = "Run `bun run codegraph:bundle` in the repo root, set `LOCUS_CODEGRAPH_PATH` to the bundle or CLI executable, or install `codegraph` on PATH.";
+
+#[derive(Debug, Clone)]
+struct ResolvedCodegraph {
+    program: PathBuf,
+    prefix_args: Vec<String>,
+}
+
+type ManagedCodegraphDirs = Mutex<Vec<PathBuf>>;
+
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
+const SYNC_TIMEOUT_SECS: u64 = 600;
+const INIT_TIMEOUT_SECS: u64 = 1_800;
 const MAX_OUTPUT_CHARS: usize = 200_000;
+
+fn ensure_index_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+pub fn has_initialized_index(project_path: &Path) -> bool {
+    project_path
+        .join(".codegraph")
+        .join("codegraph.db")
+        .is_file()
+}
+
+pub async fn init_project_index(project_path: &Path) -> Result<(), String> {
+    let project = cli_arg_path(project_path);
+    eprintln!(
+        "[CodeGraph] initializing index for {} (this may take a while)...",
+        project_path.display()
+    );
+    let cmd_args = vec!["init".to_string(), "-i".to_string(), project];
+    run_codegraph_command(cmd_args, INIT_TIMEOUT_SECS)
+        .await
+        .map(|_| ())?;
+    if !has_initialized_index(project_path) {
+        return Err(format!(
+            "CodeGraph init finished but index is still missing at {}",
+            project_path
+                .join(".codegraph")
+                .join("codegraph.db")
+                .display()
+        ));
+    }
+    eprintln!(
+        "[CodeGraph] index ready at {}",
+        project_path.join(".codegraph").display()
+    );
+    Ok(())
+}
+
+pub async fn ensure_project_index(project_path: &Path) -> Result<(), String> {
+    if has_initialized_index(project_path) {
+        return Ok(());
+    }
+    let _guard = ensure_index_lock().lock().await;
+    if has_initialized_index(project_path) {
+        return Ok(());
+    }
+    init_project_index(project_path).await
+}
+
+pub async fn sync_project_index(project_path: &Path) -> Result<(), String> {
+    ensure_project_index(project_path).await?;
+    let project = cli_arg_path(project_path);
+    let cmd_args = vec!["sync".to_string(), "-q".to_string(), project];
+    run_codegraph_command(cmd_args, SYNC_TIMEOUT_SECS)
+        .await
+        .map(|_| ())
+}
+
+pub fn set_managed_codegraph_resource_dir(path: PathBuf) {
+    let bundle = path.join("codegraph-bundle");
+    let dirs = managed_codegraph_resource_dirs();
+    let mut dirs = dirs
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !dirs.iter().any(|existing| same_path(existing, &bundle)) {
+        dirs.push(bundle);
+    }
+}
+
+/// Returns embedded Node (or Windows node.exe) plus args needed to run an arbitrary JS entrypoint
+/// from the bundled codegraph runtime.
+pub fn resolve_codegraph_node_for_script(script: &Path) -> Option<(PathBuf, Vec<String>)> {
+    for root in codegraph_bundle_roots() {
+        if let Some(resolved) = resolve_codegraph_node_for_script_in_root(&root, script) {
+            return Some(resolved);
+        }
+        let npm_root = root
+            .join("node_modules")
+            .join(format!("@colbymchenry/codegraph-{}", codegraph_platform_target()));
+        if let Some(resolved) = resolve_codegraph_node_for_script_in_root(&npm_root, script) {
+            return Some(resolved);
+        }
+    }
+    None
+}
+
+fn resolve_codegraph_node_for_script_in_root(
+    root: &Path,
+    script: &Path,
+) -> Option<(PathBuf, Vec<String>)> {
+    #[cfg(windows)]
+    {
+        let node_exe = root.join("node.exe");
+        if node_exe.is_file() && script.is_file() {
+            return Some((
+                node_exe,
+                vec![
+                    "--liftoff-only".to_string(),
+                    cli_arg_path(script),
+                ],
+            ));
+        }
+        return None;
+    }
+
+    #[cfg(not(windows))]
+    {
+        for node in embedded_node_candidates(root) {
+            if node.is_file() && script.is_file() {
+                return Some((
+                    node,
+                    vec![
+                        "--liftoff-only".to_string(),
+                        cli_arg_path(script),
+                    ],
+                ));
+            }
+        }
+        None
+    }
+}
+
+#[cfg(not(windows))]
+fn embedded_node_candidates(root: &Path) -> [PathBuf; 2] {
+    [
+        root.join("lib").join("node").join("bin").join("node"),
+        root.join("bin").join("node"),
+    ]
+}
 
 pub fn register_all(registry: &mut super::ToolRegistry) {
     registry.register_builtin(codegraph_search());
@@ -15,6 +168,7 @@ pub fn register_all(registry: &mut super::ToolRegistry) {
     registry.register_builtin(codegraph_files());
     registry.register_builtin(codegraph_status());
     registry.register_builtin(codegraph_sync());
+    registry.register_builtin(codegraph_trace());
 }
 
 fn codegraph_search() -> ToolDef {
@@ -178,6 +332,30 @@ fn codegraph_sync() -> ToolDef {
     )
 }
 
+fn codegraph_trace() -> ToolDef {
+    tool_from_prompt(
+        "codegraph_trace",
+        crate::prompt::tools::CODEGRAPH_TRACE,
+        |args, ctx| async move {
+            let from = match require_str(&args, "from") {
+                Ok(from) => from,
+                Err(error) => return error,
+            };
+            let to = match require_str(&args, "to") {
+                Ok(to) => to,
+                Err(error) => return error,
+            };
+            let mut cmd_args = vec!["trace".to_string(), from, to];
+            if let Some(depth) = args.get("depth").and_then(|v| v.as_u64()) {
+                cmd_args.push("--depth".to_string());
+                cmd_args.push(depth.to_string());
+            }
+            append_common_flags(&mut cmd_args, &args, true);
+            run_codegraph(ctx, cmd_args, &args).await
+        },
+    )
+}
+
 fn tool_from_prompt<F, Fut>(name: &str, prompt_json: &str, handler: F) -> ToolDef
 where
     F: Fn(serde_json::Value, ToolExecutionContext) -> Fut + Send + Sync + 'static,
@@ -215,7 +393,7 @@ fn resolve_project_path(
     ctx: &ToolExecutionContext,
 ) -> Result<String, ToolResult> {
     if let Some(path) = optional_str(args, "path") {
-        return Ok(path);
+        return Ok(cli_arg_path(Path::new(&path)));
     }
     if let Some(working_dir) = ctx
         .working_dir
@@ -223,7 +401,7 @@ fn resolve_project_path(
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        return Ok(working_dir.to_string());
+        return Ok(cli_arg_path(Path::new(working_dir)));
     }
     Err(ToolResult {
         output: "Missing project path: set `path` or select a working directory.".to_string(),
@@ -233,7 +411,21 @@ fn resolve_project_path(
 
 fn append_project_path_flag(cmd_args: &mut Vec<String>, project_path: String) {
     cmd_args.push("-p".to_string());
-    cmd_args.push(project_path);
+    cmd_args.push(cli_arg_path(Path::new(&project_path)));
+}
+
+/// Node on Windows re-parses argv from the command line; backslash sequences such as `\n`
+/// in `\node_modules` or `\b` in `\bin` corrupt paths like `G:\AI\...` down to `G:`.
+fn cli_arg_path(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    #[cfg(windows)]
+    {
+        text.replace('\\', "/")
+    }
+    #[cfg(not(windows))]
+    {
+        text.into_owned()
+    }
 }
 
 fn append_common_flags(cmd_args: &mut Vec<String>, args: &serde_json::Value, json_output: bool) {
@@ -265,50 +457,103 @@ async fn run_codegraph(
         }
     }
 
+    if let Some(project_path) = project_path_for_command(&cmd_args, args, &ctx) {
+        if let Err(message) = ensure_project_index(&project_path).await {
+            return ToolResult {
+                output: message,
+                is_error: true,
+            };
+        }
+    }
+
     let timeout_secs = args
         .get("timeout")
         .and_then(|v| v.as_u64())
         .unwrap_or(DEFAULT_TIMEOUT_SECS)
         .clamp(5, 600);
 
-    let mut command = async_command("codegraph");
+    match run_codegraph_command(cmd_args, timeout_secs).await {
+        Ok(output) => ToolResult {
+            output,
+            is_error: false,
+        },
+        Err(message) => ToolResult {
+            output: message,
+            is_error: true,
+        },
+    }
+}
+
+fn project_path_for_command(
+    cmd_args: &[String],
+    args: &serde_json::Value,
+    ctx: &ToolExecutionContext,
+) -> Option<PathBuf> {
+    if matches!(
+        cmd_args.first().map(String::as_str),
+        Some("status") | Some("sync")
+    ) {
+        return cmd_args
+            .get(1)
+            .map(|path| PathBuf::from(path))
+            .or_else(|| resolve_project_path(args, ctx).ok().map(PathBuf::from));
+    }
+
+    let flag_index = cmd_args.iter().position(|arg| arg == "-p")?;
+    cmd_args
+        .get(flag_index + 1)
+        .map(|path| PathBuf::from(path))
+        .or_else(|| resolve_project_path(args, ctx).ok().map(PathBuf::from))
+}
+
+async fn run_codegraph_command(
+    cmd_args: Vec<String>,
+    timeout_secs: u64,
+) -> Result<String, String> {
+    let resolved = resolve_codegraph()?;
+
+    let program = resolved
+        .program
+        .to_str()
+        .unwrap_or("codegraph")
+        .to_string();
+    let mut command = async_command(&program);
+    if !resolved.prefix_args.is_empty() {
+        command.args(&resolved.prefix_args);
+    }
     command.args(&cmd_args);
     command.stdout(std::process::Stdio::piped());
     command.stderr(std::process::Stdio::piped());
 
-    let child = match command.spawn() {
-        Ok(child) => child,
-        Err(error) => {
-            return ToolResult {
-                output: format!(
-                    "Failed to run codegraph CLI: {}. Install CodeGraph and ensure `codegraph` is on PATH.",
-                    error
-                ),
-                is_error: true,
-            };
-        }
-    };
+    let child = command
+        .spawn()
+        .map_err(|error| format!("Failed to run codegraph CLI: {}. {}", error, CODEGRAPH_BUNDLE_HINT))?;
 
     let output = match tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait_with_output())
         .await
     {
         Ok(Ok(output)) => output,
-        Ok(Err(error)) => {
-            return ToolResult {
-                output: format!("codegraph process failed: {}", error),
-                is_error: true,
-            };
-        }
+        Ok(Err(error)) => return Err(format!("codegraph process failed: {}", error)),
         Err(_) => {
-            return ToolResult {
-                output: format!(
-                    "codegraph timed out after {} seconds",
-                    timeout_secs
-                ),
-                is_error: true,
-            };
+            return Err(format!(
+                "codegraph timed out after {} seconds",
+                timeout_secs
+            ));
         }
     };
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let detail = if !stderr.trim().is_empty() {
+            stderr.trim().to_string()
+        } else if !stdout.trim().is_empty() {
+            stdout.trim().to_string()
+        } else {
+            format!("codegraph exited with status {}", output.status)
+        };
+        return Err(detail);
+    }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -326,14 +571,210 @@ async fn run_codegraph(
         combined.push_str("\n\n(Output truncated)");
     }
 
-    if combined.is_empty() && !output.status.success() {
-        combined = format!("codegraph exited with status {}", output.status);
+    Ok(combined)
+}
+
+fn resolve_codegraph() -> Result<ResolvedCodegraph, String> {
+    resolve_codegraph_from_env()
+        .or_else(resolve_codegraph_from_path)
+        .or_else(resolve_codegraph_from_bundle)
+        .ok_or_else(|| format!("CodeGraph is not available. {}", CODEGRAPH_BUNDLE_HINT))
+}
+
+fn resolve_codegraph_from_env() -> Option<ResolvedCodegraph> {
+    let raw = std::env::var("LOCUS_CODEGRAPH_PATH")
+        .ok()
+        .map(|value| value.trim().trim_matches('"').to_string())
+        .filter(|value| !value.is_empty())?;
+    let path = PathBuf::from(&raw);
+    if path.is_file() {
+        return Some(ResolvedCodegraph {
+            program: path,
+            prefix_args: Vec::new(),
+        });
+    }
+    if path.is_dir() {
+        return resolve_codegraph_from_bundle_root(&path);
+    }
+    None
+}
+
+fn resolve_codegraph_from_path() -> Option<ResolvedCodegraph> {
+    let path_var = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path_var) {
+        for name in codegraph_path_binary_names() {
+            let candidate = dir.join(name);
+            if !candidate.is_file() {
+                continue;
+            }
+            #[cfg(windows)]
+            if candidate.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("cmd")) {
+                return Some(ResolvedCodegraph {
+                    program: PathBuf::from(std::env::var("ComSpec").unwrap_or_else(|_| "cmd.exe".to_string())),
+                    prefix_args: vec![
+                        "/C".to_string(),
+                        cli_arg_path(&candidate),
+                    ],
+                });
+            }
+            return Some(ResolvedCodegraph {
+                program: candidate,
+                prefix_args: Vec::new(),
+            });
+        }
+    }
+    None
+}
+
+fn resolve_codegraph_from_bundle() -> Option<ResolvedCodegraph> {
+    for root in codegraph_bundle_roots() {
+        if let Some(resolved) = resolve_codegraph_from_bundle_root(&root) {
+            return Some(resolved);
+        }
+    }
+    None
+}
+
+fn resolve_codegraph_from_bundle_root(root: &Path) -> Option<ResolvedCodegraph> {
+    if let Some(resolved) = resolve_codegraph_from_runtime_root(root) {
+        return Some(resolved);
     }
 
-    ToolResult {
-        output: combined,
-        is_error: !output.status.success(),
+    let npm_root = root
+        .join("node_modules")
+        .join(format!("@colbymchenry/codegraph-{}", codegraph_platform_target()));
+    resolve_codegraph_from_runtime_root(&npm_root)
+}
+
+fn resolve_codegraph_from_runtime_root(root: &Path) -> Option<ResolvedCodegraph> {
+    #[cfg(windows)]
+    {
+        let node_exe = root.join("node.exe");
+        let entry = root
+            .join("lib")
+            .join("dist")
+            .join("bin")
+            .join("codegraph.js");
+        if node_exe.is_file() && entry.is_file() {
+            return Some(ResolvedCodegraph {
+                program: node_exe,
+                prefix_args: vec![
+                    "--liftoff-only".to_string(),
+                    cli_arg_path(&entry),
+                ],
+            });
+        }
+        return None;
     }
+
+    #[cfg(not(windows))]
+    {
+        let launcher = root.join("bin").join("codegraph");
+        if launcher.is_file() {
+            return Some(ResolvedCodegraph {
+                program: launcher,
+                prefix_args: Vec::new(),
+            });
+        }
+        None
+    }
+}
+
+fn codegraph_bundle_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+
+    if let Ok(registered) = managed_codegraph_resource_dirs().lock() {
+        for root in registered.iter() {
+            push_unique_bundle_root(&mut roots, root);
+        }
+    }
+
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(exe_dir) = exe.parent() {
+            push_unique_bundle_root(&mut roots, &exe_dir.join("resources").join("codegraph-bundle"));
+            push_unique_bundle_root(&mut roots, &exe_dir.join("codegraph-bundle"));
+        }
+    }
+
+    push_unique_bundle_root(
+        &mut roots,
+        &PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("gen")
+            .join("codegraph-bundle"),
+    );
+
+    roots
+}
+
+fn push_unique_bundle_root(target: &mut Vec<PathBuf>, candidate: &Path) {
+    if !candidate.is_dir() {
+        return;
+    }
+    if target.iter().any(|existing| same_path(existing, candidate)) {
+        return;
+    }
+    target.push(candidate.to_path_buf());
+}
+
+fn managed_codegraph_resource_dirs() -> &'static ManagedCodegraphDirs {
+    static DIRS: OnceLock<ManagedCodegraphDirs> = OnceLock::new();
+    DIRS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn codegraph_platform_target() -> &'static str {
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    {
+        return "win32-x64";
+    }
+    #[cfg(all(target_os = "windows", target_arch = "aarch64"))]
+    {
+        return "win32-arm64";
+    }
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    {
+        return "darwin-x64";
+    }
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        return "darwin-arm64";
+    }
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        return "linux-x64";
+    }
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    {
+        return "linux-arm64";
+    }
+    #[allow(unreachable_code)]
+    "unknown"
+}
+
+fn codegraph_path_binary_names() -> &'static [&'static str] {
+    #[cfg(windows)]
+    {
+        &["codegraph.exe", "codegraph.cmd", "codegraph"]
+    }
+    #[cfg(not(windows))]
+    {
+        &["codegraph"]
+    }
+}
+
+fn same_path(left: &Path, right: &Path) -> bool {
+    dunce::canonicalize(left)
+        .unwrap_or_else(|_| left.to_path_buf())
+        .as_os_str()
+        .eq_ignore_ascii_case(
+            &dunce::canonicalize(right)
+                .unwrap_or_else(|_| right.to_path_buf())
+                .as_os_str(),
+        )
+}
+
+#[cfg(test)]
+pub(crate) fn resolve_codegraph_from_bundle_root_for_test(root: &Path) -> Option<ResolvedCodegraph> {
+    resolve_codegraph_from_bundle_root(root)
 }
 
 #[cfg(test)]
@@ -353,6 +794,7 @@ mod tests {
             "codegraph_files",
             "codegraph_status",
             "codegraph_sync",
+            "codegraph_trace",
         ] {
             assert!(
                 registry.canonical_name(name).is_some(),
@@ -361,6 +803,87 @@ mod tests {
             );
             assert!(registry.is_built_in(name));
         }
+    }
+
+    #[test]
+    fn resolve_codegraph_prefers_flat_windows_bundle_layout() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        std::fs::write(root.join("node.exe"), b"").expect("node.exe");
+        let entry_dir = root.join("lib").join("dist").join("bin");
+        std::fs::create_dir_all(&entry_dir).expect("entry dirs");
+        std::fs::write(entry_dir.join("codegraph.js"), b"").expect("entry");
+
+        let resolved =
+            resolve_codegraph_from_bundle_root_for_test(root).expect("bundle layout");
+        assert!(resolved.program.ends_with("node.exe"));
+        assert_eq!(resolved.prefix_args.len(), 2);
+        assert_eq!(resolved.prefix_args[0], "--liftoff-only");
+        assert!(resolved.prefix_args[1].ends_with("codegraph.js"));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn resolve_codegraph_prefers_unix_bundle_launcher() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        let bin_dir = root.join("bin");
+        std::fs::create_dir_all(&bin_dir).expect("bin dir");
+        let launcher = bin_dir.join("codegraph");
+        std::fs::write(&launcher, b"#!/bin/sh\n").expect("launcher");
+        let mut permissions = std::fs::metadata(&launcher)
+            .expect("metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&launcher, permissions).expect("chmod");
+
+        let resolved =
+            resolve_codegraph_from_bundle_root_for_test(root).expect("bundle layout");
+        assert!(resolved.program.ends_with("bin/codegraph"));
+        assert!(resolved.prefix_args.is_empty());
+    }
+
+    #[test]
+    fn cli_arg_path_normalizes_windows_backslashes() {
+        let normalized = cli_arg_path(Path::new(r"G:\AI\Locus\src\node_modules\bin\codegraph.js"));
+        #[cfg(windows)]
+        assert_eq!(
+            normalized,
+            "G:/AI/Locus/src/node_modules/bin/codegraph.js"
+        );
+        #[cfg(not(windows))]
+        assert_eq!(
+            normalized,
+            r"G:\AI\Locus\src\node_modules\bin\codegraph.js"
+        );
+    }
+
+    #[tokio::test]
+    async fn codegraph_search_runs_against_g_drive_workspace() {
+        if resolve_codegraph().is_err() {
+            eprintln!("skipping: CodeGraph bundle/CLI unavailable in this test environment");
+            return;
+        }
+
+        let registry = ToolRegistry::with_builtins();
+        let result = registry
+            .execute_with_context(
+                "codegraph_search",
+                &serde_json::json!({ "query": "run_codegraph", "limit": 1 }),
+                ToolExecutionContext {
+                    working_dir: Some(r"G:\AI\Locus".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(
+            !result.is_error,
+            "codegraph_search failed: {}",
+            result.output
+        );
+        assert!(!result.output.trim().is_empty());
     }
 
     #[tokio::test]

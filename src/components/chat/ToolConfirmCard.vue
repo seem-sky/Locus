@@ -128,6 +128,9 @@ const unityStatusRows = computed(() => {
       <span class="tool-confirm-title">{{ title }}</span>
     </div>
     <template v-if="basicDisplay">
+      <div v-if="basicDisplay.workflowNote" class="tool-confirm-workflow-note">
+        {{ basicDisplay.workflowNote }}
+      </div>
       <div class="tool-confirm-body">
         <div class="tool-confirm-name">{{ basicDisplay.toolName }}</div>
         <UnityRunStatesPreview
@@ -235,6 +238,17 @@ const unityStatusRows = computed(() => {
 
 .tool-confirm-card.is-unity-status-change .tool-confirm-actions {
   justify-content: flex-end;
+}
+
+.tool-confirm-workflow-note {
+  margin-bottom: 10px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid color-mix(in srgb, var(--border-color) 82%, var(--accent-color) 18%);
+  background: color-mix(in srgb, var(--panel-bg) 90%, var(--accent-color) 10%);
+  color: var(--text-color);
+  font-size: 12px;
+  line-height: 1.45;
 }
 
 @media (max-width: 720px) {

@@ -85,8 +85,11 @@ function maxStatus(a: SessionTreeStatus | null, b: SessionTreeStatus | null): Se
 
 function sortNodes(nodes: SessionTreeNode[], isChildren = false): SessionTreeNode[] {
   if (isChildren) {
-    // Children: sort by key ascending for stable order (no reordering on updates)
-    nodes.sort((a, b) => a.key.localeCompare(b.key));
+    // Children: chronological order (oldest first), then key for stability
+    nodes.sort((a, b) => {
+      if (a.updatedAt !== b.updatedAt) return a.updatedAt - b.updatedAt;
+      return a.key.localeCompare(b.key);
+    });
   } else {
     // Root: sort by most recent first
     nodes.sort((a, b) => {

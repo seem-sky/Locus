@@ -230,6 +230,7 @@ export function useSettingsState(emit: SettingsEmit) {
       localStorage.removeItem("locus-theme-preference");
       localStorage.removeItem("locus-unity-embed-theme-preference");
       localStorage.removeItem("locus-knowledge-access-mode");
+      localStorage.removeItem("locus-workspace-browse-filters");
       localStorage.removeItem("locus:sessionPanelWidth");
       localStorage.removeItem("locus:unity:sessionPanelWidth");
       localStorage.removeItem("locus:unity:sessionPanelCollapsed");
@@ -290,7 +291,7 @@ export function useSettingsState(emit: SettingsEmit) {
   }
 
   // ── Navigation ───────────────────────────────────────────────────────
-  const activeCategory = ref<"api" | "models" | "permissions" | "proxy" | "general" | "display" | "notifications" | "shortcuts" | "knowledge" | "archived" | "console" | "about">("general");
+  const activeCategory = ref<"api" | "models" | "permissions" | "proxy" | "general" | "display" | "notifications" | "shortcuts" | "knowledge" | "memory" | "archived" | "console" | "about">("general");
 
   // ── Provider / API key state ─────────────────────────────────────────
   const providers = ref<ProviderStatus[]>([]);

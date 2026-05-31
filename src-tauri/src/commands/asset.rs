@@ -919,6 +919,11 @@ fn walker_score_match(rel_path: &str, query_terms: &[String]) -> Option<i32> {
 /// Return the [`AssetSearchRoot`] that owns `rel_path`, or `None` if the path
 /// does not begin with one of the three known roots.
 fn root_for_rel_path(rel_path: &str) -> Option<AssetSearchRoot> {
+    if let Some(rest) = rel_path.strip_prefix("Assets.Lua") {
+        if rest.is_empty() || rest.starts_with('/') {
+            return Some(AssetSearchRoot::Assets);
+        }
+    }
     if let Some(rest) = rel_path.strip_prefix("Assets") {
         if rest.is_empty() || rest.starts_with('/') {
             return Some(AssetSearchRoot::Assets);

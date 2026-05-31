@@ -41,6 +41,8 @@ const displaySettingsState = vi.hoisted(() => ({
   changesAutoOpen: true,
   changesAutoClose: true,
   fileChangePopoverEnabled: true,
+  thinkingAutoOpen: false,
+  thinkingAutoExpand: true,
   chatDiffReviewTarget: "inline",
   gitDiffReviewTarget: "inline",
   rightAlignUserMessages: false,
@@ -158,6 +160,7 @@ describe("chat session panel state", () => {
     displaySettingsState.changesAutoOpen = true;
     displaySettingsState.changesAutoClose = true;
     displaySettingsState.fileChangePopoverEnabled = true;
+    displaySettingsState.thinkingAutoOpen = false;
     displaySettingsState.rightAlignUserMessages = false;
     displaySettingsState.compactToolCalls = true;
     displaySettingsState.hideThinkingBlocks = true;
@@ -334,6 +337,48 @@ describe("chat session panel state", () => {
     expect(chatStore.isStreaming).toBe(true);
     expect(chatStore.currentRunId).toBe("run-external");
     expect(chatStore.streamingSessionIds.has("s1")).toBe(true);
+  });
+
+  it("auto-opens thinking panel when thinking starts and the setting is enabled", async () => {
+    const chatStore = useChatStore();
+    displaySettingsState.thinkingAutoOpen = true;
+
+    await chatStore.selectSession("s1");
+    chatStore.handleStreamEvent({
+      runId: "run-1",
+      type: "runStart",
+      sessionId: "s1",
+    });
+    chatStore.handleStreamEvent({
+      runId: "run-1",
+      type: "thinkingDelta",
+      sessionId: "s1",
+      text: "thinking...",
+    });
+
+    expect(chatStore.showThinkingPanel).toBe(true);
+    expect(chatStore.isThinking).toBe(true);
+  });
+
+  it("does not auto-open thinking panel when the setting is disabled", async () => {
+    const chatStore = useChatStore();
+    displaySettingsState.thinkingAutoOpen = false;
+
+    await chatStore.selectSession("s1");
+    chatStore.handleStreamEvent({
+      runId: "run-1",
+      type: "runStart",
+      sessionId: "s1",
+    });
+    chatStore.handleStreamEvent({
+      runId: "run-1",
+      type: "thinkingDelta",
+      sessionId: "s1",
+      text: "thinking...",
+    });
+
+    expect(chatStore.showThinkingPanel).toBe(false);
+    expect(chatStore.isThinking).toBe(true);
   });
 
   it("remembers todo panel visibility per session", async () => {

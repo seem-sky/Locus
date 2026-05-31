@@ -1,6 +1,9 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { nextTick, reactive } from "vue";
-import { useAssetState } from "../composables/useAssetState";
+import {
+  resolveExplorerRootNames,
+  useAssetState,
+} from "../composables/useAssetState";
 import type { AssetPreviewPayload, SemanticTargetInspector, SemanticTreeNode } from "../types";
 
 const assetServiceMocks = vi.hoisted(() => ({
@@ -121,6 +124,35 @@ function dirEntriesPage(
     hasMore,
   };
 }
+
+describe("resolveExplorerRootNames", () => {
+  it("places preferred Unity roots first and appends other workspace folders", () => {
+    expect(
+      resolveExplorerRootNames([
+        "design",
+        "Packages",
+        "Assets",
+        "knowledge",
+        "ProjectSettings",
+      ]),
+    ).toEqual([
+      "Assets",
+      "Packages",
+      "ProjectSettings",
+      "design",
+      "knowledge",
+    ]);
+  });
+
+  it("falls back to preferred roots when discovery returns nothing", () => {
+    expect(resolveExplorerRootNames([])).toEqual([
+      "Assets",
+      "Assets.Lua",
+      "Packages",
+      "ProjectSettings",
+    ]);
+  });
+});
 
 describe("useAssetState preview flow", () => {
   beforeEach(() => {
@@ -328,13 +360,14 @@ describe("useAssetState preview flow", () => {
 
     await state.togglePath("Assets");
 
-    const assetsRoot = state.explorerTree.value[0];
+    const assetsRoot = state.explorerTree.value.find((node) => node.path === "Assets");
     expect(assetsRoot?.kind).toBe("folder");
     expect(projectServiceMocks.listDirEntriesPage).toHaveBeenCalledWith(
       "Assets",
       0,
       200,
       true,
+      expect.any(Object),
     );
     expect(assetsRoot?.kind === "folder" && assetsRoot.children).toHaveLength(2);
     expect(assetsRoot?.kind === "folder" && assetsRoot.hasMore).toBe(true);
@@ -346,6 +379,7 @@ describe("useAssetState preview flow", () => {
       2,
       200,
       true,
+      expect.any(Object),
     );
     expect(assetsRoot?.kind === "folder" && assetsRoot.children).toHaveLength(4);
     expect(assetsRoot?.kind === "folder" && assetsRoot.hasMore).toBe(false);
@@ -381,7 +415,7 @@ describe("useAssetState preview flow", () => {
     await state.togglePath("Assets");
     await flushPromises();
 
-    const assetsRoot = state.explorerTree.value[0];
+    const assetsRoot = state.explorerTree.value.find((node) => node.path === "Assets");
     expect(assetsRoot?.kind).toBe("folder");
 
     const artFolder = assetsRoot?.kind === "folder"
@@ -405,12 +439,14 @@ describe("useAssetState preview flow", () => {
       0,
       1,
       true,
+      expect.any(Object),
     );
     expect(projectServiceMocks.listDirEntriesPage).toHaveBeenCalledWith(
       "Assets/Docs",
       0,
       1,
       true,
+      expect.any(Object),
     );
   });
 
@@ -490,13 +526,16 @@ describe("useAssetState preview flow", () => {
 
     await state.togglePath("ProjectSettings");
 
-    const projectSettingsRoot = state.explorerTree.value[2];
+    const projectSettingsRoot = state.explorerTree.value.find(
+      (node) => node.path === "ProjectSettings",
+    );
     expect(state.isPathExpanded("ProjectSettings")).toBe(false);
     expect(projectServiceMocks.listDirEntriesPage).toHaveBeenCalledWith(
       "ProjectSettings",
       0,
       200,
       true,
+      expect.any(Object),
     );
     expect(projectSettingsRoot?.kind === "folder" && projectSettingsRoot.loaded).toBe(true);
     expect(
@@ -525,12 +564,15 @@ describe("useAssetState preview flow", () => {
 
     await state.probeFolderPath("ProjectSettings");
 
-    const projectSettingsRoot = state.explorerTree.value[2];
+    const projectSettingsRoot = state.explorerTree.value.find(
+      (node) => node.path === "ProjectSettings",
+    );
     expect(projectServiceMocks.listDirEntriesPage).toHaveBeenCalledWith(
       "ProjectSettings",
       0,
       1,
       true,
+      expect.any(Object),
     );
     expect(projectSettingsRoot?.kind === "folder" && projectSettingsRoot.loaded).toBe(false);
     expect(
@@ -539,5 +581,30 @@ describe("useAssetState preview flow", () => {
     expect(
       projectSettingsRoot?.kind === "folder" && projectSettingsRoot.hasChildFolders,
     ).toBe(false);
+  });
+
+  it("discovers additional workspace root folders from the workspace listing", async () => {
+    projectServiceMocks.listDirEntriesPage.mockImplementation(
+      async (subPath: string) => {
+        if (subPath === "") {
+          return dirEntriesPage([
+            { name: "Assets", relPath: "Assets", isDir: true },
+            { name: "design", relPath: "design", isDir: true },
+            { name: "knowledge", relPath: "knowledge", isDir: true },
+          ]);
+        }
+        return dirEntriesPage([], 0, 0, false);
+      },
+    );
+
+    const state = useAssetState(reactive({ workingDir: "F:/repo" }));
+    await state.discoverAndInitRoots();
+    await flushPromises();
+
+    expect(state.explorerTree.value.map((node) => node.path)).toEqual([
+      "Assets",
+      "design",
+      "knowledge",
+    ]);
   });
 });

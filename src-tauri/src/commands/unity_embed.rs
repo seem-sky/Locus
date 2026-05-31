@@ -1754,8 +1754,11 @@ fn normalize_unity_path_text(path: &str) -> String {
 fn is_supported_unity_ref_path(path: &str) -> bool {
     let normalized = normalize_unity_path_text(path);
     let lower = normalized.to_ascii_lowercase();
-    matches!(lower.as_str(), "assets" | "packages" | "projectsettings")
-        || lower.starts_with("assets/")
+    matches!(
+        lower.as_str(),
+        "assets" | "assets.lua" | "packages" | "projectsettings"
+    ) || lower.starts_with("assets/")
+        || lower.starts_with("assets.lua/")
         || lower.starts_with("packages/")
         || lower.starts_with("projectsettings/")
 }

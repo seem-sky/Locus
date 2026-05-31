@@ -36,6 +36,16 @@ export function hasTauriWindowRuntime(): boolean {
   return typeof internals?.invoke === "function";
 }
 
+export async function waitForTauriWindowRuntime(timeoutMs = 5000): Promise<boolean> {
+  if (hasTauriWindowRuntime()) return true;
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    if (hasTauriWindowRuntime()) return true;
+  }
+  return hasTauriWindowRuntime();
+}
+
 export function getCurrentTauriWindowLabel(): string | null {
   if (!hasTauriWindowRuntime()) return null;
   try {

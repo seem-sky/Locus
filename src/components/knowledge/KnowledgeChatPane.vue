@@ -74,6 +74,8 @@ const {
   answerAllToolConfirms,
   applyKnowledgeProposal,
   ignoreKnowledgeProposal,
+  applyMemoryProposal,
+  ignoreMemoryProposal,
   resetSession,
 } = useEmbeddedChatSession({
   sessionKey,
@@ -197,6 +199,8 @@ function handleSelectAgent(agentId: string) {
     @answer-all-tool-confirms="answerAllToolConfirms"
     @apply-knowledge-proposal="applyKnowledgeProposal"
     @ignore-knowledge-proposal="ignoreKnowledgeProposal"
+    @apply-memory-proposal="applyMemoryProposal"
+    @ignore-memory-proposal="ignoreMemoryProposal"
   >
     <template #composer-start>
       <AgentSelector

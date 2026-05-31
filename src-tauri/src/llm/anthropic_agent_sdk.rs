@@ -650,6 +650,7 @@ fn parse_assistant_message(message: &serde_json::Value) -> Option<ClaudeSdkAssis
                                 outcome: None,
                                 recorded_output: None,
                                 nested_tool_calls: None,
+                                execution_meta: None,
                             });
                         }
                     }

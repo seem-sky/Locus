@@ -6,6 +6,8 @@ use std::time::{Duration, Instant};
 
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
+#[cfg(target_os = "windows")]
+const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
 const GIT_VERSION_TIMEOUT: Duration = Duration::from_millis(1500);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,6 +63,56 @@ pub fn suppress_command_window(cmd: &mut Command) {
     {
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+}
+
+pub fn set_new_process_group(cmd: &mut Command) {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
+    }
+}
+
+/// Node on Windows re-parses argv from the full command line; backslashes in paths
+/// such as `\node_modules` can corrupt later arguments down to `G:`.
+pub fn windows_command_path(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    #[cfg(windows)]
+    {
+        text.replace('\\', "/")
+    }
+    #[cfg(not(windows))]
+    {
+        text.into_owned()
+    }
+}
+
+pub fn kill_process_tree(child: &mut std::process::Child) {
+    let pid = child.id();
+    kill_pid_tree(pid);
+    let _ = child.wait();
+}
+
+pub fn kill_pid_tree(pid: u32) {
+    #[cfg(target_os = "windows")]
+    {
+        let mut cmd = Command::new("taskkill");
+        cmd.args(["/F", "/T", "/PID", &pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        suppress_command_window(&mut cmd);
+        let _ = cmd.status();
+        return;
+    }
+
+    #[cfg(unix)]
+    {
+        let mut cmd = Command::new("kill");
+        cmd.args(["-TERM", &pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let _ = cmd.status();
     }
 }
 

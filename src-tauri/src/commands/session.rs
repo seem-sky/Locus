@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::panic::AssertUnwindSafe;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use futures::FutureExt;
@@ -25,13 +26,48 @@ use crate::session::models::{
     UserIntentPayload,
 };
 use crate::session::pending_inputs::QueuePendingInputRequest;
-use crate::session::store::{SessionStore, CHILD_SESSION_FORK_ERROR};
+use crate::session::store::{
+    SessionStore, CHILD_SESSION_FORK_ERROR, CHILD_SESSION_UNARCHIVE_ERROR,
+};
 use crate::tool::ToolRegistry;
 use crate::workspace::Workspace;
 use crate::{
     ActiveTaskHandle, ActiveTasks, ApiKeyState, PendingInputQueueHandle, ProviderKeysState,
     QuestionStore,
 };
+
+#[derive(Clone)]
+pub struct AgentResponseSettingsState {
+    pub force_chinese_chat: Arc<AtomicBool>,
+}
+
+impl AgentResponseSettingsState {
+    pub fn new() -> Self {
+        Self {
+            force_chinese_chat: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub fn resolve_response_locale(&self, response_locale: Option<String>) -> Option<String> {
+        if let Some(locale) = response_locale.filter(|value| !value.trim().is_empty()) {
+            return Some(locale);
+        }
+        if self.force_chinese_chat.load(Ordering::Relaxed) {
+            return Some("zh".to_string());
+        }
+        None
+    }
+}
+
+#[tauri::command]
+pub fn set_agent_response_settings(
+    force_chinese_chat: bool,
+    state: State<'_, AgentResponseSettingsState>,
+) {
+    state
+        .force_chinese_chat
+        .store(force_chinese_chat, Ordering::Relaxed);
+}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -127,11 +163,15 @@ async fn active_session_workspace_key(workspace: &State<'_, Arc<Workspace>>) -> 
 }
 
 fn emit_session_stream(app_handle: &AppHandle, store: &SessionStore, event: StreamEvent) {
+    let prefix = match &event {
+        StreamEvent::MemoryProposal { .. } => "memory",
+        _ => "knowledge",
+    };
     emit_session_stream_with_run_id(
         app_handle,
         store,
         format!(
-            "knowledge_{}",
+            "{prefix}_{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|duration| duration.as_millis().to_string())
@@ -203,6 +243,22 @@ fn emit_knowledge_proposal_message(
         app_handle,
         store,
         StreamEvent::KnowledgeProposal {
+            session_id: session_id.to_string(),
+            message,
+        },
+    );
+}
+
+pub(crate) fn emit_memory_proposal_message(
+    app_handle: &AppHandle,
+    store: &SessionStore,
+    session_id: &str,
+    message: ChatMessage,
+) {
+    emit_session_stream(
+        app_handle,
+        store,
+        StreamEvent::MemoryProposal {
             session_id: session_id.to_string(),
             message,
         },
@@ -469,6 +525,7 @@ pub async fn get_agent_rendered_env_prompt(
         None,
         HashMap::new(),
         tokio::sync::watch::channel(false).1,
+        None,
     );
 
     Ok(instance.rendered_env_prompt().await)
@@ -512,6 +569,7 @@ pub async fn get_agent_system_prompt_stats(
         None,
         HashMap::new(),
         tokio::sync::watch::channel(false).1,
+        None,
     );
 
     Ok(instance.system_prompt_stats().await)
@@ -682,6 +740,7 @@ pub async fn list_agent_injected_items(
         None,
         HashMap::new(),
         tokio::sync::watch::channel(false).1,
+        None,
     );
 
     Ok(instance.list_injected_prompt_items().await)
@@ -778,6 +837,7 @@ pub async fn chat(
     user_intent: Option<UserIntentPayload>,
     subagent_models: Option<HashMap<String, String>>,
     knowledge_mode: Option<String>,
+    response_locale: Option<String>,
     app_handle: AppHandle,
     store: State<'_, Arc<SessionStore>>,
     registry: State<'_, Arc<AgentDefRegistry>>,
@@ -793,6 +853,8 @@ pub async fn chat(
     app_knowledge_dir: State<'_, crate::commands::AppKnowledgeDir>,
     app_agent_dir: State<'_, crate::AppAgentDir>,
     undo_manager: State<'_, crate::UndoManagerHandle>,
+    dev_workflow_gates: State<'_, crate::agent::workflow::DevWorkflowGateStore>,
+    agent_response_settings: State<'_, AgentResponseSettingsState>,
 ) -> Result<ChatLaunch, AppError> {
     let cwd = workspace.path.read().await.clone();
     let ws_id = if cwd.trim().is_empty() {
@@ -966,7 +1028,7 @@ pub async fn chat(
     let um = Some(undo_manager.inner().clone());
     let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
     let (done_tx, done_rx) = tokio::sync::watch::channel(false);
-    let instance = AgentInstance::new(
+    let mut instance = AgentInstance::new(
         def,
         &sid,
         backend,
@@ -984,6 +1046,18 @@ pub async fn chat(
         um,
         subagent_models.unwrap_or_default(),
         cancel_rx,
+        Some(dev_workflow_gates.inner().clone()),
+    );
+    let effective_response_locale =
+        agent_response_settings.resolve_response_locale(response_locale);
+    instance.set_response_locale(effective_response_locale.clone());
+    eprintln!(
+        "[chat] session={} response_locale={:?} force_chinese_chat={}",
+        sid,
+        effective_response_locale,
+        agent_response_settings
+            .force_chinese_chat
+            .load(Ordering::Relaxed)
     );
     let partial_assistant = instance.partial_assistant_state();
     let effective_mode = mode
@@ -1639,7 +1713,20 @@ pub async fn unarchive_session(
     session_id: String,
     store: State<'_, Arc<SessionStore>>,
 ) -> Result<(), AppError> {
-    store.unarchive_session(&session_id).map_err(Into::into)
+    store.unarchive_session(&session_id).map_err(|error| {
+        if error == CHILD_SESSION_UNARCHIVE_ERROR {
+            AppError::new(
+                "session.unarchive_child",
+                "Child sessions cannot be unarchived individually.",
+            )
+            .detail(error)
+            .operation("unarchiveSession")
+        } else {
+            AppError::new("session.unarchive_failed", "Failed to unarchive session.")
+                .detail(error)
+                .operation("unarchiveSession")
+        }
+    })
 }
 
 #[tauri::command]
@@ -3315,6 +3402,7 @@ mod tests {
                 thinking_duration: None,
                 thinking_signature: None,
                 knowledge_proposal: None,
+            memory_proposal: None,
                 render_parts: None,
             }],
             pending_inputs: vec![],
@@ -3373,6 +3461,7 @@ mod tests {
                     outcome: None,
                     recorded_output: None,
                     nested_tool_calls: None,
+                execution_meta: None,
                 }]),
                 tool_call_id: None,
                 images: None,
@@ -3381,6 +3470,7 @@ mod tests {
                 thinking_duration: None,
                 thinking_signature: None,
                 knowledge_proposal: None,
+            memory_proposal: None,
                 render_parts: None,
             }],
             pending_inputs: vec![],

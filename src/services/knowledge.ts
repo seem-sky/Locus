@@ -887,3 +887,30 @@ export function removeSkillUnityFiles(
     packageId,
   });
 }
+
+export interface WebpagePreviewResult {
+  title: string;
+  content: string;
+  url: string;
+}
+
+export interface WebpageImportResult {
+  path: string;
+  success: boolean;
+}
+
+export function knowledgePreviewWebpage(url: string): Promise<WebpagePreviewResult> {
+  return ipcInvoke<WebpagePreviewResult>("knowledge_preview_webpage", { url });
+}
+
+export function knowledgeImportWebpage(input: {
+  url: string;
+  title?: string | null;
+  targetPath: string;
+}): Promise<WebpageImportResult> {
+  return ipcInvoke<WebpageImportResult>("knowledge_import_webpage", {
+    url: input.url,
+    title: input.title ?? null,
+    targetPath: input.targetPath,
+  });
+}

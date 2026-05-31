@@ -1,4 +1,6 @@
 import { ipcInvoke } from "./ipc";
+import type { WorkspaceBrowseFilters } from "../composables/useWorkspaceBrowseFilters";
+import { workspaceBrowseFiltersActive } from "../composables/useWorkspaceBrowseFilters";
 
 export interface DirEntry {
   relPath: string;
@@ -41,8 +43,15 @@ export function openDirInFileExplorer(path: string): Promise<void> {
   return ipcInvoke<void>("open_dir_in_file_explorer", { path });
 }
 
-export function listDirEntries(subPath: string): Promise<DirEntry[]> {
-  return ipcInvoke<DirEntry[]>("list_dir_entries", { subPath });
+export function listDirEntries(
+  subPath: string,
+  browseFilters?: WorkspaceBrowseFilters | null,
+): Promise<DirEntry[]> {
+  const payload: Record<string, unknown> = { subPath };
+  if (browseFilters && workspaceBrowseFiltersActive(browseFilters)) {
+    payload.browseFilters = browseFilters;
+  }
+  return ipcInvoke<DirEntry[]>("list_dir_entries", payload);
 }
 
 export function listDirEntriesPage(
@@ -50,20 +59,30 @@ export function listDirEntriesPage(
   offset = 0,
   limit = 200,
   excludeMeta = false,
+  browseFilters?: WorkspaceBrowseFilters | null,
 ): Promise<DirEntriesPage> {
-  return ipcInvoke<DirEntriesPage>("list_dir_entries_page", {
+  const payload: Record<string, unknown> = {
     subPath,
     offset,
     limit,
     excludeMeta,
-  });
+  };
+  if (browseFilters && workspaceBrowseFiltersActive(browseFilters)) {
+    payload.browseFilters = browseFilters;
+  }
+  return ipcInvoke<DirEntriesPage>("list_dir_entries_page", payload);
 }
 
 export function searchWorkspaceEntries(
   query: string,
   limit = 200,
+  browseFilters?: WorkspaceBrowseFilters | null,
 ): Promise<WorkspaceSearchEntry[]> {
-  return ipcInvoke<WorkspaceSearchEntry[]>("search_workspace_entries", { query, limit });
+  const payload: Record<string, unknown> = { query, limit };
+  if (browseFilters && workspaceBrowseFiltersActive(browseFilters)) {
+    payload.browseFilters = browseFilters;
+  }
+  return ipcInvoke<WorkspaceSearchEntry[]>("search_workspace_entries", payload);
 }
 
 export function resetAllConfig(): Promise<void> {

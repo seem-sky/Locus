@@ -40,7 +40,7 @@ export function walkHtmlText(html: string, transform: (text: string) => string):
   return parts.join("");
 }
 
-const ASSET_ROOT_RE = /^(?:Assets|Packages)\//;
+const ASSET_ROOT_RE = /^(?:Assets(?:\.Lua)?|Packages)\//;
 const SCENE_OBJECT_ROOT_RE = /^(?:Assets|Packages)\/.+?\.unity\/.+/i;
 const QUOTED_SCENE_OBJECT_REF_RE = /(["'])@?((?:Assets|Packages)\/(?:(?!\1).)*?\.unity\/(?:(?!\1).)*?)\s*\1/g;
 const QUOTED_ASSET_REF_RE = /(["'])@?((?:Assets|Packages)\/(?:(?!\1).)+?)\s*\1/g;

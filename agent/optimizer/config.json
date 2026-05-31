@@ -1,0 +1,25 @@
+{
+  "name": "Optimizer",
+  "description": "Code optimization subagent: refines implementer output for efficiency, concision, and runtime depth before review.",
+  "tools": [
+    "read",
+    "write",
+    "edit",
+    "bash",
+    "grep",
+    "list",
+    "codegraph_search",
+    "codegraph_context",
+    "codegraph_callers",
+    "codegraph_callees",
+    "codegraph_impact",
+    "codegraph_trace",
+    "unity_execute",
+    "unity_recompile",
+    "unity_run_states"
+  ],
+  "sub_agents": [],
+  "default": false,
+  "default_effort": "medium",
+  "model_recommendation": "large"
+}

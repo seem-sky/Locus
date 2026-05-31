@@ -131,6 +131,8 @@ const emit = defineEmits<{
   (e: "insertQueuedFollowUp"): void;
   (e: "applyKnowledgeProposal", proposalId: string): void;
   (e: "ignoreKnowledgeProposal", proposalId: string): void;
+  (e: "applyMemoryProposal", proposalId: string): void;
+  (e: "ignoreMemoryProposal", proposalId: string): void;
 }>();
 
 const slots = useSlots();
@@ -640,6 +642,8 @@ onUnmounted(() => {
       @scroll="handleTranscriptScroll"
       @apply-knowledge-proposal="emit('applyKnowledgeProposal', $event)"
       @ignore-knowledge-proposal="emit('ignoreKnowledgeProposal', $event)"
+      @apply-memory-proposal="emit('applyMemoryProposal', $event)"
+      @ignore-memory-proposal="emit('ignoreMemoryProposal', $event)"
       @tool-handoff-quiet-change="handleToolHandoffQuietChange"
       @tool-viewport-anchor-start="handleToolViewportAnchorStart"
       @tool-viewport-anchor-end="handleToolViewportAnchorEnd"

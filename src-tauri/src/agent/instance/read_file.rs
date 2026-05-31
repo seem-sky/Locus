@@ -24,11 +24,10 @@ impl AgentInstance {
         if !Self::is_read_image_path(file_path) {
             let tool_context = self.build_tool_execution_context(app_handle, "read").await;
             return self
-                .await_tool_result(self.tool_registry.execute_with_context(
-                    "read",
-                    args,
-                    tool_context,
-                ))
+                .await_tool_result(
+                    self.tool_registry.execute_with_context("read", args, tool_context),
+                    None,
+                )
                 .await;
         }
 
@@ -37,11 +36,10 @@ impl AgentInstance {
             Err(_) => {
                 let tool_context = self.build_tool_execution_context(app_handle, "read").await;
                 return self
-                    .await_tool_result(self.tool_registry.execute_with_context(
-                        "read",
-                        args,
-                        tool_context,
-                    ))
+                    .await_tool_result(
+                        self.tool_registry.execute_with_context("read", args, tool_context),
+                        None,
+                    )
                     .await;
             }
         };
@@ -49,11 +47,10 @@ impl AgentInstance {
         if metadata.is_dir() {
             let tool_context = self.build_tool_execution_context(app_handle, "read").await;
             return self
-                .await_tool_result(self.tool_registry.execute_with_context(
-                    "read",
-                    args,
-                    tool_context,
-                ))
+                .await_tool_result(
+                    self.tool_registry.execute_with_context("read", args, tool_context),
+                    None,
+                )
                 .await;
         }
 

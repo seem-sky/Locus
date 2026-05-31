@@ -18,6 +18,10 @@ export interface DisplaySettings {
   changesAutoClose: boolean;
   /** Enable hover preview popovers for file changes */
   fileChangePopoverEnabled: boolean;
+  /** Auto-open thinking panel when thinking starts */
+  thinkingAutoOpen: boolean;
+  /** Auto-expand inline thinking content in the chat transcript */
+  thinkingAutoExpand: boolean;
   /** Default target for reviewing chat file diffs */
   chatDiffReviewTarget: DiffReviewTarget;
   /** Default target for reviewing Git file diffs */
@@ -28,8 +32,6 @@ export interface DisplaySettings {
   compactToolCalls: boolean;
   /** Hide completed thinking blocks in chat transcript */
   hideThinkingBlocks: boolean;
-  /** Show View packages in the lower section of the session list */
-  showViewsInSessionPanel: boolean;
   /** Merge Git tree status letters into colored file icons */
   mergeGitTreeStatusIcon: boolean;
   /** Hide Git command suggestions in Git terminal */
@@ -85,12 +87,13 @@ const defaults: DisplaySettings = {
   changesAutoOpen: true,
   changesAutoClose: true,
   fileChangePopoverEnabled: true,
+  thinkingAutoOpen: false,
+  thinkingAutoExpand: true,
   chatDiffReviewTarget: "window",
   gitDiffReviewTarget: "window",
   rightAlignUserMessages: true,
   compactToolCalls: true,
   hideThinkingBlocks: true,
-  showViewsInSessionPanel: true,
   mergeGitTreeStatusIcon: true,
   hideGitCommandSuggestions: false,
   systemNotificationsEnabled: true,

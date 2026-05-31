@@ -68,6 +68,7 @@ pub mod tools {
     pub const CODEGRAPH_FILES: &str = include_str!("../../tools/codegraph_files.json");
     pub const CODEGRAPH_STATUS: &str = include_str!("../../tools/codegraph_status.json");
     pub const CODEGRAPH_SYNC: &str = include_str!("../../tools/codegraph_sync.json");
+    pub const CODEGRAPH_TRACE: &str = include_str!("../../tools/codegraph_trace.json");
 }
 
 #[derive(serde::Deserialize)]
@@ -163,6 +164,7 @@ mod tests {
             ("codegraph_files", tools::CODEGRAPH_FILES),
             ("codegraph_status", tools::CODEGRAPH_STATUS),
             ("codegraph_sync", tools::CODEGRAPH_SYNC),
+            ("codegraph_trace", tools::CODEGRAPH_TRACE),
         ];
 
         for (name, json_str) in tool_prompts {

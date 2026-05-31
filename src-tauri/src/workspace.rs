@@ -3,12 +3,25 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceBrowseFiltersConfig {
+    #[serde(default)]
+    pub blocked_folder_names: Vec<String>,
+    #[serde(default)]
+    pub blocked_file_names: Vec<String>,
+    #[serde(default)]
+    pub blocked_extensions: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkspaceConfig {
     #[serde(rename = "workspace_id", alias = "workspaceId")]
     pub workspace_id: String,
     #[serde(default, rename = "forceZh", alias = "forceZh")]
     pub force_zh: bool,
+    #[serde(default, rename = "browseFilters", alias = "browse_filters")]
+    pub browse_filters: WorkspaceBrowseFiltersConfig,
 }
 
 pub struct Workspace {
@@ -87,11 +100,31 @@ pub fn write_workspace_config(dir: &str, config: &WorkspaceConfig) -> Result<(),
         .map_err(|e| format!("Failed to write workspace config: {}", e))
 }
 
-pub fn update_workspace_force_zh(dir: &str, force_zh: bool) -> Result<(), String> {
-    let mut config = read_workspace_config(dir).unwrap_or_else(|_| WorkspaceConfig {
+fn fallback_workspace_config() -> WorkspaceConfig {
+    WorkspaceConfig {
         workspace_id: String::new(),
         force_zh: false,
-    });
+        browse_filters: WorkspaceBrowseFiltersConfig::default(),
+    }
+}
+
+pub fn read_workspace_browse_filters(dir: &str) -> WorkspaceBrowseFiltersConfig {
+    read_workspace_config(dir)
+        .map(|cfg| cfg.browse_filters)
+        .unwrap_or_default()
+}
+
+pub fn update_workspace_browse_filters(
+    dir: &str,
+    browse_filters: WorkspaceBrowseFiltersConfig,
+) -> Result<(), String> {
+    let mut config = read_workspace_config(dir).unwrap_or_else(|_| fallback_workspace_config());
+    config.browse_filters = browse_filters;
+    write_workspace_config(dir, &config)
+}
+
+pub fn update_workspace_force_zh(dir: &str, force_zh: bool) -> Result<(), String> {
+    let mut config = read_workspace_config(dir).unwrap_or_else(|_| fallback_workspace_config());
     config.force_zh = force_zh;
     write_workspace_config(dir, &config)
 }
@@ -171,6 +204,7 @@ pub fn load_or_create_workspace(dir: &str) -> Result<String, String> {
             &WorkspaceConfig {
                 workspace_id: workspace_id.clone(),
                 force_zh: false,
+                browse_filters: WorkspaceBrowseFiltersConfig::default(),
             },
         )?;
     }
@@ -184,7 +218,7 @@ mod tests {
 
     use super::{
         generated_workspace_id, load_or_create_workspace, read_workspace_config, Workspace,
-        WorkspaceConfig,
+        WorkspaceBrowseFiltersConfig, WorkspaceConfig,
     };
 
     fn write_project_settings(root: &tempfile::TempDir, body: &str) {
@@ -211,6 +245,11 @@ mod tests {
         let cfg = WorkspaceConfig {
             workspace_id: "stable-id".to_string(),
             force_zh: false,
+            browse_filters: WorkspaceBrowseFiltersConfig {
+                blocked_folder_names: vec!["Temp".to_string()],
+                blocked_file_names: vec![],
+                blocked_extensions: vec![".dll".to_string()],
+            },
         };
         let value = serde_json::to_value(&cfg).expect("workspace config should serialize");
         assert_eq!(
@@ -219,6 +258,16 @@ mod tests {
         );
         assert!(value.get("workspaceId").is_none());
         assert!(value.get("memory").is_none());
+        let browse_filters = value
+            .get("browseFilters")
+            .expect("browse filters should serialize in camelCase");
+        assert_eq!(
+            browse_filters
+                .get("blockedFolderNames")
+                .and_then(|v| v.as_array())
+                .map(|items| items.len()),
+            Some(1)
+        );
     }
 
     #[test]

@@ -644,6 +644,7 @@ fn collect_tool_calls(
             outcome: None,
             recorded_output: None,
             nested_tool_calls: None,
+            execution_meta: None,
         });
     }
 
@@ -856,6 +857,7 @@ mod tests {
             thinking_duration: None,
             thinking_signature: None,
             knowledge_proposal: None,
+            memory_proposal: None,
             render_parts: None,
         }
     }

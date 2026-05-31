@@ -65,6 +65,13 @@ pub(super) fn bash() -> ToolDef {
                         };
                     }
                 };
+                let rtk_meta = crate::rtk::rewrite_with_meta(&command);
+                let execution_meta = serde_json::json!({ "rtk": rtk_meta.to_json() });
+                if let Some(sink) = ctx.execution_meta_sink.as_ref() {
+                    if let Ok(mut slot) = sink.lock() {
+                        *slot = Some(execution_meta);
+                    }
+                }
                 let _desc = args
                     .get("description")
                     .and_then(|v| v.as_str())
@@ -100,15 +107,19 @@ pub(super) fn bash() -> ToolDef {
                     }
                 }
 
+                let rewritten_command = rtk_meta
+                    .executed_command
+                    .clone()
+                    .unwrap_or_else(|| command.clone());
                 let sh_command = || {
                     if let Some(ref python) = python {
                         format!(
                             "{}{}",
                             crate::python_runtime::sh_python_function_prefix(&python.path),
-                            command
+                            rewritten_command
                         )
                     } else {
-                        command.clone()
+                        rewritten_command.clone()
                     }
                 };
 
@@ -118,7 +129,7 @@ pub(super) fn bash() -> ToolDef {
                         c.arg("-c").arg(sh_command());
                         c
                     } else {
-                        let wrapped = format!("chcp 65001 >nul && {}", command);
+                        let wrapped = format!("chcp 65001 >nul && {}", rewritten_command);
                         let mut c = async_command("cmd");
                         c.arg("/S").arg("/C").arg(&wrapped);
                         c
@@ -169,6 +180,7 @@ pub(super) fn bash() -> ToolDef {
 
                 let mut path = augment_path_with_git(std::env::var_os("PATH"))
                     .or_else(|| std::env::var_os("PATH"));
+                path = crate::rtk::augment_path_with_rtk(path);
                 if let Some(ref python) = python {
                     path = crate::python_runtime::prepend_python_to_path(path, &python.path);
                 }
@@ -219,7 +231,10 @@ pub(super) fn bash() -> ToolDef {
                         is_error: true,
                     },
                     Err(_) => ToolResult {
-                        output: format!("Command timed out after {}ms: {}", timeout_ms, command),
+                        output: format!(
+                            "Command timed out after {}ms: {}",
+                            timeout_ms, rewritten_command
+                        ),
                         is_error: true,
                     },
                 }

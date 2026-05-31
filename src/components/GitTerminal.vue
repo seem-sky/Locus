@@ -7,7 +7,8 @@ import { gitExecute } from "../services/git";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import type { StreamEvent, ModelOption, PendingQuestion, PendingToolConfirm } from "../types";
 import MarkdownRenderer from "./MarkdownRenderer.vue";
-import { t } from "../i18n";
+import { locale, t } from "../i18n";
+import { resolveChatResponseLocale } from "../composables/useAgentResponseSettings";
 import { normalizeAppError } from "../services/errors";
 import { useDisplaySettings } from "../composables/useDisplaySettings";
 
@@ -344,6 +345,7 @@ async function submit() {
       agentId: "git",
       model: props.selectedModelId || null,
       sessionType: "git",
+      responseLocale: resolveChatResponseLocale(locale.value),
     });
     sessionId.value = sid;
     currentRunId.value = runId;

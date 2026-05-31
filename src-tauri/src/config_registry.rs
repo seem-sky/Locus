@@ -508,6 +508,7 @@ fn collect_permissions(app_handle: &tauri::AppHandle, out: &mut Vec<ConfigEntry>
         ("codegraph_files", "CodeGraph indexed file tree"),
         ("codegraph_status", "CodeGraph index status"),
         ("codegraph_sync", "CodeGraph index sync"),
+        ("codegraph_trace", "CodeGraph path tracing"),
         ("list", "Directory listing"),
         ("task", "Sub-agent delegation"),
         ("todowrite", "TODO list management"),

@@ -22,7 +22,7 @@ export const LOCUS_CHAT_MESSAGE_DRAFT_MIME = "application/x-locus-chat-message-d
 const CLIPBOARD_HTML_MARKER_RE =
   /<!--\s*locus-user-message-draft:([A-Za-z0-9+/=]+)\s*-->/;
 const SERIALIZED_KIND = "locus_user_message_draft_v1";
-const UNITY_ASSET_REF_ROOT_RE = /^(?:Assets|Packages|ProjectSettings)(?:\/|$)/i;
+const UNITY_ASSET_REF_ROOT_RE = /^(?:Assets(?:\.Lua)?|Packages|ProjectSettings)(?:\/|$)/i;
 const UNITY_SCENE_OBJECT_REF_RE = /^((?:Assets|Packages)\/.+?\.unity)\/.+/i;
 const PROJECT_KNOWLEDGE_REF_ROOT_RE = /^(?:design|memory|skill|reference)\/.+\.md$/i;
 

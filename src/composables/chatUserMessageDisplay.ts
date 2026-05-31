@@ -19,6 +19,12 @@ const LOCUS_LOCAL_FILE_ENTRY_RE =
 const UNITY_EDITOR_STATUS_CHANGED_PREFIX_RE =
   /^[ \t]*\[Unity Editor Status Changed\][^\r\n]*(?:\r?\n[ \t]*){0,2}/;
 
+const DEV_WORKFLOW_CONTINUATION_PREFIX_RE =
+  /^[ \t]*\[Dev workflow continuation\][ \t]*(?:\r?\n|$)/i;
+
+const ZH_LANGUAGE_USER_MESSAGE_PREFIX =
+  "【语言要求：全程使用简体中文，包括 thinking / 推理过程，禁止英文思考】\n\n";
+
 export interface UserConsoleEntryDisplay {
   title: string;
   level: "Error" | "Warning" | "Log";
@@ -57,8 +63,21 @@ function stripLocusLocalFileBlocks(text: string) {
   return text.replace(LOCUS_LOCAL_FILES_BLOCK_RE, "\n");
 }
 
+function stripDevWorkflowContinuationPrefix(text: string) {
+  if (DEV_WORKFLOW_CONTINUATION_PREFIX_RE.test(text)) {
+    return "";
+  }
+  return text;
+}
+
 function stripKnownLocusPrefixes(text: string) {
   return text.replace(UNITY_EDITOR_STATUS_CHANGED_PREFIX_RE, "");
+}
+
+function stripImplicitLanguagePrefix(text: string) {
+  return text.startsWith(ZH_LANGUAGE_USER_MESSAGE_PREFIX)
+    ? text.slice(ZH_LANGUAGE_USER_MESSAGE_PREFIX.length)
+    : text;
 }
 
 function normalizeConsoleLevel(title: string, text: string): UserConsoleEntryDisplay["level"] {
@@ -139,11 +158,15 @@ export function displayUserMessageContent(content: string) {
 
   while (next !== previous) {
     previous = next;
-    next = stripKnownLocusPrefixes(
-      stripLocusLocalFileBlocks(
-        stripLocusConsoleBlocks(
-          stripUnityAssetRefBlocks(
-            stripSystemReminderBlocks(next),
+    next = stripDevWorkflowContinuationPrefix(
+      stripKnownLocusPrefixes(
+        stripImplicitLanguagePrefix(
+          stripLocusLocalFileBlocks(
+            stripLocusConsoleBlocks(
+              stripUnityAssetRefBlocks(
+                stripSystemReminderBlocks(next),
+              ),
+            ),
           ),
         ),
       ),

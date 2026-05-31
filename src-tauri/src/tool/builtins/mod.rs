@@ -1,4 +1,4 @@
-mod codegraph;
+pub mod codegraph;
 mod filesystem;
 mod knowledge;
 mod lua_gc_analyze;

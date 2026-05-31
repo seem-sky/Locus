@@ -23,6 +23,15 @@ import {
   normalizeSkillCommandTrigger,
   SKILL_COMMAND_NOTICE_OPERATION,
 } from "../../composables/skillCommands";
+import {
+  isQuickChatSkillPinned,
+  MAX_QUICK_CHAT_SKILLS,
+  pinQuickChatSkill,
+  quickChatPinsRevision,
+  resolveSkillPinFromDocument,
+  resolveSkillPinFromManifest,
+  unpinQuickChatSkill,
+} from "../../composables/useQuickChatSkills";
 import BaseDropdown from "../ui/BaseDropdown.vue";
 import BaseMarkdownEditor from "../ui/BaseMarkdownEditor.vue";
 import BaseSwitch from "../ui/BaseSwitch.vue";
@@ -410,6 +419,31 @@ const skillCommandInputDisabled = computed(() =>
 );
 const showSkillCommandFields = computed(() =>
   isSkillDocument.value && skillEnabled.value && skillSurfaceAllowsCommand(currentSkillSurface.value),
+);
+const skillQuickChatPin = computed(() => {
+  quickChatPinsRevision.value;
+  const manifest = skillPackageManifestForDocument(props.document);
+  if (manifest) return resolveSkillPinFromManifest(manifest);
+  return resolveSkillPinFromDocument(props.document, skillItems.value);
+});
+const skillQuickChatPinned = computed(() => {
+  quickChatPinsRevision.value;
+  const pin = skillQuickChatPin.value;
+  return pin ? isQuickChatSkillPinned(pin, skillItems.value) : false;
+});
+const showSkillQuickChatPin = computed(() =>
+  isSkillDocument.value && skillEnabled.value,
+);
+const skillQuickChatPinRequiresCommand = computed(() =>
+  showSkillQuickChatPin.value && !skillSurfaceAllowsCommand(currentSkillSurface.value),
+);
+const skillQuickChatPinDisabled = computed(() =>
+  props.saveLoading || !skillQuickChatPin.value || skillQuickChatPinRequiresCommand.value,
+);
+const skillQuickChatPinTitle = computed(() =>
+  skillQuickChatPinRequiresCommand.value
+    ? t("knowledge.skill.quickChatPinNeedsCommand")
+    : t("knowledge.skill.quickChatPinHint"),
 );
 const skillPackageId = computed(() => {
   return packageIdForSkillDocument(props.document);
@@ -1328,6 +1362,23 @@ function showSkillCommandError(message: string) {
   });
 }
 
+function onSkillQuickChatPinChange(enabled: boolean) {
+  const pin = skillQuickChatPin.value;
+  if (!pin || skillQuickChatPinDisabled.value) return;
+  if (enabled) {
+    const result = pinQuickChatSkill(pin, skillItems.value);
+    if (result.limited) {
+      notificationStore.addNotice(
+        "error",
+        t("knowledge.skill.quickChatPinLimit", MAX_QUICK_CHAT_SKILLS),
+        { operation: "knowledgeSkillQuickChatPin" },
+      );
+    }
+    return;
+  }
+  unpinQuickChatSkill(pin, skillItems.value);
+}
+
 function onSkillSurfaceChange(value: string) {
   if (!props.document || props.document.type !== "skill" || isReadOnly.value) return;
   notificationStore.clearByOperation(SKILL_COMMAND_NOTICE_OPERATION);
@@ -1931,6 +1982,24 @@ function labelForProvider(provider?: string | null): string {
                       :disabled="isReadOnly || saveLoading"
                       @blur="persistSkillArgumentHint"
                       @keydown="onSkillArgumentHintKeydown"
+                    />
+                  </div>
+                </div>
+                <div
+                  v-if="showSkillQuickChatPin"
+                  class="meta-row meta-row-control"
+                  :title="skillQuickChatPinTitle"
+                >
+                  <span class="meta-label">{{ t("knowledge.skill.quickChatPin") }}</span>
+                  <div
+                    class="meta-control meta-control-switch"
+                    :title="skillQuickChatPinTitle"
+                  >
+                    <BaseSwitch
+                      :model-value="skillQuickChatPinned"
+                      :disabled="skillQuickChatPinDisabled"
+                      :aria-label="t('knowledge.skill.quickChatPin')"
+                      @update:model-value="onSkillQuickChatPinChange"
                     />
                   </div>
                 </div>

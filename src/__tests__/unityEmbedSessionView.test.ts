@@ -38,7 +38,16 @@ describe("Unity embedded session view", () => {
     expect(workspace).toContain(':default-session-panel-collapsed="defaultSessionPanelCollapsed"');
     expect(workspace).toContain(':session-panel-storage-scope="sessionPanelStorageScope"');
     expect(workspace).toContain("defaultSessionPanelCollapsed: false");
-    expect(workspace).toContain("<ThinkingPanel");
+    expect(workspace).toContain("<ChatView");
+    expect(workspace).not.toContain("<ThinkingPanel");
+    expect(workspace).toContain("chatStore.showThinkingPanel");
+    expect(workspace).not.toContain("chat-session-stack");
+    const chatView = read("src/components/ChatView.vue");
+    const sidebar = read("src/components/ChatSidebarPanel.vue");
+    expect(chatView).toContain("session-sidebar-stack");
+    expect(chatView).not.toContain("<ThinkingPanel");
+    expect(sidebar).toContain("<ThinkingPanel");
+    expect(sidebar).toContain("chat-sidebar-section-thinking");
     expect(workspace).toContain("<ChatSidebarPanel");
     expect(workspace).toContain(':storage-scope="sessionPanelStorageScope"');
     expect(workspace).toContain("@layout-mode-change=\"handleLayoutModeChange\"");

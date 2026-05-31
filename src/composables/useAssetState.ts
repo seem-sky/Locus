@@ -11,6 +11,7 @@ import {
   setWatcherTuning,
 } from "../services/asset";
 import { listDirEntriesPage } from "../services/project";
+import { useWorkspaceBrowseFilters } from "./useWorkspaceBrowseFilters";
 import { normalizeAppError } from "../services/errors";
 import { getWarmup } from "./warmupCache";
 import { acquireSelectionLock } from "./useSelectionLock";
@@ -55,15 +56,54 @@ export type AssetExplorerNode =
 type AssetPreviewFileNode = Extract<AssetExplorerNode, { kind: "file" }>;
 type AssetFolderNode = Extract<AssetExplorerNode, { kind: "folder" }>;
 
-const FIXED_ROOTS = ["Assets", "Packages", "ProjectSettings"] as const;
+/** Unity 资产根目录优先顺序；其余工作区顶层目录在扫描后追加显示。 */
+export const PREFERRED_ASSET_ROOTS = [
+  "Assets",
+  "Assets.Lua",
+  "Packages",
+  "ProjectSettings",
+] as const;
 const ASSET_EXPLORER_PAGE_SIZE = 200;
+const ASSET_EXPLORER_ROOT_SCAN_LIMIT = 500;
 const ASSET_EXPLORER_BRANCH_PROBE_PAGE_SIZE = 1;
 const ASSET_EXPLORER_BRANCH_PROBE_CONCURRENCY = 8;
 type ViewMode = "stats" | "preview";
 type AssetSearchScope = "folder" | "global";
 type FolderRevealMode = "none" | "ancestors" | "self";
 
+function compareRootNames(a: string, b: string): number {
+  return a.localeCompare(b, undefined, {
+    numeric: true,
+    sensitivity: "base",
+  });
+}
+
+/** 合并优先 Unity 根目录与工作区扫描到的其它顶层文件夹。 */
+export function resolveExplorerRootNames(discoveredDirs: string[]): string[] {
+  const discoveredSet = new Set(discoveredDirs);
+  const ordered: string[] = [];
+
+  for (const name of PREFERRED_ASSET_ROOTS) {
+    if (discoveredDirs.length === 0 || discoveredSet.has(name)) {
+      ordered.push(name);
+    }
+  }
+
+  if (discoveredDirs.length === 0) {
+    return [...PREFERRED_ASSET_ROOTS];
+  }
+
+  const preferredSet = new Set<string>(PREFERRED_ASSET_ROOTS);
+  const extras = discoveredDirs
+    .filter((name) => !preferredSet.has(name))
+    .sort(compareRootNames);
+
+  return [...ordered, ...extras];
+}
+
 export function useAssetState(props: AssetProps) {
+  const { payload: browseFilters, revision: browseFiltersRevision } = useWorkspaceBrowseFilters();
+
   // ── Reactive state ────────────────────────────────────────
   const loading = ref(false);
   const error = ref("");
@@ -168,24 +208,45 @@ export function useAssetState(props: AssetProps) {
   }
 
   // ── Explorer ──────────────────────────────────────────────
+  function applyExplorerRoots(names: string[]) {
+    const roots = names.length > 0 ? names : [...PREFERRED_ASSET_ROOTS];
+    explorerTree.value = roots.map((name) => createFolderNode(name, name, 0, true));
+    const fallback = roots[0] ?? PREFERRED_ASSET_ROOTS[0];
+    if (!selectedFolderPath.value || !roots.includes(selectedFolderPath.value)) {
+      selectedFolderPath.value = fallback;
+    }
+  }
+
+  /** 同步初始化（测试用）；运行时使用 `discoverAndInitRoots`。 */
   function initRoots() {
-    explorerTree.value = FIXED_ROOTS.map((name) => ({
-      kind: "folder",
-      name,
-      path: name,
-      depth: 0,
-      isRoot: true,
-      loaded: false,
-      loading: false,
-      hasMore: false,
-      nextOffset: 0,
-      totalCount: 0,
-      hasChildFoldersKnown: false,
-      hasChildFolders: false,
-      branchProbeLoading: false,
-      children: [],
-    }));
-    selectedFolderPath.value = FIXED_ROOTS[0];
+    applyExplorerRoots([...PREFERRED_ASSET_ROOTS]);
+  }
+
+  function defaultExplorerRootPath(): string {
+    const firstRoot = explorerTree.value.find(
+      (node): node is AssetFolderNode => node.kind === "folder",
+    );
+    return firstRoot?.path ?? PREFERRED_ASSET_ROOTS[0];
+  }
+
+  async function discoverAndInitRoots() {
+    let discoveredDirs: string[] = [];
+    try {
+      const page = await listDirEntriesPage(
+        "",
+        0,
+        ASSET_EXPLORER_ROOT_SCAN_LIMIT,
+        true,
+        browseFilters.value,
+      );
+      discoveredDirs = page.entries
+        .filter((entry) => entry.isDir)
+        .map((entry) => entry.name);
+    } catch (e) {
+      const err = normalizeAppError(e);
+      error.value = err.message;
+    }
+    applyExplorerRoots(resolveExplorerRootNames(discoveredDirs));
   }
 
   function isPathExpanded(path: string): boolean {
@@ -303,6 +364,7 @@ export function useAssetState(props: AssetProps) {
         options.append ? folder.nextOffset : 0,
         ASSET_EXPLORER_PAGE_SIZE,
         true,
+        browseFilters.value,
       );
       assignFolderPage(folder, page, !!options.append);
     } catch (e) {
@@ -329,6 +391,7 @@ export function useAssetState(props: AssetProps) {
         0,
         ASSET_EXPLORER_BRANCH_PROBE_PAGE_SIZE,
         true,
+        browseFilters.value,
       );
       folder.hasChildFoldersKnown = true;
       folder.hasChildFolders = page.entries[0]?.isDir === true;
@@ -802,9 +865,9 @@ export function useAssetState(props: AssetProps) {
 
   onMounted(async () => {
     if (hasWorkspace.value) {
-      initRoots();
+      await discoverAndInitRoots();
       void prefetchRootFolderBranchState();
-      await selectFolder(FIXED_ROOTS[0], {
+      await selectFolder(defaultExplorerRootPath(), {
         preservePreview: true,
         revealInTree: "none",
       });
@@ -874,17 +937,32 @@ export function useAssetState(props: AssetProps) {
   });
 
   // Re-init when workingDir changes (workspace switch).
+  watch(browseFiltersRevision, async () => {
+    if (!hasWorkspace.value) return;
+    expandedPaths.value = new Set();
+    await discoverAndInitRoots();
+    void prefetchRootFolderBranchState();
+    const folderPath = defaultExplorerRootPath();
+    if (folderPath) {
+      await selectFolder(folderPath, {
+        preservePreview: true,
+        revealInTree: "none",
+      });
+    }
+  });
+
   watch(
     () => props.workingDir,
     (workingDir) => {
       stopWatcherPoll();
       resetWorkspaceState();
       if (!workingDir.trim()) return;
-      initRoots();
-      void prefetchRootFolderBranchState();
-      void selectFolder(FIXED_ROOTS[0], {
-        preservePreview: true,
-        revealInTree: "none",
+      void discoverAndInitRoots().then(() => {
+        void prefetchRootFolderBranchState();
+        void selectFolder(defaultExplorerRootPath(), {
+          preservePreview: true,
+          revealInTree: "none",
+        });
       });
       const cachedDbOverview = getWarmup<AssetDbOverview>("asset:dbOverview");
       const cachedWatcherTuning = getWarmup<WatcherTuning>("asset:watcherTuning");
@@ -1035,6 +1113,7 @@ export function useAssetState(props: AssetProps) {
     watcherTuningSaving,
     // actions
     initRoots,
+    discoverAndInitRoots,
     isPathExpanded,
     selectFolder,
     togglePath,

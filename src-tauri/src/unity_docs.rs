@@ -3195,17 +3195,21 @@ fn ensure_unity_reference_store_schema(conn: &Connection) -> Result<(), String> 
 }
 
 fn open_unity_reference_store_readonly(path: &Path) -> Result<Connection, String> {
-    Connection::open_with_flags(
-        path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .map_err(|e| {
-        format!(
-            "Failed to open Unity reference store '{}': {}",
-            path.display(),
-            e
-        )
-    })
+    let uri = format!(
+        "file:{}?mode=ro&immutable=1",
+        path.to_string_lossy().replace('\\', "/")
+    );
+    if let Ok(conn) = Connection::open_with_flags(
+        &uri,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) {
+        return Ok(conn);
+    }
+
+    let _guard = unity_reference_store_lock()
+        .lock()
+        .map_err(|_| "Unity reference store lock is poisoned".to_string())?;
+    open_unity_reference_store(path)
 }
 
 fn insert_managed_document(

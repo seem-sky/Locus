@@ -17,7 +17,7 @@ interface StreamNotificationContext {
 
 type NotifiableStreamEvent = Extract<
   StreamEvent,
-  { type: "done" | "askUser" | "error" | "toolConfirm" | "knowledgeProposal" }
+  { type: "done" | "askUser" | "error" | "toolConfirm" | "knowledgeProposal" | "memoryProposal" }
 >;
 
 const MAX_RECENT_NOTIFICATION_KEYS = 128;
@@ -35,6 +35,7 @@ function isNotifiableStreamEvent(event: StreamEvent): event is NotifiableStreamE
     || event.type === "error"
     || event.type === "toolConfirm"
     || event.type === "knowledgeProposal"
+    || event.type === "memoryProposal"
   );
 }
 
@@ -59,6 +60,10 @@ function getNotificationKey(event: NotifiableStreamEvent): string {
     case "knowledgeProposal": {
       const proposalId = event.message.knowledgeProposal?.proposalId?.trim();
       return proposalId ? `proposal:${proposalId}` : `proposal-message:${event.message.id}`;
+    }
+    case "memoryProposal": {
+      const proposalId = event.message.memoryProposal?.proposalId?.trim();
+      return proposalId ? `memory-proposal:${proposalId}` : `memory-proposal-message:${event.message.id}`;
     }
   }
 }
@@ -100,6 +105,22 @@ function summarizeKnowledgeProposal(event: Extract<StreamEvent, { type: "knowled
     return t("notifications.knowledgeProposalMultiple", proposal.items.length);
   }
   return t("notifications.knowledgeProposalFallback");
+}
+
+function summarizeMemoryProposal(event: Extract<StreamEvent, { type: "memoryProposal" }>): string {
+  const proposal = event.message.memoryProposal;
+  if (!proposal || proposal.status !== "pending") {
+    return t("notifications.memoryProposalFallback");
+  }
+
+  const firstContent = summarizeText(proposal.items[0]?.content);
+  if (proposal.items.length === 1 && firstContent) {
+    return t("notifications.memoryProposalSingle", firstContent);
+  }
+  if (proposal.items.length > 1) {
+    return t("notifications.memoryProposalMultiple", proposal.items.length);
+  }
+  return t("notifications.memoryProposalFallback");
 }
 
 async function buildNotificationMessage(
@@ -172,6 +193,8 @@ function isSystemNotificationEventEnabled(
       return state.notifyOnToolConfirm;
     case "knowledgeProposal":
       return state.notifyOnToolConfirm;
+    case "memoryProposal":
+      return state.notifyOnToolConfirm;
   }
 }
 
@@ -193,6 +216,8 @@ function isSoundEventEnabled(
       return state.soundOnToolConfirm;
     case "knowledgeProposal":
       return state.soundOnToolConfirm;
+    case "memoryProposal":
+      return state.soundOnToolConfirm;
   }
 }
 
@@ -209,6 +234,7 @@ function getSoundIntent(
       return "error";
     case "toolConfirm":
     case "knowledgeProposal":
+    case "memoryProposal":
       return "confirm";
   }
 }
@@ -283,6 +309,13 @@ async function maybeSendSystemStreamNotification(
       await buildNotificationMessage(
         t("notifications.knowledgeProposalTitle"),
         summarizeKnowledgeProposal(event),
+        context,
+      );
+      break;
+    case "memoryProposal":
+      await buildNotificationMessage(
+        t("notifications.memoryProposalTitle"),
+        summarizeMemoryProposal(event),
         context,
       );
       break;

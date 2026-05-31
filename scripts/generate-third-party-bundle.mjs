@@ -38,6 +38,14 @@ const BUNDLED_BINARIES = [
   },
 ];
 
+const BUNDLED_NPM_PACKAGES = [
+  {
+    name: "@agentmemory/agentmemory",
+    version: "0.9.24",
+    bundleDir: path.join(ROOT_DIR, "src-tauri", "gen", "agentmemory-bundle"),
+  },
+];
+
 main();
 
 function main() {
@@ -46,6 +54,7 @@ function main() {
   const frontend = generateFrontendBundle();
   const rust = generateRustBundle();
   const binaries = generateBinaryBundle();
+  const agentmemory = generateAgentmemoryBundle();
   const manifests = copyManifestInputs();
 
   writeText(
@@ -69,6 +78,7 @@ Unity Editor DLL bundle notices remain bundled with \`locus_unity/Editor/Roslyn\
     frontend,
     rust,
     binaries,
+    agentmemory,
     manifests,
   });
 }
@@ -253,6 +263,75 @@ function generateBinaryBundle() {
   return {
     packageCount: records.length,
   };
+}
+
+function generateAgentmemoryBundle() {
+  const packagesDir = path.join(OUTPUT_DIR, "agentmemory", "packages");
+  ensureDirectory(packagesDir);
+  const records = [];
+
+  for (const pkg of BUNDLED_NPM_PACKAGES) {
+    const segments = pkg.name.startsWith("@") ? pkg.name.slice(1).split("/") : [pkg.name];
+    const packageRoot = path.join(pkg.bundleDir, "node_modules", ...segments);
+    const outputDirectory = path.join(packagesDir, packageFolderName(pkg.name, pkg.version));
+    ensureDirectory(outputDirectory);
+
+    if (!fs.existsSync(packageRoot)) {
+      writeText(
+        path.join(outputDirectory, "NOTICE.txt"),
+        `${pkg.name}@${pkg.version}\n\nBundle not built yet. Run \`bun run agentmemory:bundle\` before release builds.\n`,
+      );
+      records.push({
+        kind: "bundled-npm-package",
+        name: pkg.name,
+        version: pkg.version,
+        status: "missing-bundle",
+        texts: [toOutputRelative(path.join(outputDirectory, "NOTICE.txt"))],
+      });
+      continue;
+    }
+
+    const legalFiles = collectLegalFiles(packageRoot);
+    const copiedFiles =
+      legalFiles.length > 0
+        ? copyLegalFiles(legalFiles, packageRoot, outputDirectory)
+        : [
+            writeTextReturnPath(
+              path.join(outputDirectory, "NOTICE.txt"),
+              `${pkg.name}@${pkg.version}\n\nNo LICENSE file found in bundled package directory.\n`,
+            ),
+          ];
+
+    writeText(
+      path.join(outputDirectory, "III-NOTICE.txt"),
+      "iii-engine v0.11.2 is bundled separately under agentmemory-bundle/bin/ from https://github.com/iii-hq/iii\n",
+    );
+    copiedFiles.push(path.join(outputDirectory, "III-NOTICE.txt"));
+
+    records.push({
+      kind: "bundled-npm-package",
+      name: pkg.name,
+      version: pkg.version,
+      status: "present",
+      sourceDir: toRepoRelative(packageRoot),
+      texts: copiedFiles.map(toOutputRelative),
+    });
+  }
+
+  records.sort(comparePackageRecords);
+  writeJson(path.join(OUTPUT_DIR, "agentmemory", "index.json"), {
+    packageCount: records.length,
+    packages: records,
+  });
+
+  return {
+    packageCount: records.length,
+  };
+}
+
+function writeTextReturnPath(filePath, contents) {
+  writeText(filePath, contents);
+  return filePath;
 }
 
 function copyManifestInputs() {

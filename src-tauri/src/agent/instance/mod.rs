@@ -21,6 +21,14 @@ use std::{
 use tauri::{AppHandle, Manager};
 
 use crate::agent::definition::{AgentDef, AgentDefRegistry};
+use crate::agent::session_language::{
+    detect_session_language, is_explicit_chinese_locale, strip_assistant_thinking_for_prompt,
+    wrap_subagent_prompt,
+};
+use crate::agent::workflow::{
+    advance_to_implement_if_allowed, advance_to_review_if_allowed, DevWorkflowGateStore,
+    WorkflowGate,
+};
 use crate::commands::{
     BasicToolConfirmDisplay, KnowledgeToolConfirmDirectoryMode, KnowledgeToolConfirmOperation,
     KnowledgeToolConfirmPreview, StreamEvent, ToolConfirmDisplay,
@@ -208,6 +216,10 @@ pub struct AgentInstance {
     document_skill_tool_names: Mutex<HashSet<String>>,
     partial_assistant: Arc<AssistantStreamState>,
     cancel_rx: tokio::sync::watch::Receiver<bool>,
+    /// Shared per-session workflow state for dev agent (survives across chat runs).
+    dev_workflow_gates: Option<DevWorkflowGateStore>,
+    /// UI or explicit locale tag (`zh` / `en`) for response-language consistency.
+    response_locale: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -390,7 +402,8 @@ fn render_part_seq(part: &AssistantRenderPart) -> u32 {
         AssistantRenderPart::Thinking { order, .. }
         | AssistantRenderPart::Text { order, .. }
         | AssistantRenderPart::ToolCall { order, .. }
-        | AssistantRenderPart::KnowledgeProposal { order, .. } => order.seq,
+        | AssistantRenderPart::KnowledgeProposal { order, .. }
+        | AssistantRenderPart::MemoryProposal { order, .. } => order.seq,
     }
 }
 
@@ -445,6 +458,7 @@ impl ParentToolCall {
         output: String,
         outcome: crate::commands::ToolCallOutcome,
         images: Option<Vec<ImageData>>,
+        execution_meta: Option<serde_json::Value>,
     ) -> ParentStreamEvent {
         ParentStreamEvent {
             run_id: self.run_id.clone(),
@@ -456,6 +470,7 @@ impl ParentToolCall {
                 output,
                 outcome,
                 images,
+                execution_meta,
             },
         }
     }
@@ -550,6 +565,8 @@ pub(super) struct ExecutedToolResult {
     outcome: ToolRunOutcome,
     nested_tool_calls: Option<Vec<ToolCallInfo>>,
     images: Option<Vec<ImageData>>,
+    workflow_gate_handled: bool,
+    execution_meta: Option<serde_json::Value>,
 }
 
 impl ToolRunOutcome {
@@ -578,7 +595,18 @@ impl ExecutedToolResult {
             is_error: result.is_error,
             nested_tool_calls: None,
             images: None,
+            workflow_gate_handled: false,
+            execution_meta: None,
         }
+    }
+
+    pub(super) fn from_tool_result_with_meta(
+        result: ToolResult,
+        execution_meta: Option<serde_json::Value>,
+    ) -> Self {
+        let mut executed = Self::from_tool_result(result);
+        executed.execution_meta = execution_meta;
+        executed
     }
 
     pub(super) fn into_tool_result(self) -> ToolResult {
@@ -601,6 +629,16 @@ impl ExecutedToolResult {
         }
         self
     }
+
+    pub(super) fn append_output(&mut self, suffix: &str) {
+        if !suffix.is_empty() {
+            self.output = format!("{}\n\n{}", self.output, suffix);
+        }
+    }
+
+    pub(super) fn mark_workflow_gate_handled(&mut self) {
+        self.workflow_gate_handled = true;
+    }
 }
 
 pub(super) fn finalize_tool_call_record(
@@ -619,6 +657,7 @@ pub(super) fn finalize_tool_call_record(
     if let Some(result) = result {
         finalized.outcome = Some(result.outcome.as_stream_outcome());
         finalized.nested_tool_calls = result.nested_tool_calls.clone();
+        finalized.execution_meta = result.execution_meta.clone();
     }
 
     finalized
@@ -831,6 +870,7 @@ struct GitCommandEffect {
 enum ToolConfirmReason {
     UserPermission,
     KnowledgeGovernance,
+    WorkflowAmbiguous,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2415,7 +2455,16 @@ impl AgentInstance {
 
         let path = std::path::Path::new(trimmed);
         if path.is_absolute() {
-            return Some(trimmed.to_string());
+            let workspace_root = if self.has_selected_working_dir() && self.knowledge_access_mode.allows_context() {
+                Some(std::path::Path::new(&self.working_dir))
+            } else {
+                None
+            };
+            return Some(
+                crate::commands::resolve_workspace_file_path(workspace_root, trimmed)
+                    .display()
+                    .to_string(),
+            );
         }
 
         if !self.has_selected_working_dir() {
@@ -2426,10 +2475,12 @@ impl AgentInstance {
         }
 
         Some(
-            std::path::Path::new(&self.working_dir)
-                .join(path)
-                .display()
-                .to_string(),
+            crate::commands::resolve_workspace_file_path(
+                Some(std::path::Path::new(&self.working_dir)),
+                trimmed,
+            )
+            .display()
+            .to_string(),
         )
     }
 
@@ -2623,6 +2674,7 @@ impl AgentInstance {
             | "codegraph_files"
             | "codegraph_status"
             | "codegraph_sync"
+            | "codegraph_trace"
             | "view_create"
             | "view_list"
             | "view_reload"
@@ -2750,6 +2802,7 @@ impl AgentInstance {
         undo_manager: Option<Arc<crate::vcs::UndoManager>>,
         subagent_model_overrides: std::collections::HashMap<String, String>,
         cancel_rx: tokio::sync::watch::Receiver<bool>,
+        dev_workflow_gates: Option<DevWorkflowGateStore>,
     ) -> Self {
         let effective_effort = effort.or_else(|| def.default_effort.clone());
         AgentInstance {
@@ -2776,7 +2829,156 @@ impl AgentInstance {
             document_skill_tool_names: Mutex::new(HashSet::new()),
             partial_assistant: Arc::new(AssistantStreamState::default()),
             cancel_rx,
+            dev_workflow_gates,
+            response_locale: None,
         }
+    }
+
+    pub fn set_response_locale(&mut self, locale: Option<String>) {
+        self.response_locale = locale
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+    }
+
+    fn is_explicit_chinese_forced(&self) -> bool {
+        is_explicit_chinese_locale(self.response_locale.as_deref())
+    }
+
+    fn language_prompt_prefix(&self, store: &SessionStore) -> Option<&'static str> {
+        if !self.is_explicit_chinese_forced() {
+            return None;
+        }
+        self.session_language_for_turn(store).user_message_prefix()
+    }
+
+    fn prepare_llm_messages(
+        &self,
+        messages: &[crate::session::models::ChatMessage],
+    ) -> Vec<crate::session::models::ChatMessage> {
+        let mut prepared = messages.to_vec();
+        if self.is_explicit_chinese_forced() {
+            strip_assistant_thinking_for_prompt(&mut prepared);
+        }
+        prepared
+    }
+
+    fn with_dev_workflow_gate<R>(
+        &self,
+        mode: &str,
+        f: impl FnOnce(&mut WorkflowGate) -> R,
+    ) -> Option<R> {
+        if !WorkflowGate::applies(&self.def.id, mode) {
+            return None;
+        }
+        let store = self.dev_workflow_gates.as_ref()?;
+        let mut map = store.lock().ok()?;
+        let gate = map
+            .entry(self.session_id.clone())
+            .or_insert_with(WorkflowGate::new);
+        Some(f(gate))
+    }
+
+    fn workflow_gate_check(
+        &self,
+        tool_name: &str,
+        args: &serde_json::Value,
+        mode: &str,
+    ) -> Option<ExecutedToolResult> {
+        self.with_dev_workflow_gate(mode, |gate| {
+            gate.check_tool(tool_name, args).map(|output| {
+                ExecutedToolResult::from_tool_result(ToolResult {
+                    output,
+                    is_error: true,
+                })
+            })
+        })
+        .flatten()
+    }
+
+    fn workflow_gate_on_success(
+        &self,
+        tool_name: &str,
+        args: &serde_json::Value,
+        mode: &str,
+        output: Option<&str>,
+    ) -> Option<String> {
+        self.with_dev_workflow_gate(mode, |gate| gate.on_tool_success(tool_name, args, output))
+            .flatten()
+    }
+
+    fn build_workflow_status_reminder(&self, mode: &str) -> Option<String> {
+        self.with_dev_workflow_gate(mode, |gate| {
+            Some(format!(
+                "<system-reminder>\n{}\n</system-reminder>",
+                gate.status_reminder()
+            ))
+        })
+        .flatten()
+    }
+
+    fn workflow_needs_incomplete_continuation(&self, mode: &str) -> bool {
+        self.with_dev_workflow_gate(mode, |gate| gate.needs_incomplete_workflow_continuation())
+            .unwrap_or(false)
+    }
+
+    fn inject_workflow_continuation_user_message(
+        &self,
+        app_handle: &AppHandle,
+        store: &SessionStore,
+        run_id: &str,
+        nudge: &str,
+    ) -> Result<(), String> {
+        let wrapped = Self::wrap_system_reminder(nudge)
+            .ok_or_else(|| "Workflow continuation nudge is empty".to_string())?;
+        let message_id = store.add_message(
+            &self.session_id,
+            MessageRole::User,
+            &wrapped,
+        )?;
+        let current_user_message = self.persisted_message_by_id(store, &message_id)?;
+        emit_stream(
+            app_handle,
+            run_id,
+            StreamEvent::UserMessage {
+                session_id: self.session_id.clone(),
+                message: current_user_message,
+            },
+        );
+        Ok(())
+    }
+
+    fn try_continue_incomplete_workflow(
+        &self,
+        app_handle: &AppHandle,
+        store: &SessionStore,
+        run_id: &str,
+        mode: &str,
+    ) -> Result<bool, String> {
+        let nudge = self
+            .with_dev_workflow_gate(mode, |gate| gate.take_incomplete_text_stop_nudge())
+            .flatten();
+        let Some(nudge) = nudge else {
+            return Ok(false);
+        };
+        eprintln!(
+            "[Agent {}] workflow incomplete after text-only stop — injecting continuation nudge (phase gate)",
+            self.id
+        );
+        self.inject_workflow_continuation_user_message(app_handle, store, run_id, &nudge)?;
+        Ok(true)
+    }
+
+    fn apply_dev_workflow_tool_policy(&self, mode: Option<&str>, names: &mut Vec<String>) {
+        let Some(mode) = mode else {
+            return;
+        };
+        let _ = self.with_dev_workflow_gate(mode, |gate| {
+            let hidden: HashSet<&str> = gate.hidden_request_tools().iter().copied().collect();
+            if !hidden.is_empty() {
+                names.retain(|name| !hidden.contains(name.as_str()));
+            }
+            gate.prioritize_request_tools(names);
+        });
     }
 
     pub fn partial_assistant_state(&self) -> Arc<AssistantStreamState> {
@@ -2803,6 +3005,7 @@ impl AgentInstance {
             },
             unity_connected,
             runtime_state: Some(self.tool_runtime_state.clone()),
+            execution_meta_sink: Some(Arc::new(Mutex::new(None))),
         }
     }
 
@@ -2979,7 +3182,7 @@ impl AgentInstance {
         dynamic_mode: crate::config::DynamicToolLoadingMode,
     ) -> Vec<String> {
         let active_skill_tool_names = HashSet::new();
-        self.build_request_tool_names_for_mode_and_skills(dynamic_mode, &active_skill_tool_names)
+        self.build_request_tool_names_for_mode_and_skills(dynamic_mode, &active_skill_tool_names, None)
             .await
     }
 
@@ -2987,6 +3190,7 @@ impl AgentInstance {
         &self,
         dynamic_mode: crate::config::DynamicToolLoadingMode,
         active_skill_tool_names: &HashSet<String>,
+        mode: Option<&str>,
     ) -> Vec<String> {
         let allowed = self.allowed_tool_set().await;
         let direct_overrides = self.tool_direct_load_overrides();
@@ -3016,6 +3220,7 @@ impl AgentInstance {
                 push_unique_tool_name(&mut names, &name);
             }
         }
+        self.apply_dev_workflow_tool_policy(mode, &mut names);
         names
     }
 
@@ -3752,7 +3957,8 @@ impl AgentInstance {
             | "codegraph_impact"
             | "codegraph_files"
             | "codegraph_status"
-            | "codegraph_sync" => {
+            | "codegraph_sync"
+            | "codegraph_trace" => {
                 if let Some(p) = args.get("path").and_then(|v| v.as_str()) {
                     if let Some(resolved) = self.resolve_path_against_working_dir(p) {
                         args["path"] = serde_json::Value::String(resolved);
@@ -4969,6 +5175,7 @@ impl AgentInstance {
             self.undo_manager.clone(),
             self.subagent_model_overrides.clone(),
             self.cancel_waiter(),
+            self.dev_workflow_gates.clone(),
         ))
     }
 
@@ -4983,6 +5190,10 @@ impl AgentInstance {
         on_thinking_delta: impl Fn(String) + Send + Sync + 'static,
         on_tool_call_start: impl Fn(String, String) + Send + Sync + 'static,
     ) -> Result<LlmCallResult, String> {
+        let messages = self.prepare_llm_messages(messages);
+        let trailing_system_reminder = self
+            .is_explicit_chinese_forced()
+            .then(|| self.session_language_instruction(store));
         match &self.backend {
             LlmBackend::OpenRouter { api_key, base_url } => {
                 let system_prompt = system_parts.join("\n\n");
@@ -4991,7 +5202,7 @@ impl AgentInstance {
                     api_key,
                     &api_model,
                     &system_prompt,
-                    messages,
+                    &messages,
                     api_tools,
                     base_url.as_deref(),
                     None, // api_path: defaults to /api/v1/chat/completions
@@ -5031,11 +5242,12 @@ impl AgentInstance {
                     &self.effective_model,
                     user_metadata,
                     system_parts,
-                    messages,
+                    &messages,
                     api_tools,
                     base_url.as_deref(),
                     Some(&self.session_id),
                     self.effort.as_deref(),
+                    trailing_system_reminder,
                     on_text_delta,
                     on_thinking_delta,
                     on_tool_call_start,
@@ -5084,7 +5296,7 @@ impl AgentInstance {
                     base_url.as_deref(),
                     actual_model,
                     &system_prompt,
-                    messages,
+                    &messages,
                     api_tools,
                     self.effort.as_deref(),
                     self.debug,
@@ -5112,7 +5324,7 @@ impl AgentInstance {
                             base_url.as_deref(),
                             actual_model,
                             &system_prompt,
-                            messages,
+                            &messages,
                             api_tools,
                             self.effort.as_deref(),
                             self.debug,
@@ -5159,13 +5371,15 @@ impl AgentInstance {
                 ..
             } => {
                 use crate::commands::{ApiFormat, CustomReasoningParamFormat};
-                if !supports_vision && messages_have_images(messages) {
+                if !supports_vision && messages_have_images(&messages) {
                     return Err(no_vision_endpoint_error());
                 }
                 let custom_reasoning_effort = crate::llm::openai_reasoning::custom_reasoning_effort(
                     self.effort.as_deref(),
                     supported_reasoning_efforts,
                 );
+                let effective_replay_reasoning =
+                    *replay_reasoning_content && !self.is_explicit_chinese_forced();
                 match api_format {
                     ApiFormat::OpenaiChat => {
                         let system_prompt = system_parts.join("\n\n");
@@ -5185,12 +5399,12 @@ impl AgentInstance {
                             api_key,
                             api_model,
                             &system_prompt,
-                            messages,
+                            &messages,
                             api_tools,
                             endpoint.as_str(),
                             reasoning_effort,
                             thinking_level,
-                            *replay_reasoning_content,
+                            effective_replay_reasoning,
                             self.debug,
                             on_text_delta,
                             on_thinking_delta,
@@ -5227,7 +5441,7 @@ impl AgentInstance {
                             api_key,
                             api_model,
                             &system_prompt,
-                            messages,
+                            &messages,
                             api_tools,
                             endpoint.as_str(),
                             self.effort.as_deref(),
@@ -5258,7 +5472,11 @@ impl AgentInstance {
                         })
                     }
                     ApiFormat::AnthropicMessages => {
-                        let system_prompt = system_parts.join("\n\n");
+                        let mut system_prompt = system_parts.join("\n\n");
+                        if let Some(reminder) = trailing_system_reminder {
+                            system_prompt.push_str("\n\n");
+                            system_prompt.push_str(reminder);
+                        }
                         let thinking_level = matches!(
                             reasoning_param_format,
                             CustomReasoningParamFormat::AnthropicThinking
@@ -5269,12 +5487,12 @@ impl AgentInstance {
                             api_key,
                             api_model,
                             &system_prompt,
-                            messages,
+                            &messages,
                             api_tools,
                             endpoint.as_str(),
                             beta_flags,
                             thinking_level,
-                            *replay_reasoning_content,
+                            effective_replay_reasoning,
                             server_tools.web_search,
                             Some(&self.session_id),
                             "Custom(Anthropic)",
@@ -5407,7 +5625,7 @@ impl AgentInstance {
                         base_url.as_deref(),
                         actual_model,
                         &system_prompt,
-                        messages,
+                        &messages,
                         &[],
                         self.effort.as_deref(),
                         self.debug,
@@ -5916,6 +6134,46 @@ impl AgentInstance {
         ))
     }
 
+    fn session_language_instruction(&self, store: &SessionStore) -> &'static str {
+        detect_session_language(
+            store,
+            &self.session_id,
+            &self.working_dir,
+            self.response_locale.as_deref(),
+        )
+        .instruction()
+    }
+
+    fn session_language_for_turn(&self, store: &SessionStore) -> crate::agent::session_language::SessionLanguage {
+        detect_session_language(
+            store,
+            &self.session_id,
+            &self.working_dir,
+            self.response_locale.as_deref(),
+        )
+    }
+
+    fn build_core_system_parts<'a>(
+        &'a self,
+        store: &SessionStore,
+        prompt_parts: &'a SystemPromptParts,
+        workflow_reminder: Option<&'a str>,
+    ) -> Vec<&'a str> {
+        let language_instruction = self.session_language_instruction(store);
+        let mut parts = vec![language_instruction, prompt_parts.base_prompt.as_str()];
+        if !prompt_parts.rules_prompt.is_empty() {
+            parts.push(prompt_parts.rules_prompt.as_str());
+        }
+        if !prompt_parts.knowledge_prompt.is_empty() {
+            parts.push(prompt_parts.knowledge_prompt.as_str());
+        }
+        if let Some(reminder) = workflow_reminder {
+            parts.push(reminder);
+        }
+        parts.push(language_instruction);
+        parts
+    }
+
     fn build_selected_skill_reminder(
         &self,
         intent: &crate::session::models::UserIntentPayload,
@@ -6125,10 +6383,17 @@ impl AgentInstance {
 
     fn build_user_prompt_suffix(
         &self,
+        store: &SessionStore,
         mode: &str,
         user_intent: Option<&crate::session::models::UserIntentPayload>,
     ) -> Option<String> {
         let mut parts = Vec::new();
+        if let Some(reminder) = self
+            .session_language_for_turn(store)
+            .user_turn_reminder()
+        {
+            parts.push(reminder.to_string());
+        }
         if let Some(intent) = user_intent {
             let skill_reminder = self.build_selected_skill_reminder(intent);
             if !skill_reminder.is_empty() {
@@ -6200,13 +6465,19 @@ impl AgentInstance {
                     .transpose()
                     .map_err(|e| format!("Failed to serialize pending user intent: {}", e))?;
                 let effective_mode = Self::pending_input_mode(&input);
-                let user_prompt_suffix =
-                    self.build_user_prompt_suffix(&effective_mode, input.user_intent.as_ref());
+                let user_prompt_suffix = self.build_user_prompt_suffix(
+                    store,
+                    &effective_mode,
+                    input.user_intent.as_ref(),
+                );
+                let language_prompt_prefix = self.language_prompt_prefix(store);
                 let first_user_message_id = store.first_user_message_id(&self.session_id)?;
+                let first_message_prefix =
+                    Self::merge_prompt_blocks(language_prompt_prefix, env_prompt_prefix);
                 let current_prompt_prefix = if first_user_message_id.is_none() {
-                    env_prompt_prefix
+                    first_message_prefix.as_deref()
                 } else {
-                    None
+                    language_prompt_prefix
                 };
                 let message_id = store.add_message_with_images_asset_refs_and_signature(
                     &self.session_id,
@@ -6222,7 +6493,7 @@ impl AgentInstance {
                     store.update_message_prompt_prefix(
                         &self.session_id,
                         first_user_message_id,
-                        env_prompt_prefix,
+                        first_message_prefix.as_deref(),
                     )?;
                 }
                 let current_user_message = self.persisted_message_by_id(store, &message_id)?;
@@ -6358,6 +6629,8 @@ impl AgentInstance {
             outcome: ToolRunOutcome::Interrupted,
             nested_tool_calls: None,
             images: None,
+            workflow_gate_handled: false,
+            execution_meta: None,
         }
     }
 
@@ -6495,6 +6768,7 @@ impl AgentInstance {
             );
             let clear_started_at = Instant::now();
             self.clear_pending_knowledge_proposal(app_handle).await;
+            self.clear_pending_memory_proposal(app_handle).await;
             log_stage_elapsed(
                 &self.id,
                 &self.session_id,
@@ -6531,16 +6805,7 @@ impl AgentInstance {
 
         if initial_mode == "compact" {
             let prompt_parts = self.build_system_prompt_parts().await;
-            let system_parts: Vec<&str> = {
-                let mut parts = vec![prompt_parts.base_prompt.as_str()];
-                if !prompt_parts.rules_prompt.is_empty() {
-                    parts.push(prompt_parts.rules_prompt.as_str());
-                }
-                if !prompt_parts.knowledge_prompt.is_empty() {
-                    parts.push(prompt_parts.knowledge_prompt.as_str());
-                }
-                parts
-            };
+            let system_parts = self.build_core_system_parts(store, &prompt_parts, None);
             let ctx_limit = if let LlmBackend::Custom { context_length, .. } = &self.backend {
                 *context_length
             } else {
@@ -6553,6 +6818,7 @@ impl AgentInstance {
                 .build_request_tool_names_for_mode_and_skills(
                     dynamic_tool_loading_mode,
                     &active_skill_tool_names,
+                    Some(initial_mode),
                 )
                 .await;
             let api_tools = self.build_api_tools(&request_tools).await;
@@ -6602,7 +6868,7 @@ impl AgentInstance {
         }
 
         let user_text_started_at = Instant::now();
-        let actual_user_text: String;
+        let mut actual_user_text: String;
         if crate::unity_bridge::is_unity_project(&self.working_dir) {
             let (_connected, status, active_scene) =
                 crate::unity_bridge::query_unity_status(&self.working_dir).await;
@@ -6666,13 +6932,35 @@ impl AgentInstance {
             prompt_parts.knowledge_prompt.len()
         );
         let persist_user_message_started_at = Instant::now();
+        let language_prompt_prefix = self.language_prompt_prefix(store);
         let env_prompt_prefix = Self::wrap_system_reminder(&prompt_parts.env_prompt);
-        let user_prompt_suffix = self.build_user_prompt_suffix(initial_mode, user_intent.as_ref());
+        let memory_prompt_prefix = self
+            .build_relevant_memory_prompt_prefix(app_handle, &actual_user_text)
+            .await;
+        let combined_core_prefix = Self::merge_prompt_blocks(
+            env_prompt_prefix.as_deref(),
+            memory_prompt_prefix.as_deref(),
+        )
+        .map(|value| Self::wrap_system_reminder(&value))
+        .flatten();
+        let combined_prompt_prefix = Self::merge_prompt_blocks(
+            language_prompt_prefix,
+            combined_core_prefix.as_deref(),
+        );
+        let followup_memory_prefix = memory_prompt_prefix
+            .as_deref()
+            .and_then(|value| Self::wrap_system_reminder(value));
+        let followup_prompt_prefix = Self::merge_prompt_blocks(
+            language_prompt_prefix,
+            followup_memory_prefix.as_deref(),
+        );
+        let user_prompt_suffix =
+            self.build_user_prompt_suffix(store, initial_mode, user_intent.as_ref());
         let first_user_message_id = store.first_user_message_id(&self.session_id)?;
         let current_prompt_prefix = if first_user_message_id.is_none() {
-            env_prompt_prefix.as_deref()
+            combined_prompt_prefix.as_deref()
         } else {
-            None
+            followup_prompt_prefix.as_deref()
         };
         let current_message_id = store.add_message_with_images_asset_refs_and_signature(
             &self.session_id,
@@ -6688,7 +6976,7 @@ impl AgentInstance {
             store.update_message_prompt_prefix(
                 &self.session_id,
                 first_user_message_id,
-                env_prompt_prefix.as_deref(),
+                combined_prompt_prefix.as_deref(),
             )?;
         }
         let current_user_message = store
@@ -6730,14 +7018,12 @@ impl AgentInstance {
                 user_prompt_suffix.as_deref(),
             );
             let system_prompt = {
-                let mut parts = vec![prompt_parts.base_prompt.as_str()];
-                if !prompt_parts.rules_prompt.is_empty() {
-                    parts.push(prompt_parts.rules_prompt.as_str());
-                }
-                if !prompt_parts.knowledge_prompt.is_empty() {
-                    parts.push(prompt_parts.knowledge_prompt.as_str());
-                }
-                parts.join("\n\n")
+                self.build_core_system_parts(
+                    store,
+                    &prompt_parts,
+                    None,
+                )
+                .join("\n\n")
             };
             let active_skill_tool_names = self.active_skill_tool_names(&selected_skill_tool_names);
             return self
@@ -6761,6 +7047,7 @@ impl AgentInstance {
             .build_request_tool_names_for_mode_and_skills(
                 dynamic_tool_loading_mode,
                 &active_skill_tool_names,
+                Some(initial_mode),
             )
             .await;
         let api_tools = self.build_api_tools(&request_tools).await;
@@ -6829,6 +7116,7 @@ impl AgentInstance {
 
             if self.is_cancel_requested() {
                 self.clear_pending_knowledge_proposal(app_handle).await;
+            self.clear_pending_memory_proposal(app_handle).await;
                 self.emit_cancelled(app_handle, store, &run_id);
                 return Ok(String::new());
             }
@@ -6838,16 +7126,12 @@ impl AgentInstance {
             let session_id = self.session_id.clone();
             let handle = app_handle.clone();
             let parent_tc = self.parent_tool_call.clone();
-            let system_parts: Vec<&str> = {
-                let mut parts = vec![prompt_parts.base_prompt.as_str()];
-                if !prompt_parts.rules_prompt.is_empty() {
-                    parts.push(prompt_parts.rules_prompt.as_str());
-                }
-                if !prompt_parts.knowledge_prompt.is_empty() {
-                    parts.push(prompt_parts.knowledge_prompt.as_str());
-                }
-                parts
-            };
+            let workflow_reminder = self.build_workflow_status_reminder(&mode);
+            let system_parts = self.build_core_system_parts(
+                store,
+                &prompt_parts,
+                workflow_reminder.as_deref(),
+            );
             let ctx_limit = if let LlmBackend::Custom { context_length, .. } = &self.backend {
                 *context_length
             } else {
@@ -6859,6 +7143,7 @@ impl AgentInstance {
                 .build_request_tool_names_for_mode_and_skills(
                     dynamic_tool_loading_mode,
                     &active_skill_tool_names,
+                    Some(&mode),
                 )
                 .await;
             let api_tools = self.build_api_tools(&request_tools).await;
@@ -7131,6 +7416,7 @@ impl AgentInstance {
                             llm_call_started_at.elapsed().as_millis()
                         );
                         self.clear_pending_knowledge_proposal(app_handle).await;
+            self.clear_pending_memory_proposal(app_handle).await;
                         self.emit_cancelled(app_handle, store, &run_id);
                         return Ok(String::new());
                     }
@@ -7444,6 +7730,7 @@ impl AgentInstance {
                         output: output.clone(),
                         outcome: crate::commands::ToolCallOutcome::Done,
                         images: None,
+                        execution_meta: tc.execution_meta.clone(),
                     });
                     if let Some(ref parent) = self.parent_tool_call {
                         emit_parent_stream(
@@ -7464,6 +7751,7 @@ impl AgentInstance {
                                 tc.name.clone(),
                                 output.clone(),
                                 crate::commands::ToolCallOutcome::Done,
+                                None,
                                 None,
                             ),
                         );
@@ -7677,6 +7965,7 @@ impl AgentInstance {
                 }
                 if self.is_cancel_requested() {
                     self.clear_pending_knowledge_proposal(app_handle).await;
+            self.clear_pending_memory_proposal(app_handle).await;
                     self.emit_cancelled(app_handle, store, &run_id);
                     return Ok(String::new());
                 }
@@ -7698,12 +7987,21 @@ impl AgentInstance {
                     }
                 }
 
-                for ((tc, _), result) in prepared.iter().zip(results.iter()) {
+                for ((tc, args), result) in prepared.iter().zip(results.iter()) {
+                    let tool_output = if !result.is_error && !result.workflow_gate_handled {
+                        if let Some(hint) = self.workflow_gate_on_success(&tc.name, args, &mode, Some(&result.output)) {
+                            format!("{}\n\n{}", result.output, hint)
+                        } else {
+                            result.output.clone()
+                        }
+                    } else {
+                        result.output.clone()
+                    };
                     let stored_output = match store.rewrite_tool_result_for_storage(
                         &self.session_id,
                         &tc.id,
                         &tc.name,
-                        &result.output,
+                        &tool_output,
                     ) {
                         Ok(output) => output,
                         Err(e) => {
@@ -7731,7 +8029,36 @@ impl AgentInstance {
                         &stored_output,
                         result.images.as_deref(),
                     ) {
-                        Ok(Some(_)) => {}
+                        Ok(Some(_)) => {
+                            let memory_store: tauri::State<
+                                '_,
+                                std::sync::Arc<crate::agentmemory::AgentMemoryState>,
+                            > = app_handle.state();
+                            let memory_store = memory_store.inner().clone();
+                            let session_id = self.session_id.clone();
+                            let working_dir = self.working_dir.clone();
+                            let tool_name = tc.name.clone();
+                            let tool_input = args.clone();
+                            let tool_output = stored_output.clone();
+                            let is_error = result.is_error;
+                            if let Err(error) = tokio::task::spawn_blocking(move || {
+                                memory_store.observe_tool_use(
+                                    &session_id,
+                                    &working_dir,
+                                    &tool_name,
+                                    &tool_input,
+                                    &tool_output,
+                                    is_error,
+                                );
+                            })
+                            .await
+                            {
+                                eprintln!(
+                                    "[Agent {}] agentmemory observe_tool_use join failed for session {}: {}",
+                                    self.id, self.session_id, error
+                                );
+                            }
+                        }
                         Ok(None) => {
                             eprintln!(
                                 "[Agent {}] discarding stale tool result before save: session={} run={} tool_call_id={}",
@@ -7754,6 +8081,7 @@ impl AgentInstance {
                         output: stored_output.clone(),
                         outcome: result.outcome.as_stream_outcome(),
                         images: result.images.clone(),
+                        execution_meta: result.execution_meta.clone(),
                     });
                     if let Some(ref parent) = self.parent_tool_call {
                         let truncated_output = if stored_output.chars().count() > 500 {
@@ -7770,6 +8098,7 @@ impl AgentInstance {
                                 truncated_output,
                                 result.outcome.as_stream_outcome(),
                                 result.images.clone(),
+                                result.execution_meta.clone(),
                             ),
                         );
                     }
@@ -7879,6 +8208,7 @@ impl AgentInstance {
 
                 if self.is_cancel_requested() {
                     self.clear_pending_knowledge_proposal(app_handle).await;
+            self.clear_pending_memory_proposal(app_handle).await;
                     self.emit_cancelled(app_handle, store, &run_id);
                     return Ok(String::new());
                 }
@@ -7900,6 +8230,18 @@ impl AgentInstance {
                 if has_executable_tool_calls {
                     continue;
                 }
+
+                if self.try_continue_incomplete_workflow(
+                    app_handle,
+                    store,
+                    &run_id,
+                    &mode,
+                )? {
+                    self.partial_assistant.reset();
+                    store.update_run_status(&run_id, "running", None)?;
+                    continue 'agent_loop;
+                }
+
                 // Server-tool-only round: model already provided its answer alongside the
                 // server tool results. toolCallRoundDone already emitted, message already stored.
                 final_text = response.text;
@@ -7978,6 +8320,75 @@ impl AgentInstance {
                 )?;
                 store.update_run_status(&run_id, "running", None)?;
                 continue 'agent_loop;
+            }
+
+            if self.workflow_needs_incomplete_continuation(&mode) {
+                let thinking_opt = if response.thinking_text.is_empty() {
+                    None
+                } else {
+                    Some(response.thinking_text.as_str())
+                };
+                let thinking_dur = if response.thinking_duration_secs > 0 {
+                    Some(response.thinking_duration_secs)
+                } else {
+                    None
+                };
+                let thinking_sig = if response.thinking_signature.is_empty() {
+                    None
+                } else {
+                    Some(response.thinking_signature.as_str())
+                };
+                let assistant_msg_id = store.add_message_with_thinking_and_render_parts(
+                    &self.session_id,
+                    MessageRole::Assistant,
+                    &response.text,
+                    thinking_opt,
+                    thinking_dur,
+                    thinking_sig,
+                    response.response_id.as_deref(),
+                    response.continuation_request.as_ref(),
+                    response_content_order,
+                    response_thinking_order,
+                    &response_render_parts,
+                )?;
+                self.partial_assistant.mark_persisted(
+                    assistant_msg_id.clone(),
+                    response.text.clone(),
+                    thinking_opt.map(str::to_string),
+                    thinking_dur,
+                );
+                emit_stream(app_handle, &run_id, StreamEvent::ToolCallRoundDone {
+                    session_id: self.session_id.clone(),
+                    message_id: assistant_msg_id.clone(),
+                    full_text: response.text.clone(),
+                    tool_calls: Vec::new(),
+                    content_order: response_content_order,
+                    thinking_order: response_thinking_order,
+                    render_parts: Some(response_render_parts.clone()),
+                });
+                self.partial_assistant.reset();
+
+                if self.try_continue_incomplete_workflow(
+                    app_handle,
+                    store,
+                    &run_id,
+                    &mode,
+                )? {
+                    store.update_run_status(&run_id, "running", None)?;
+                    continue 'agent_loop;
+                }
+
+                final_thinking_text = response.thinking_text;
+                final_thinking_duration = response.thinking_duration_secs;
+                final_thinking_signature = response.thinking_signature;
+                final_text = response.text;
+                final_response_id = response.response_id;
+                final_continuation_request = response.continuation_request;
+                final_content_order = response_content_order;
+                final_thinking_order = response_thinking_order;
+                done_already_emitted = true;
+                terminal_done_message_id = Some(assistant_msg_id);
+                break;
             }
 
             final_thinking_text = response.thinking_text;
@@ -8138,6 +8549,48 @@ impl AgentInstance {
             );
         }
 
+        if let Err(error) = self
+            .stage_memory_proposal_from_session(app_handle, store, &run_id)
+            .await
+        {
+            eprintln!(
+                "[Agent {}] failed to stage memory proposal for session {}: {}",
+                self.id, self.session_id, error
+            );
+        }
+
+        {
+            let memory_store: tauri::State<'_, std::sync::Arc<crate::agentmemory::AgentMemoryState>> =
+                app_handle.state();
+            let memory_store = memory_store.inner().clone();
+            let session_id = self.session_id.clone();
+            match tokio::task::spawn_blocking(move || memory_store.session_end(&session_id)).await {
+                Ok(Err(error)) => {
+                    eprintln!(
+                        "[Agent {}] agentmemory session_end failed for {}: {}",
+                        self.id, self.session_id, error
+                    );
+                }
+                Err(error) => {
+                    eprintln!(
+                        "[Agent {}] agentmemory session_end join failed for {}: {}",
+                        self.id, self.session_id, error
+                    );
+                }
+                Ok(Ok(())) => {}
+            }
+        }
+
+        if let Err(error) = self
+            .flush_pending_memory_proposal(app_handle, store, &run_id)
+            .await
+        {
+            eprintln!(
+                "[Agent {}] failed to flush memory proposal for session {}: {}",
+                self.id, self.session_id, error
+            );
+        }
+
         eprintln!(
             "[Agent {}] loop finished after {} iterations",
             self.id, iteration
@@ -8163,6 +8616,7 @@ impl AgentInstance {
 
             if let Err(ref err) = run_result {
                 self.clear_pending_knowledge_proposal(app_handle).await;
+            self.clear_pending_memory_proposal(app_handle).await;
                 let interrupted = Self::persist_interrupted_assistant_snapshot(
                     store,
                     &self.session_id,
@@ -8224,6 +8678,7 @@ impl AgentInstance {
                 | "codegraph_files"
                 | "codegraph_status"
                 | "codegraph_sync"
+                | "codegraph_trace"
         )
     }
 
@@ -8363,12 +8818,14 @@ impl AgentInstance {
         tool_name: &str,
         arguments: &str,
         knowledge_preview: Option<KnowledgeToolConfirmPreview>,
+        workflow_note: Option<String>,
     ) -> ToolConfirmDisplay {
         match knowledge_preview {
             Some(preview) => ToolConfirmDisplay::Knowledge(preview),
             None => ToolConfirmDisplay::Basic(BasicToolConfirmDisplay {
                 tool_name: tool_name.to_string(),
                 arguments: arguments.to_string(),
+                workflow_note,
             }),
         }
     }
@@ -8380,6 +8837,7 @@ impl AgentInstance {
         arguments: &str,
         knowledge_preview: Option<KnowledgeToolConfirmPreview>,
         knowledge_governance_requires_confirm: bool,
+        workflow_ambiguous_requires_confirm: bool,
     ) -> ToolConfirmAssessment {
         let mut reasons = Vec::new();
         if let Some(reason) = Self::permission_confirm_reason(global_mode, tool_mode, tool_name) {
@@ -8388,10 +8846,21 @@ impl AgentInstance {
         if knowledge_governance_requires_confirm {
             reasons.push(ToolConfirmReason::KnowledgeGovernance);
         }
+        if workflow_ambiguous_requires_confirm {
+            reasons.push(ToolConfirmReason::WorkflowAmbiguous);
+        }
+
+        let workflow_note = workflow_ambiguous_requires_confirm
+            .then(|| crate::agent::workflow::WORKFLOW_AMBIGUOUS_TOOL_CONFIRM_NOTE.to_string());
 
         ToolConfirmAssessment {
             reasons,
-            display: Self::build_tool_confirm_display(tool_name, arguments, knowledge_preview),
+            display: Self::build_tool_confirm_display(
+                tool_name,
+                arguments,
+                knowledge_preview,
+                workflow_note,
+            ),
         }
     }
 
@@ -8422,6 +8891,7 @@ impl AgentInstance {
         arguments: &str,
         args: &serde_json::Value,
         run_id: &str,
+        mode: &str,
     ) -> ToolConfirmDecision {
         let mode_state: tauri::State<crate::ToolPermissionMode> = app_handle.state();
         let global_mode = mode_state.0.read().await.clone();
@@ -8472,8 +8942,19 @@ impl AgentInstance {
             );
         drop(perms);
 
+        let workflow_ambiguous_requires_confirm = WorkflowGate::applies(&self.def.id, mode)
+            && self
+                .with_dev_workflow_gate(mode, |gate| {
+                    Some(crate::agent::workflow::workflow_ambiguous_tool_requires_user_confirm(
+                        gate, tool_name, args,
+                    ))
+                })
+                .flatten()
+                .unwrap_or(false);
+
         if normalized_global_mode == PermissionModeSetting::Auto
             && !knowledge_governance_requires_confirm
+            && !workflow_ambiguous_requires_confirm
         {
             eprintln!(
                 "[Agent {}] tool confirm skipped for '{}' (global_mode=auto)",
@@ -8489,6 +8970,7 @@ impl AgentInstance {
             arguments,
             knowledge_preview,
             knowledge_governance_requires_confirm,
+            workflow_ambiguous_requires_confirm,
         );
 
         if assessment.reasons.is_empty() {
@@ -8687,7 +9169,11 @@ impl AgentInstance {
         }
     }
 
-    async fn await_tool_result<F>(&self, future: F) -> ExecutedToolResult
+    async fn await_tool_result<F>(
+        &self,
+        future: F,
+        execution_meta_sink: Option<std::sync::Arc<std::sync::Mutex<Option<serde_json::Value>>>>,
+    ) -> ExecutedToolResult
     where
         F: std::future::Future<Output = ToolResult> + Send,
     {
@@ -8697,7 +9183,11 @@ impl AgentInstance {
 
         let mut cancel_rx = self.cancel_waiter();
         tokio::select! {
-            result = future => ExecutedToolResult::from_tool_result(result),
+            result = future => {
+                let execution_meta = execution_meta_sink
+                    .and_then(|sink| sink.lock().ok().and_then(|mut slot| slot.take()));
+                ExecutedToolResult::from_tool_result_with_meta(result, execution_meta)
+            }
             _ = cancel_rx.changed() => Self::interrupted_tool_result(),
         }
     }
@@ -8735,9 +9225,15 @@ impl AgentInstance {
 
         if tc.name == "tool_load" {
             let dynamic_mode = self.dynamic_tool_loading_mode(app_handle);
-            return ExecutedToolResult::from_tool_result(
+            let mut result = ExecutedToolResult::from_tool_result(
                 self.execute_tool_load_with_mode(args, dynamic_mode).await,
             );
+            if !result.is_error {
+                if let Some(hint) = self.workflow_gate_on_success("tool_load", args, mode, None) {
+                    result.append_output(&hint);
+                }
+            }
+            return result;
         }
 
         if tc.name == "tool_call" {
@@ -8768,6 +9264,9 @@ impl AgentInstance {
             }
 
             normalize_tool_args(&mut target_args);
+            if let Some(blocked) = self.workflow_gate_check(&canonical, &target_args, mode) {
+                return blocked;
+            }
             let target_arguments =
                 serde_json::to_string(&target_args).unwrap_or_else(|_| "{}".to_string());
             eprintln!(
@@ -8777,9 +9276,26 @@ impl AgentInstance {
                 target_arguments.len()
             );
             let mut target_call = tc.clone();
-            target_call.name = canonical;
+            target_call.name = canonical.clone();
             target_call.arguments = target_arguments;
-            return Box::pin(self.execute_single_tool(
+            if canonical == "bash" {
+                if let Some(command) = target_args.get("command").and_then(|v| v.as_str()) {
+                    let rtk_meta = crate::rtk::rewrite_with_meta(command);
+                    emit_stream(
+                        app_handle,
+                        run_id,
+                        StreamEvent::ToolCallProgress {
+                            session_id: self.session_id.clone(),
+                            tool_call_id: tc.id.clone(),
+                            title: "RTK".to_string(),
+                            info: crate::rtk::progress_info(&rtk_meta),
+                            progress: None,
+                            state: "rtk".to_string(),
+                        },
+                    );
+                }
+            }
+            let mut result = Box::pin(self.execute_single_tool(
                 app_handle,
                 store,
                 &target_call,
@@ -8788,6 +9304,13 @@ impl AgentInstance {
                 mode,
             ))
             .await;
+            if !result.is_error {
+                if let Some(hint) = self.workflow_gate_on_success(&canonical, &target_args, mode, Some(&result.output)) {
+                    result.append_output(&hint);
+                }
+                result.mark_workflow_gate_handled();
+            }
+            return result;
         }
 
         if !self.is_allowed_agent_tool(&tc.name).await {
@@ -8806,6 +9329,10 @@ impl AgentInstance {
                 ),
                 is_error: true,
             });
+        }
+
+        if let Some(blocked) = self.workflow_gate_check(&tc.name, args, mode) {
+            return blocked;
         }
 
         let file_workspace_boundary_enabled = app_handle
@@ -8836,7 +9363,7 @@ impl AgentInstance {
         }
 
         match self
-            .request_tool_confirm(app_handle, &tc.id, &tc.name, &tc.arguments, args, run_id)
+            .request_tool_confirm(app_handle, &tc.id, &tc.name, &tc.arguments, args, run_id, mode)
             .await
         {
             ToolConfirmDecision::Allow => {}
@@ -8863,12 +9390,22 @@ impl AgentInstance {
                 .await
         } else if tc.name == "task" {
             self.await_executed_tool_result(
-                self.execute_task(app_handle, store, args, &tc.id, run_id),
+                self.execute_task(app_handle, store, args, &tc.id, run_id, mode),
             )
             .await
         } else if tc.name == "ask_user_question" {
-            self.await_tool_result(self.execute_ask(app_handle, &tc.id, args, run_id))
-                .await
+            let mut result = self
+                .await_tool_result(self.execute_ask(app_handle, &tc.id, args, run_id), None)
+                .await;
+            if !result.is_error {
+                if let Some(hint) =
+                    self.workflow_gate_on_success("ask_user_question", args, mode, Some(&result.output))
+                {
+                    result.append_output(&hint);
+                }
+                result.mark_workflow_gate_handled();
+            }
+            result
         } else if tc.name == "graph_view" {
             self.execute_graph_view(app_handle, &tc.id, args).await
         } else if tc.name == "todowrite" {
@@ -8878,28 +9415,28 @@ impl AgentInstance {
         } else if tc.name == "knowledge_list" {
             ExecutedToolResult::from_tool_result(self.execute_knowledge_list(args))
         } else if tc.name == "knowledge_query" {
-            self.await_tool_result(self.execute_knowledge_query(app_handle, &tc.id, args, run_id))
+            self.await_tool_result(self.execute_knowledge_query(app_handle, &tc.id, args, run_id), None)
                 .await
         } else if tc.name == "knowledge_read" {
             self.execute_knowledge_read(app_handle, &tc.id, args, run_id)
                 .await
         } else if tc.name == "knowledge_create" {
-            self.await_tool_result(self.execute_knowledge_create(app_handle, args))
+            self.await_tool_result(self.execute_knowledge_create(app_handle, args), None)
                 .await
         } else if tc.name == "knowledge_edit" {
-            self.await_tool_result(self.execute_knowledge_edit(app_handle, args))
+            self.await_tool_result(self.execute_knowledge_edit(app_handle, args), None)
                 .await
         } else if tc.name == "knowledge_move" {
-            self.await_tool_result(self.execute_knowledge_move(app_handle, args))
+            self.await_tool_result(self.execute_knowledge_move(app_handle, args), None)
                 .await
         } else if tc.name == "knowledge_delete" {
-            self.await_tool_result(self.execute_knowledge_delete(app_handle, args))
+            self.await_tool_result(self.execute_knowledge_delete(app_handle, args), None)
                 .await
         } else if tc.name == "skill_create" {
-            self.await_tool_result(self.execute_skill_create(app_handle, args))
+            self.await_tool_result(self.execute_skill_create(app_handle, args), None)
                 .await
         } else if tc.name == "skill_reload" {
-            self.await_tool_result(self.execute_skill_reload(app_handle, args))
+            self.await_tool_result(self.execute_skill_reload(app_handle, args), None)
                 .await
         } else if tc.name == "skill_list" {
             ExecutedToolResult::from_tool_result(self.execute_skill_list(args))
@@ -8907,10 +9444,10 @@ impl AgentInstance {
             self.execute_unity_execute(app_handle, &tc.id, args, run_id)
                 .await
         } else if tc.name == "unity_recompile" {
-            self.await_tool_result(self.execute_unity_recompile(app_handle, &tc.id, args, run_id))
+            self.await_tool_result(self.execute_unity_recompile(app_handle, &tc.id, args, run_id), None)
                 .await
         } else if tc.name == "unity_run_states" {
-            self.await_tool_result(self.execute_unity_run_states(app_handle, &tc.id, args, run_id))
+            self.await_tool_result(self.execute_unity_run_states(app_handle, &tc.id, args, run_id), None)
                 .await
         } else if tc.name == "unity_capture_viewport" {
             self.await_executed_tool_result(self.execute_unity_capture_viewport(args))
@@ -8923,13 +9460,13 @@ impl AgentInstance {
         } else if tc.name == "unity_asset_search" {
             ExecutedToolResult::from_tool_result(self.execute_unity_asset_search(app_handle, args))
         } else if tc.name == "unity_yaml_list" {
-            self.await_tool_result(self.execute_unity_yaml_list(app_handle, args))
+            self.await_tool_result(self.execute_unity_yaml_list(app_handle, args), None)
                 .await
         } else if tc.name == "unity_yaml_search" {
-            self.await_tool_result(self.execute_unity_yaml_search(app_handle, args))
+            self.await_tool_result(self.execute_unity_yaml_search(app_handle, args), None)
                 .await
         } else if tc.name == "unity_yaml_read" {
-            self.await_tool_result(self.execute_unity_yaml_read(app_handle, args))
+            self.await_tool_result(self.execute_unity_yaml_read(app_handle, args), None)
                 .await
         } else {
             let bash_git_knowledge_assessment = if tc.name == "bash" {
@@ -8944,12 +9481,29 @@ impl AgentInstance {
             let tool_context = self
                 .build_tool_execution_context(app_handle, &tc.name)
                 .await;
+            let meta_sink = tool_context.execution_meta_sink.clone();
+            if tc.name == "bash" {
+                if let Some(command) = args.get("command").and_then(|v| v.as_str()) {
+                    let rtk_meta = crate::rtk::rewrite_with_meta(command);
+                    emit_stream(
+                        app_handle,
+                        run_id,
+                        StreamEvent::ToolCallProgress {
+                            session_id: self.session_id.clone(),
+                            tool_call_id: tc.id.clone(),
+                            title: "RTK".to_string(),
+                            info: crate::rtk::progress_info(&rtk_meta),
+                            progress: None,
+                            state: "rtk".to_string(),
+                        },
+                    );
+                }
+            }
             let mut result = self
-                .await_tool_result(self.tool_registry.execute_with_context(
-                    &tc.name,
-                    args,
-                    tool_context,
-                ))
+                .await_tool_result(
+                    self.tool_registry.execute_with_context(&tc.name, args, tool_context),
+                    meta_sink,
+                )
                 .await;
 
             if result.outcome == ToolRunOutcome::Done
@@ -9026,12 +9580,13 @@ impl AgentInstance {
             let configured_load_mode =
                 self.configured_tool_load_mode(&canonical, &direct_overrides);
             let direct_mode = dynamic_mode == crate::config::DynamicToolLoadingMode::Direct;
+            let native_direct = configured_load_mode == ToolLoadMode::Direct;
             let was_loaded = self
                 .loaded_tool_names
                 .lock()
                 .map(|loaded| loaded.contains(&canonical))
                 .unwrap_or(false);
-            let already_available = configured_load_mode == ToolLoadMode::Direct || was_loaded;
+            let already_available = native_direct || was_loaded;
             let loaded_by_request =
                 direct_mode && configured_load_mode != ToolLoadMode::Direct && !was_loaded;
             if loaded_by_request {
@@ -9041,7 +9596,8 @@ impl AgentInstance {
                     }
                 }
             }
-            let direct_available = direct_mode && (already_available || loaded_by_request);
+            let direct_available =
+                native_direct || (direct_mode && (already_available || loaded_by_request));
 
             let mut item = serde_json::Map::new();
             item.insert("name".to_string(), serde_json::json!(canonical.clone()));
@@ -9055,7 +9611,9 @@ impl AgentInstance {
             );
             item.insert(
                 "status".to_string(),
-                serde_json::json!(if direct_available {
+                serde_json::json!(if native_direct {
+                    "already_available"
+                } else if direct_available {
                     if already_available {
                         "already_available"
                     } else {
@@ -9094,12 +9652,22 @@ impl AgentInstance {
             );
             item.insert(
                 "callPath".to_string(),
-                serde_json::json!(if direct_available {
+                serde_json::json!(if native_direct {
+                    if direct_mode { "direct" } else { "native" }
+                } else if direct_available {
                     "direct"
                 } else {
                     "meta_tool"
                 }),
             );
+            if native_direct && !direct_mode {
+                item.insert(
+                    "executeNote".to_string(),
+                    serde_json::json!(format!(
+                        "{canonical} is already in your native tool list. Invoke it directly in the next tool call — tool_load does not run the tool or satisfy codegraph_gate."
+                    )),
+                );
+            }
 
             items.push(serde_json::Value::Object(item));
         }
@@ -9237,6 +9805,138 @@ impl AgentInstance {
             app_handle,
             run_id,
             StreamEvent::KnowledgeProposal {
+                session_id: self.session_id.clone(),
+                message: message.clone(),
+            },
+        );
+        Ok(Some(message))
+    }
+
+    fn merge_prompt_blocks(first: Option<&str>, second: Option<&str>) -> Option<String> {
+        let first = first.map(str::trim).filter(|value| !value.is_empty());
+        let second = second.map(str::trim).filter(|value| !value.is_empty());
+        match (first, second) {
+            (None, None) => None,
+            (Some(value), None) | (None, Some(value)) => Some(value.to_string()),
+            (Some(left), Some(right)) if left == right || left.contains(right) => {
+                Some(left.to_string())
+            }
+            (Some(left), Some(right)) if right.contains(left) => Some(right.to_string()),
+            (Some(left), Some(right)) => Some(format!("{}\n\n{}", left, right)),
+        }
+    }
+
+    async fn build_relevant_memory_prompt_prefix(
+        &self,
+        app_handle: &AppHandle,
+        user_text: &str,
+    ) -> Option<String> {
+        if !self.has_selected_working_dir() {
+            return None;
+        }
+        let query = user_text.trim();
+        if query.is_empty() {
+            return None;
+        }
+
+        let memory_store: tauri::State<'_, std::sync::Arc<crate::agentmemory::AgentMemoryState>> =
+            app_handle.state();
+        let memory_store = memory_store.inner().clone();
+        let session_id = self.session_id.clone();
+        let working_dir = self.working_dir.clone();
+        let query = query.to_string();
+
+        match tokio::task::spawn_blocking(move || {
+            memory_store.build_chat_memory_prefix(&session_id, &working_dir, &query)
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                eprintln!(
+                    "[Agent {}] memory prefix build join failed for session {}: {}",
+                    self.id, self.session_id, error
+                );
+                None
+            }
+        }
+    }
+
+    pub(super) async fn clear_pending_memory_proposal(&self, app_handle: &AppHandle) {
+        let drafts: tauri::State<crate::MemoryProposalDraftStore> = app_handle.state();
+        let mut draft_store = drafts.lock().await;
+        draft_store.remove(&self.session_id);
+    }
+
+    async fn stage_memory_proposal_from_session(
+        &self,
+        app_handle: &AppHandle,
+        store: &SessionStore,
+        run_id: &str,
+    ) -> Result<(), String> {
+        if !store.is_main_chat_session(&self.session_id)? {
+            return Ok(());
+        }
+
+        let messages = store.get_messages(&self.session_id)?;
+        let Some(candidates) = crate::memory::evaluate_memory_proposal_from_session(&messages) else {
+            return Ok(());
+        };
+
+        let mut items = Vec::new();
+        let mut confidence_sum = 0.0f32;
+        for (category, content, tags, confidence) in candidates {
+            items.push(crate::session::models::MemoryProposalItem {
+                category,
+                content,
+                tags,
+                scope: crate::memory::default_scope_for_category(category),
+            });
+            confidence_sum += confidence;
+        }
+        let confidence = (confidence_sum / items.len() as f32).clamp(0.0, 1.0);
+        let proposal = crate::commands::build_memory_proposal(items, confidence);
+
+        let drafts: tauri::State<crate::MemoryProposalDraftStore> = app_handle.state();
+        let mut draft_store = drafts.lock().await;
+        draft_store.insert(
+            self.session_id.clone(),
+            crate::PendingMemoryProposalDraft {
+                run_id: run_id.to_string(),
+                proposal,
+            },
+        );
+        Ok(())
+    }
+
+    pub(super) async fn flush_pending_memory_proposal(
+        &self,
+        app_handle: &AppHandle,
+        store: &SessionStore,
+        run_id: &str,
+    ) -> Result<Option<crate::session::models::ChatMessage>, String> {
+        let drafts: tauri::State<crate::MemoryProposalDraftStore> = app_handle.state();
+        let staged = {
+            let mut draft_store = drafts.lock().await;
+            match draft_store.get(&self.session_id) {
+                Some(entry) if entry.run_id == run_id => draft_store.remove(&self.session_id),
+                _ => None,
+            }
+        };
+
+        let Some(staged) = staged else {
+            return Ok(None);
+        };
+
+        let _message_id = store.add_memory_proposal_message(&self.session_id, &staged.proposal)?;
+        let message = store
+            .get_memory_proposal_message(&self.session_id, &staged.proposal.proposal_id)?
+            .ok_or_else(|| "Memory proposal message was not found after insert".to_string())?;
+
+        emit_stream(
+            app_handle,
+            run_id,
+            StreamEvent::MemoryProposal {
                 session_id: self.session_id.clone(),
                 message: message.clone(),
             },
@@ -12542,15 +13242,31 @@ impl AgentInstance {
             self.undo_manager.clone(),
             self.subagent_model_overrides.clone(),
             self.cancel_waiter(),
+            self.dev_workflow_gates.clone(),
         );
         child.parent_tool_call = Some(ParentToolCall::new(
             self.session_id.clone(),
             run_id.to_string(),
             tool_call_id.to_string(),
         ));
+        child.response_locale = self.response_locale.clone();
+
+        let language = detect_session_language(
+            store,
+            &self.session_id,
+            &self.working_dir,
+            self.response_locale.as_deref(),
+        );
+        let localized_prompt = wrap_subagent_prompt(prompt, language);
+        eprintln!(
+            "[Agent {}] subagent '{}' using response language={}",
+            self.id,
+            subagent_type,
+            language.tag()
+        );
 
         match child
-            .run(app_handle, store, prompt, None, None, "build", None)
+            .run(app_handle, store, &localized_prompt, None, None, "build", None)
             .await
         {
             Ok(result_text) => {
@@ -12729,7 +13445,11 @@ impl AgentInstance {
         args: &serde_json::Value,
         tool_call_id: &str,
         run_id: &str,
+        mode: &str,
     ) -> ExecutedToolResult {
+        let _ = self.with_dev_workflow_gate(mode, |gate| {
+            advance_to_implement_if_allowed(gate, args) || advance_to_review_if_allowed(gate, args)
+        });
         let description = args["description"].as_str().unwrap_or("unknown task");
         let prompt = match args["prompt"].as_str() {
             Some(p) if !p.is_empty() => p,
@@ -12767,16 +13487,32 @@ impl AgentInstance {
             .await
         {
             Ok(_) if self.is_cancel_requested() => Self::interrupted_tool_result(),
-            Ok(result) => ExecutedToolResult::from_tool_result(ToolResult {
-                output: result.output,
-                is_error: result.is_error,
-            })
-            .with_nested_tool_calls(result.tool_calls),
+            Ok(result) => {
+                let mut output = result.output;
+                if let Some(followup) = self
+                    .with_dev_workflow_gate(mode, |gate| {
+                        gate.on_subagent_done(subagent_type, result.is_error, Some(&output))
+                    })
+                    .flatten()
+                {
+                    output = format!("{output}\n\n{followup}");
+                }
+                ExecutedToolResult::from_tool_result(ToolResult {
+                    output,
+                    is_error: result.is_error,
+                })
+                .with_nested_tool_calls(result.tool_calls)
+            }
             Err(_) if self.is_cancel_requested() => Self::interrupted_tool_result(),
-            Err(error) => ExecutedToolResult::from_tool_result(ToolResult {
-                output: error,
-                is_error: true,
-            }),
+            Err(error) => {
+                let _ = self.with_dev_workflow_gate(mode, |gate| {
+                    gate.on_subagent_done(subagent_type, true, None)
+                });
+                ExecutedToolResult::from_tool_result(ToolResult {
+                    output: error,
+                    is_error: true,
+                })
+            }
         }
     }
 }
@@ -12882,6 +13618,7 @@ mod tests {
             "ok".to_string(),
             ToolCallOutcome::Done,
             None,
+            None,
         );
         assert_eq!(done.run_id, "parent-run");
         match done.event {
@@ -12893,6 +13630,7 @@ mod tests {
                 output,
                 outcome,
                 images,
+                execution_meta,
             } => {
                 assert_eq!(session_id, "parent-session");
                 assert_eq!(parent_tool_call_id, "task-1");
@@ -12901,6 +13639,7 @@ mod tests {
                 assert_eq!(output, "ok");
                 assert_eq!(outcome, ToolCallOutcome::Done);
                 assert!(images.is_none());
+                assert!(execution_meta.is_none());
             }
             other => panic!("unexpected event: {:?}", other),
         }
@@ -12936,6 +13675,7 @@ mod tests {
             outcome: None,
             recorded_output: None,
             nested_tool_calls: None,
+        execution_meta: None,
         };
         let nested_tool_call = ToolCallInfo {
             id: "read-1".to_string(),
@@ -12947,6 +13687,7 @@ mod tests {
             outcome: Some(crate::commands::ToolCallOutcome::Done),
             recorded_output: Some("ok".to_string()),
             nested_tool_calls: None,
+        execution_meta: None,
         };
         let result = ExecutedToolResult::from_tool_result(ToolResult {
             output: "subagent result".to_string(),
@@ -13569,6 +14310,7 @@ PrefabInstance:
             None,
             HashMap::new(),
             cancel_rx,
+            None,
         )
     }
 
@@ -13625,6 +14367,7 @@ PrefabInstance:
             None,
             HashMap::new(),
             cancel_rx,
+            None,
         )
     }
 
@@ -13710,6 +14453,7 @@ PrefabInstance:
             None,
             HashMap::new(),
             cancel_rx,
+            None,
         );
 
         let request_tool_names = instance.build_request_tool_names().await;
@@ -13807,6 +14551,7 @@ PrefabInstance:
             None,
             HashMap::new(),
             cancel_rx,
+            None,
         );
 
         let request_tool_names = instance.build_request_tool_names().await;
@@ -13906,6 +14651,7 @@ PrefabInstance:
             None,
             HashMap::new(),
             cancel_rx,
+            None,
         );
 
         let request_tool_names = instance.build_request_tool_names().await;
@@ -13937,6 +14683,83 @@ PrefabInstance:
         assert_eq!(load_json["tools"][0]["name"], "web_fetch");
         assert_eq!(load_json["tools"][0]["status"], "described");
         assert_eq!(load_json["tools"][0]["callWith"], "tool_call");
+    }
+
+    #[tokio::test]
+    async fn meta_tool_load_for_native_direct_codegraph_reports_native_call_path() {
+        let temp = tempdir().expect("temp dir");
+        let working_dir = temp.path().to_string_lossy().to_string();
+        let (_, cancel_rx) = tokio::sync::watch::channel(false);
+        let instance = AgentInstance::new(
+            Arc::new(AgentDef {
+                id: "dev".to_string(),
+                name: "Dev".to_string(),
+                description: String::new(),
+                system_prompt: String::new(),
+                env_template: String::new(),
+                tools: vec![
+                    "read".to_string(),
+                    "codegraph_context".to_string(),
+                    "codegraph_impact".to_string(),
+                ],
+                sub_agents: Vec::new(),
+                default: false,
+                default_effort: None,
+                model_recommendation: None,
+                source: "test".to_string(),
+            }),
+            "session-test",
+            crate::agent::instance::LlmBackend::Custom {
+                api_key: String::new(),
+                api_model: "test-model".to_string(),
+                endpoint: "https://example.com/v1".to_string(),
+                api_format: crate::commands::ApiFormat::OpenaiResponses,
+                context_length: 256_000,
+                beta_flags: Vec::new(),
+                supported_reasoning_efforts: Vec::new(),
+                reasoning_param_format:
+                    crate::commands::CustomReasoningParamFormat::OpenaiResponsesReasoningEffort,
+                replay_reasoning_content: true,
+                server_tools: crate::commands::CustomEndpointServerTools::default(),
+                supports_vision: true,
+            },
+            false,
+            Arc::new(AgentDefRegistry::load(None, None)),
+            Arc::new(ToolRegistry::with_builtins()),
+            working_dir,
+            RawContextStore::default(),
+            None,
+            "test-model".to_string(),
+            None,
+            Arc::new(None),
+            Arc::new(None),
+            KnowledgeAccessMode::Full,
+            None,
+            HashMap::new(),
+            cancel_rx,
+            None,
+        );
+
+        let request_tool_names = instance.build_request_tool_names().await;
+        assert!(request_tool_names.contains(&"codegraph_context".to_string()));
+
+        let load_result = instance
+            .execute_tool_load(&serde_json::json!({
+                "tools": ["codegraph_context", "codegraph_impact"]
+            }))
+            .await;
+        assert!(!load_result.is_error, "{}", load_result.output);
+        let load_json: serde_json::Value =
+            serde_json::from_str(&load_result.output).expect("tool_load json");
+        assert_eq!(load_json["mode"], "meta_tool");
+        assert_eq!(load_json["tools"][0]["name"], "codegraph_context");
+        assert_eq!(load_json["tools"][0]["status"], "already_available");
+        assert_eq!(load_json["tools"][0]["callWith"], "codegraph_context");
+        assert_eq!(load_json["tools"][0]["callPath"], "native");
+        assert!(load_json["tools"][0]["executeNote"]
+            .as_str()
+            .unwrap_or("")
+            .contains("tool_load does not run"));
     }
 
     #[tokio::test]
@@ -13987,6 +14810,7 @@ PrefabInstance:
             None,
             HashMap::new(),
             cancel_rx,
+            None,
         );
 
         let request_tool_names = instance
@@ -14064,6 +14888,7 @@ PrefabInstance:
             None,
             HashMap::new(),
             cancel_rx,
+            None,
         );
 
         let parts = instance.build_system_prompt_parts().await;
@@ -14131,6 +14956,7 @@ PrefabInstance:
             None,
             HashMap::new(),
             cancel_rx,
+            None,
         );
 
         let manifest_names = instance.lazy_tool_manifest_names().await;
@@ -14196,6 +15022,7 @@ PrefabInstance:
             None,
             HashMap::new(),
             cancel_rx,
+            None,
         );
         let active_skill_tool_names = HashSet::from(["skill_special".to_string()]);
 
@@ -14203,6 +15030,7 @@ PrefabInstance:
             .build_request_tool_names_for_mode_and_skills(
                 crate::config::DynamicToolLoadingMode::MetaTool,
                 &active_skill_tool_names,
+                None,
             )
             .await;
         assert!(request_tool_names.contains(&"tool_load".to_string()));
@@ -14213,6 +15041,7 @@ PrefabInstance:
             .build_request_tool_names_for_mode_and_skills(
                 crate::config::DynamicToolLoadingMode::Direct,
                 &active_skill_tool_names,
+                None,
             )
             .await;
         assert!(direct_request_tool_names.contains(&"tool_load".to_string()));
@@ -14395,6 +15224,7 @@ PrefabInstance:
             None,
             HashMap::new(),
             cancel_rx,
+            None,
         );
 
         let items = instance.available_tool_prompt_items().await;
@@ -14562,6 +15392,7 @@ Create a reusable Skill.
             None,
             HashMap::new(),
             cancel_rx,
+            None,
         );
         let intent = UserIntentPayload {
             kind: "user_intent_v1".to_string(),
@@ -14583,6 +15414,7 @@ Create a reusable Skill.
             .build_request_tool_names_for_mode_and_skills(
                 crate::config::DynamicToolLoadingMode::MetaTool,
                 &active_skill_tool_names,
+                None,
             )
             .await;
 
@@ -14966,6 +15798,7 @@ Create a reusable Skill.
             "{\"path\":\"design/core.md\"}",
             None,
             true,
+            false,
         );
         assert_eq!(
             assessment.reasons,
@@ -14981,6 +15814,7 @@ Create a reusable Skill.
             "knowledge_edit",
             "{\"path\":\"memory/project.md\"}",
             None,
+            false,
             false,
         );
         assert!(assessment.reasons.is_empty());

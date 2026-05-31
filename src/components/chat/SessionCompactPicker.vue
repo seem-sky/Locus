@@ -29,7 +29,6 @@ const props = defineProps<{
   streamingSessionIds?: Set<string>;
   showExpandPanelButton?: boolean;
   workingDir?: string;
-  showViews?: boolean;
 }>();
 
 interface ViewTreeNode {
@@ -69,7 +68,7 @@ let viewReloadUnsubscribe: RuntimeUnsubscribe | null = null;
 let viewTreeChangedUnsubscribe: RuntimeUnsubscribe | null = null;
 
 const hasWorkspace = computed(() => !!props.workingDir?.trim());
-const showSessionViews = computed(() => props.showViews !== false);
+const showSessionViews = computed(() => false);
 
 const sortedSessions = computed(() =>
   [...props.sessions].sort((a, b) => b.updatedAt - a.updatedAt),

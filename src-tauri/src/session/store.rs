@@ -8,9 +8,9 @@ use rusqlite::{params, Connection, OptionalExtension};
 use uuid::Uuid;
 
 use super::models::{
-    AssistantRenderPart, ChatMessage, KnowledgeProposal, KnowledgeProposalStatus, MessageRole,
-    SessionDetail, SessionEventRecord, SessionRunSummary, SessionSummary, TodoItem, TodoSnapshot,
-    ToolCallInfo,
+    AssistantRenderPart, ChatMessage, KnowledgeProposal, KnowledgeProposalStatus, MemoryProposal,
+    MessageRole, SessionDetail, SessionEventRecord, SessionRunSummary, SessionSummary, TodoItem,
+    TodoSnapshot, ToolCallInfo,
 };
 use crate::commands::TokenUsage;
 use crate::compact;
@@ -63,6 +63,8 @@ const DELETED_RESULT_TAG_OPEN: &str = "<persisted-output-deleted>";
 const DELETED_RESULT_TAG_CLOSE: &str = "</persisted-output-deleted>";
 const LARGE_RESULT_PATH_PREFIX: &str = "Full output saved to: ";
 pub const CHILD_SESSION_FORK_ERROR: &str = "Child sessions cannot be forked";
+pub const CHILD_SESSION_UNARCHIVE_ERROR: &str =
+    "Child sessions cannot be unarchived individually";
 const RUN_STATUS_QUEUED: &str = "queued";
 const RUN_STATUS_STARTING: &str = "starting";
 const RUN_STATUS_RUNNING: &str = "running";
@@ -291,6 +293,8 @@ struct MessageMetadata {
     #[serde(skip_serializing_if = "Option::is_none")]
     knowledge_proposal: Option<KnowledgeProposal>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    memory_proposal: Option<MemoryProposal>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     response_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     response_request: Option<serde_json::Value>,
@@ -304,6 +308,7 @@ struct MessageMetadata {
 
 fn message_metadata_json(
     knowledge_proposal: Option<&KnowledgeProposal>,
+    memory_proposal: Option<&MemoryProposal>,
     response_id: Option<&str>,
     response_request: Option<&serde_json::Value>,
     content_order: Option<u32>,
@@ -312,6 +317,7 @@ fn message_metadata_json(
 ) -> Result<Option<String>, String> {
     let metadata = MessageMetadata {
         knowledge_proposal: knowledge_proposal.cloned(),
+        memory_proposal: memory_proposal.cloned(),
         response_id: response_id.map(|value| value.to_string()),
         response_request: response_request.cloned(),
         content_order,
@@ -319,6 +325,7 @@ fn message_metadata_json(
         render_parts: render_parts.map(|value| value.to_vec()),
     };
     if metadata.knowledge_proposal.is_none()
+        && metadata.memory_proposal.is_none()
         && metadata.response_id.is_none()
         && metadata.response_request.is_none()
         && metadata.content_order.is_none()
@@ -373,6 +380,7 @@ fn redact_context_handoff_for_display(message: &mut ChatMessage) {
     message.thinking_duration = None;
     message.thinking_signature = None;
     message.knowledge_proposal = None;
+    message.memory_proposal = None;
     message.render_parts = None;
 }
 
@@ -1918,6 +1926,18 @@ impl SessionStore {
         })
     }
 
+    pub fn is_main_chat_session(&self, session_id: &str) -> Result<bool, String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let (session_type, parent_session_id): (String, Option<String>) = conn
+            .query_row(
+                "SELECT session_type, parent_session_id FROM sessions WHERE id = ?1",
+                params![session_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|e| format!("Session not found: {}", e))?;
+        Ok(session_type == "chat" && parent_session_id.is_none())
+    }
+
     pub fn set_latest_completed_run_id(
         &self,
         session_id: &str,
@@ -2028,11 +2048,33 @@ impl SessionStore {
     }
 
     pub fn unarchive_session(&self, id: &str) -> Result<(), String> {
-        let now = Self::now_ts();
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let parent_session_id: Option<String> = conn
+            .query_row(
+                "SELECT parent_session_id FROM sessions WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("Session not found: {}", e))?;
+
+        if parent_session_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .is_some()
+        {
+            return Err(CHILD_SESSION_UNARCHIVE_ERROR.to_string());
+        }
+
+        let now = Self::now_ts();
         conn.execute(
-            "UPDATE sessions SET archived_at = NULL, updated_at = ?1 WHERE id = ?2",
-            params![now, id],
+            "WITH RECURSIVE descendants(id) AS (
+                SELECT id FROM sessions WHERE id = ?1
+                UNION ALL
+                SELECT sessions.id FROM sessions JOIN descendants ON sessions.parent_session_id = descendants.id
+            )
+            UPDATE sessions SET archived_at = NULL, updated_at = ?2 WHERE id IN (SELECT id FROM descendants)",
+            params![id, now],
         )
         .map_err(|e| format!("Failed to unarchive session: {}", e))?;
         Ok(())
@@ -2353,6 +2395,7 @@ impl SessionStore {
             content_order,
             thinking_order,
             Some(render_parts),
+            None,
         )
     }
 
@@ -2464,6 +2507,7 @@ impl SessionStore {
             content_order,
             thinking_order,
             Some(render_parts),
+            None,
         )
     }
 
@@ -2659,6 +2703,9 @@ impl SessionStore {
                 AssistantRenderPart::KnowledgeProposal { message, .. } => {
                     Self::mark_missing_persisted_outputs_in_message(message);
                 }
+                AssistantRenderPart::MemoryProposal { message, .. } => {
+                    Self::mark_missing_persisted_outputs_in_message(message);
+                }
                 AssistantRenderPart::Thinking { .. } | AssistantRenderPart::Text { .. } => {}
             }
         }
@@ -2844,6 +2891,7 @@ impl SessionStore {
             content_order,
             thinking_order,
             None,
+            None,
         )
     }
 
@@ -2867,11 +2915,13 @@ impl SessionStore {
         content_order: Option<u32>,
         thinking_order: Option<u32>,
         render_parts: Option<&[AssistantRenderPart]>,
+        memory_proposal: Option<&MemoryProposal>,
     ) -> Result<String, String> {
         let id = Uuid::new_v4().to_string();
         let now = Self::now_ts();
         let metadata_json = message_metadata_json(
             knowledge_proposal,
+            memory_proposal,
             response_id,
             response_request,
             content_order,
@@ -2901,10 +2951,48 @@ impl SessionStore {
         session_id: &str,
         proposal: &KnowledgeProposal,
     ) -> Result<String, String> {
-        self.add_message_full(
+        self.add_message_full_with_thinking_and_render_parts(
             session_id,
             MessageRole::Assistant,
             "",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(proposal),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+
+    pub fn add_memory_proposal_message(
+        &self,
+        session_id: &str,
+        proposal: &MemoryProposal,
+    ) -> Result<String, String> {
+        self.add_message_full_with_thinking_and_render_parts(
+            session_id,
+            MessageRole::Assistant,
+            "",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
             None,
             None,
             None,
@@ -3506,18 +3594,19 @@ impl SessionStore {
                 .map(|json| serde_json::from_str(json))
                 .transpose()
                 .map_err(|e| format!("Failed to parse message metadata: {}", e))?;
-            let (knowledge_proposal, response_id, content_order, thinking_order, render_parts) =
+            let (knowledge_proposal, memory_proposal, response_id, content_order, thinking_order, render_parts) =
                 metadata
                     .map(|value| {
                         (
                             value.knowledge_proposal,
+                            value.memory_proposal,
                             value.response_id,
                             value.content_order,
                             value.thinking_order,
                             value.render_parts,
                         )
                     })
-                    .unwrap_or((None, None, None, None, None));
+                    .unwrap_or((None, None, None, None, None, None));
 
             messages.push(ChatMessage {
                 id,
@@ -3537,6 +3626,7 @@ impl SessionStore {
                 thinking_duration: thinking_duration_raw.map(|d| d as u32),
                 thinking_signature,
                 knowledge_proposal,
+                memory_proposal,
                 render_parts,
             });
         }
@@ -3561,6 +3651,165 @@ impl SessionStore {
                 .map(|proposal| proposal.proposal_id == proposal_id)
                 .unwrap_or(false)
         }))
+    }
+
+    pub fn get_memory_proposal_message(
+        &self,
+        session_id: &str,
+        proposal_id: &str,
+    ) -> Result<Option<ChatMessage>, String> {
+        let messages = self.get_messages(session_id)?;
+        Ok(messages.into_iter().find(|message| {
+            message
+                .memory_proposal
+                .as_ref()
+                .map(|proposal| proposal.proposal_id == proposal_id)
+                .unwrap_or(false)
+        }))
+    }
+
+    pub fn stale_pending_memory_proposals(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<ChatMessage>, String> {
+        self.update_pending_memory_proposals(session_id, KnowledgeProposalStatus::Stale)
+    }
+
+    pub fn update_memory_proposal_status(
+        &self,
+        session_id: &str,
+        proposal_id: &str,
+        status: KnowledgeProposalStatus,
+    ) -> Result<Option<ChatMessage>, String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, metadata_json FROM messages
+                 WHERE session_id = ?1 AND metadata_json IS NOT NULL
+                 ORDER BY created_at ASC, rowid ASC",
+            )
+            .map_err(|e| format!("Failed to prepare memory proposal query: {}", e))?;
+
+        let rows = stmt
+            .query_map(params![session_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|e| format!("Failed to query memory proposals: {}", e))?;
+
+        let mut target_message_id: Option<String> = None;
+        let mut target_metadata_json: Option<String> = None;
+        let now = Self::now_ts();
+
+        for row in rows {
+            let (message_id, metadata_json) =
+                row.map_err(|e| format!("Failed to read memory proposal row: {}", e))?;
+            let mut metadata: MessageMetadata = serde_json::from_str(&metadata_json)
+                .map_err(|e| format!("Failed to parse memory proposal metadata: {}", e))?;
+            let Some(proposal) = metadata.memory_proposal.as_mut() else {
+                continue;
+            };
+            if proposal.proposal_id != proposal_id {
+                continue;
+            }
+            if !Self::is_valid_knowledge_proposal_status_transition(&proposal.status, &status) {
+                return Err(format!(
+                    "Invalid memory proposal transition: {:?} -> {:?}",
+                    proposal.status, status
+                ));
+            }
+            proposal.status = status.clone();
+            proposal.updated_at = now;
+            target_message_id = Some(message_id);
+            target_metadata_json = Some(
+                serde_json::to_string(&metadata)
+                    .map_err(|e| format!("Failed to serialize memory proposal metadata: {}", e))?,
+            );
+            break;
+        }
+        drop(stmt);
+
+        let Some(message_id) = target_message_id else {
+            return Ok(None);
+        };
+        let Some(metadata_json) = target_metadata_json else {
+            return Ok(None);
+        };
+
+        conn.execute(
+            "UPDATE messages SET metadata_json = ?1 WHERE id = ?2 AND session_id = ?3",
+            params![metadata_json, message_id, session_id],
+        )
+        .map_err(|e| format!("Failed to update memory proposal status: {}", e))?;
+
+        drop(conn);
+        self.get_memory_proposal_message(session_id, proposal_id)
+    }
+
+    fn update_pending_memory_proposals(
+        &self,
+        session_id: &str,
+        status: KnowledgeProposalStatus,
+    ) -> Result<Vec<ChatMessage>, String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, metadata_json FROM messages
+                 WHERE session_id = ?1 AND metadata_json IS NOT NULL
+                 ORDER BY created_at ASC, rowid ASC",
+            )
+            .map_err(|e| format!("Failed to prepare pending memory proposal query: {}", e))?;
+
+        let rows = stmt
+            .query_map(params![session_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|e| format!("Failed to query pending memory proposals: {}", e))?;
+
+        let now = Self::now_ts();
+        let mut changed_proposal_ids: Vec<String> = Vec::new();
+
+        for row in rows {
+            let (message_id, metadata_json) = row
+                .map_err(|e| format!("Failed to read pending memory proposal row: {}", e))?;
+            let mut metadata: MessageMetadata = serde_json::from_str(&metadata_json).map_err(
+                |e| format!("Failed to parse pending memory proposal metadata: {}", e),
+            )?;
+            let Some(proposal) = metadata.memory_proposal.as_mut() else {
+                continue;
+            };
+            if proposal.status != KnowledgeProposalStatus::Pending {
+                continue;
+            }
+            proposal.status = status.clone();
+            proposal.updated_at = now;
+            let proposal_id = proposal.proposal_id.clone();
+            let next_metadata = serde_json::to_string(&metadata).map_err(|e| {
+                format!(
+                    "Failed to serialize pending memory proposal metadata: {}",
+                    e
+                )
+            })?;
+            conn.execute(
+                "UPDATE messages SET metadata_json = ?1 WHERE id = ?2 AND session_id = ?3",
+                params![next_metadata, message_id, session_id],
+            )
+            .map_err(|e| format!("Failed to update pending memory proposal: {}", e))?;
+            changed_proposal_ids.push(proposal_id);
+        }
+        drop(stmt);
+        drop(conn);
+
+        let messages = self.get_messages(session_id)?;
+        Ok(messages
+            .into_iter()
+            .filter(|message| {
+                message
+                    .memory_proposal
+                    .as_ref()
+                    .map(|proposal| changed_proposal_ids.contains(&proposal.proposal_id))
+                    .unwrap_or(false)
+            })
+            .collect())
     }
 
     pub fn stale_pending_knowledge_proposals(
@@ -3762,7 +4011,8 @@ impl SessionStore {
 mod tests {
     use super::{
         build_large_tool_result_message, PersistedToolResult, SessionStore,
-        CHILD_SESSION_FORK_ERROR, CONTEXT_COMPACTED_DISPLAY_MARKER, RUN_STATUS_CANCELLING,
+        CHILD_SESSION_FORK_ERROR, CHILD_SESSION_UNARCHIVE_ERROR, CONTEXT_COMPACTED_DISPLAY_MARKER,
+        RUN_STATUS_CANCELLING,
         RUN_STATUS_DONE,
     };
     use crate::session::models::{
@@ -3976,6 +4226,7 @@ mod tests {
             outcome: None,
             recorded_output: None,
             nested_tool_calls: None,
+        execution_meta: None,
         }])
         .expect("serialize tool calls");
 
@@ -4080,6 +4331,61 @@ mod tests {
         assert_eq!(error, CHILD_SESSION_FORK_ERROR);
     }
 
+    fn session_archived_at(store: &SessionStore, session_id: &str) -> Option<i64> {
+        let conn = store.conn.lock().expect("lock store");
+        conn.query_row(
+            "SELECT archived_at FROM sessions WHERE id = ?1",
+            params![session_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .expect("query archived_at")
+        .flatten()
+    }
+
+    #[test]
+    fn unarchive_session_cascades_to_descendants() {
+        let dir = tempdir().expect("create temp dir");
+        let store = SessionStore::new(dir.path()).expect("initialize store");
+        let parent_id = store
+            .create_session("Parent", None, None, "chat", None)
+            .expect("create parent");
+        let child_id = store
+            .create_session("Child", Some(&parent_id), None, "chat", Some("explorer"))
+            .expect("create child");
+
+        store.archive_session(&parent_id).expect("archive parent");
+        assert!(session_archived_at(&store, &parent_id).is_some());
+        assert!(session_archived_at(&store, &child_id).is_some());
+
+        store
+            .unarchive_session(&parent_id)
+            .expect("unarchive parent should cascade");
+        assert!(session_archived_at(&store, &parent_id).is_none());
+        assert!(session_archived_at(&store, &child_id).is_none());
+    }
+
+    #[test]
+    fn unarchive_session_rejects_child_sessions() {
+        let dir = tempdir().expect("create temp dir");
+        let store = SessionStore::new(dir.path()).expect("initialize store");
+        let parent_id = store
+            .create_session("Parent", None, None, "chat", None)
+            .expect("create parent");
+        let child_id = store
+            .create_session("Child", Some(&parent_id), None, "chat", Some("explorer"))
+            .expect("create child");
+
+        store.archive_session(&parent_id).expect("archive parent");
+
+        let error = store
+            .unarchive_session(&child_id)
+            .expect_err("child unarchive should fail");
+        assert_eq!(error, CHILD_SESSION_UNARCHIVE_ERROR);
+        assert!(session_archived_at(&store, &parent_id).is_some());
+        assert!(session_archived_at(&store, &child_id).is_some());
+    }
+
     #[test]
     fn v15_database_migrates_message_render_orders() {
         let dir = tempdir().expect("create temp dir");
@@ -4103,6 +4409,7 @@ mod tests {
             outcome: None,
             recorded_output: None,
             nested_tool_calls: None,
+        execution_meta: None,
         }])
         .expect("serialize tool calls");
         conn.execute(
@@ -4622,6 +4929,7 @@ mod tests {
             outcome: None,
             recorded_output: None,
             nested_tool_calls: None,
+        execution_meta: None,
         }])
         .expect("serialize tool calls");
 
@@ -4881,6 +5189,7 @@ mod tests {
             outcome: None,
             recorded_output: None,
             nested_tool_calls: None,
+        execution_meta: None,
         }])
         .expect("serialize tool calls");
         let large_output = "A".repeat(31_000);
@@ -4965,6 +5274,7 @@ mod tests {
                     outcome: None,
                     recorded_output: None,
                     nested_tool_calls: None,
+                execution_meta: None,
                 }],
             )
             .expect("add assistant");
@@ -5493,6 +5803,7 @@ mod tests {
             thinking_duration: None,
             thinking_signature: None,
             knowledge_proposal: None,
+            memory_proposal: None,
             render_parts: None,
         };
 
@@ -5595,6 +5906,7 @@ mod tests {
             thinking_duration: None,
             thinking_signature: None,
             knowledge_proposal: None,
+            memory_proposal: None,
             render_parts: None,
         };
 
@@ -5667,6 +5979,7 @@ mod tests {
             thinking_duration: None,
             thinking_signature: None,
             knowledge_proposal: None,
+            memory_proposal: None,
             render_parts: None,
         };
 
@@ -5731,6 +6044,7 @@ mod tests {
             thinking_duration: None,
             thinking_signature: None,
             knowledge_proposal: None,
+            memory_proposal: None,
             render_parts: None,
         };
         store
@@ -5770,6 +6084,7 @@ mod tests {
             thinking_duration: None,
             thinking_signature: None,
             knowledge_proposal: None,
+            memory_proposal: None,
             render_parts: None,
         };
         store
@@ -5840,6 +6155,7 @@ mod tests {
             thinking_duration: None,
             thinking_signature: None,
             knowledge_proposal: None,
+            memory_proposal: None,
             render_parts: None,
         };
         store
@@ -5879,6 +6195,7 @@ mod tests {
             thinking_duration: None,
             thinking_signature: None,
             knowledge_proposal: None,
+            memory_proposal: None,
             render_parts: None,
         };
         store
@@ -5944,6 +6261,7 @@ mod tests {
             thinking_duration: None,
             thinking_signature: None,
             knowledge_proposal: None,
+            memory_proposal: None,
             render_parts: None,
         };
         store
@@ -5968,6 +6286,7 @@ mod tests {
             thinking_duration: None,
             thinking_signature: None,
             knowledge_proposal: None,
+            memory_proposal: None,
             render_parts: None,
         };
         store

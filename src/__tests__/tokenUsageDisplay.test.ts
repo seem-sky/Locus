@@ -1,7 +1,13 @@
 import { describe, expect, it } from "vitest";
 
 import type { TokenUsage } from "../types";
-import { buildTokenUsageMetrics } from "../components/chat/tokenUsageDisplay";
+import {
+  buildTokenUsageMetrics,
+  formatTokenCount,
+  hasSessionTokenUsage,
+  sessionInputTokenTotal,
+  shouldShowTokenUsageBar,
+} from "../components/chat/tokenUsageDisplay";
 
 function makeUsage(overrides: Partial<TokenUsage> = {}): TokenUsage {
   return {
@@ -91,5 +97,26 @@ describe("tokenUsageDisplay", () => {
       "output",
     ]);
     expect(metrics[1]?.value).toBe(0);
+  });
+
+  it("aggregates session input across cache buckets", () => {
+    const usage = makeUsage({
+      totalInputTokens: 900,
+      totalCacheReadTokens: 3200,
+      totalCacheWriteTokens: 600,
+      totalOutputTokens: 240,
+    });
+    expect(sessionInputTokenTotal(usage)).toBe(4700);
+    expect(hasSessionTokenUsage(usage)).toBe(true);
+    expect(shouldShowTokenUsageBar(usage)).toBe(true);
+    expect(formatTokenCount(4700)).toBe("4.7k");
+  });
+
+  it("shows the bar for context window usage without session totals", () => {
+    expect(shouldShowTokenUsageBar(makeUsage({
+      contextTokens: 1200,
+      contextLimit: 128000,
+    }))).toBe(true);
+    expect(hasSessionTokenUsage(makeUsage())).toBe(false);
   });
 });

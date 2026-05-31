@@ -38,6 +38,7 @@ export interface LegacyRenderPartOptions {
   beforeContentToolCalls?: ToolCallInfo[];
   afterContentToolCalls?: ToolCallInfo[];
   knowledgeProposals?: ChatMessage[];
+  memoryProposals?: ChatMessage[];
 }
 
 export function synthesizeLegacyRenderParts(
@@ -101,6 +102,25 @@ export function synthesizeLegacyRenderParts(
       kind: "knowledgeProposal",
       id: proposalMessage.id,
       order: legacyOrder(contentSeq + 100 + index),
+      message: proposalMessage,
+    });
+  }
+
+  if (message.memoryProposal) {
+    parts.push({
+      kind: "memoryProposal",
+      id: message.id,
+      order: legacyOrder(contentSeq + 200),
+      message,
+    });
+  }
+
+  for (const [index, proposalMessage] of (options.memoryProposals ?? []).entries()) {
+    if (!proposalMessage.memoryProposal) continue;
+    parts.push({
+      kind: "memoryProposal",
+      id: proposalMessage.id,
+      order: legacyOrder(contentSeq + 210 + index),
       message: proposalMessage,
     });
   }

@@ -1,7 +1,8 @@
 import { hydrateChatMessageIntent, parseUserIntentMeta } from "./chatInputIntents";
 import { sortedAssistantRenderParts } from "./assistantRenderParts";
 import { resolveToolCallDisplayShape } from "./toolCallBatches";
-import type { StreamEvent, ChatMessage, TokenUsage, TodoItem, ToolCallDisplay, ToolCallInfo, PendingQuestion, PendingToolConfirm, ImageAttachment, AssetRefAttachment, ToolCallProgress, AssistantRenderPart } from "../types";
+import { normalizeExecutionMeta } from "./rtkExecutionMeta";
+import type { StreamEvent, ChatMessage, TokenUsage, TodoItem, ToolCallDisplay, ToolCallInfo, PendingQuestion, PendingToolConfirm, ImageAttachment, AssetRefAttachment, ToolCallProgress, AssistantRenderPart, ToolExecutionMeta } from "../types";
 
 export interface StreamState {
   messages: ChatMessage[];
@@ -150,10 +151,34 @@ export function mergeUserMessage(messages: ChatMessage[], incoming: ChatMessage)
 }
 
 function cloneToolCallInfo(toolCall: ToolCallInfo): ToolCallInfo {
+  const executionMeta = normalizeExecutionMeta(toolCall);
   return {
     ...toolCall,
+    ...(executionMeta ? { executionMeta } : {}),
     nestedToolCalls: toolCall.nestedToolCalls?.map(cloneToolCallInfo),
   };
+}
+
+function resolveToolCallDoneExecutionMeta(
+  event: Extract<StreamEvent, { type: "toolCallDone" }>,
+  state: StreamState,
+): ToolExecutionMeta | undefined {
+  const direct = normalizeExecutionMeta(event as { executionMeta?: ToolExecutionMeta; execution_meta?: ToolExecutionMeta });
+  if (direct) return direct;
+
+  const existing = state.activeToolCalls.find((toolCall) => toolCall.id === event.toolCallId);
+  const existingMeta = normalizeExecutionMeta(existing);
+  if (existingMeta) return existingMeta;
+
+  if (existing?.progress?.state === "rtk" && existing.progress.info) {
+    try {
+      return { rtk: JSON.parse(existing.progress.info) as ToolExecutionMeta["rtk"] };
+    } catch {
+      return undefined;
+    }
+  }
+
+  return undefined;
 }
 
 function liveOrderFromEvent(
@@ -225,9 +250,17 @@ function finalizeLiveRenderParts(
       return { ...part, content: options.fullText || part.content };
     }
     if (part.kind === "toolCall") {
+      const finalized = toolCallsById.get(part.id) ?? part.toolCall;
+      const executionMeta =
+        normalizeExecutionMeta(finalized)
+        ?? normalizeExecutionMeta(part.toolCall);
+      const merged: ToolCallInfo = {
+        ...finalized,
+        ...(executionMeta ? { executionMeta } : {}),
+      };
       return {
         ...part,
-        toolCall: cloneToolCallInfo(toolCallsById.get(part.id) ?? part.toolCall),
+        toolCall: cloneToolCallInfo(merged),
       };
     }
     return part;
@@ -511,6 +544,7 @@ export function reduceStreamEvent(state: StreamState, event: StreamEvent): Strea
     }
 
     case "toolCallDone": {
+      const executionMeta = resolveToolCallDoneExecutionMeta(event, state);
       const updates: Partial<ToolCallDisplay> = {
         status: event.outcome,
         output: event.output,
@@ -519,10 +553,17 @@ export function reduceStreamEvent(state: StreamState, event: StreamEvent): Strea
       if (event.images && event.images.length > 0) {
         updates.images = event.images;
       }
+      if (executionMeta) {
+        updates.executionMeta = executionMeta;
+      }
       mutations.push({
         type: "updateLiveToolPart",
         toolCallId: event.toolCallId,
-        updates: { outcome: event.outcome, recordedOutput: event.output },
+        updates: {
+          outcome: event.outcome,
+          recordedOutput: event.output,
+          ...(executionMeta ? { executionMeta } : {}),
+        },
       });
       mutations.push({
         type: "updateToolCall",
@@ -607,6 +648,9 @@ export function reduceStreamEvent(state: StreamState, event: StreamEvent): Strea
       if (event.images && event.images.length > 0) {
         updates.images = event.images;
       }
+      if (event.executionMeta) {
+        updates.executionMeta = event.executionMeta;
+      }
       mutations.push({
         type: "updateNestedToolCall",
         parentId: event.parentToolCallId,
@@ -659,6 +703,10 @@ export function reduceStreamEvent(state: StreamState, event: StreamEvent): Strea
     }
 
     case "knowledgeProposal":
+      mutations.push({ type: "upsertMessage", message: event.message });
+      break;
+
+    case "memoryProposal":
       mutations.push({ type: "upsertMessage", message: event.message });
       break;
 

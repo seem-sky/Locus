@@ -7,6 +7,7 @@ mod git;
 mod knowledge;
 pub mod lua_gc_monitor;
 mod log;
+mod memory;
 mod plan;
 mod ref_graph;
 mod session;
@@ -18,6 +19,7 @@ mod unity_embed;
 mod update;
 mod view;
 mod workspace;
+mod workspace_browse_filters;
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
@@ -135,6 +137,8 @@ pub enum StreamEvent {
         outcome: ToolCallOutcome,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         images: Option<Vec<crate::session::models::ImageData>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        execution_meta: Option<serde_json::Value>,
     },
     #[serde(rename_all = "camelCase")]
     ToolCallDelta {
@@ -175,6 +179,8 @@ pub enum StreamEvent {
         outcome: ToolCallOutcome,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         images: Option<Vec<crate::session::models::ImageData>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        execution_meta: Option<serde_json::Value>,
     },
     #[serde(rename_all = "camelCase")]
     ToolCallRoundDone {
@@ -203,6 +209,11 @@ pub enum StreamEvent {
     },
     #[serde(rename_all = "camelCase")]
     KnowledgeProposal {
+        session_id: String,
+        message: crate::session::models::ChatMessage,
+    },
+    #[serde(rename_all = "camelCase")]
+    MemoryProposal {
         session_id: String,
         message: crate::session::models::ChatMessage,
     },
@@ -318,6 +329,8 @@ pub enum KnowledgeToolConfirmOperation {
 pub struct BasicToolConfirmDisplay {
     pub tool_name: String,
     pub arguments: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workflow_note: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -379,6 +392,7 @@ pub use git::*;
 pub use knowledge::*;
 pub use lua_gc_monitor::*;
 pub use log::*;
+pub use memory::*;
 pub use plan::*;
 pub use ref_graph::*;
 pub use session::*;

@@ -42,6 +42,7 @@ import {
   type UserConsoleEntryDisplay,
   type UserLocalFileEntryDisplay,
 } from "../../composables/chatUserMessageDisplay";
+import { TRANSIENT_CHAT_MESSAGE_ID } from "../../composables/chatMessageCopy";
 import { logToolCollapseTrace, previewTraceText } from "../../services/toolCollapseTrace";
 import {
   traceToolBlockLayoutChange,
@@ -51,6 +52,7 @@ import MarkdownRenderer from "../MarkdownRenderer.vue";
 import ToolCallCollection from "../ToolCallCollection.vue";
 import ToolCallBlock from "../ToolCallBlock.vue";
 import KnowledgeProposalCard from "./KnowledgeProposalCard.vue";
+import MemoryProposalCard from "./MemoryProposalCard.vue";
 import ChatWaitingIndicator from "./ChatWaitingIndicator.vue";
 import AssetChip from "../AssetChip.vue";
 import LucideIcon from "../icons/LucideIcon.vue";
@@ -154,6 +156,8 @@ const props = withDefaults(defineProps<{
 const emit = defineEmits<{
   (e: "applyKnowledgeProposal", proposalId: string): void;
   (e: "ignoreKnowledgeProposal", proposalId: string): void;
+  (e: "applyMemoryProposal", proposalId: string): void;
+  (e: "ignoreMemoryProposal", proposalId: string): void;
   (e: "openThinking", content: string): void;
   (e: "openImage", src: string): void;
   (e: "scroll", event: Event): void;
@@ -280,13 +284,18 @@ const toolOutputImageMap = computed<Record<string, ImageAttachment[]>>(() => {
 
 const visibleMessages = computed(() =>
   props.messages.filter((msg) => {
-    const status = msg.knowledgeProposal?.status;
-    return status !== "stale" && status !== "invalidated";
+    const knowledgeStatus = msg.knowledgeProposal?.status;
+    const memoryStatus = msg.memoryProposal?.status;
+    return knowledgeStatus !== "stale"
+      && knowledgeStatus !== "invalidated"
+      && memoryStatus !== "stale"
+      && memoryStatus !== "invalidated";
   }),
 );
 
 const toolCallHandoff = ref<ToolCallHandoffState | null>(null);
 const toolCallHandoffQuiet = ref(false);
+const thinkingExpandOverrides = ref(new Map<string, boolean>());
 const retainedCollapsedToolCallMatchState = ref<ToolCallMatchState>(emptyToolCallMatchState());
 let toolCallHandoffSequence = 0;
 let toolCallHandoffArmTimer: ReturnType<typeof setTimeout> | null = null;
@@ -344,6 +353,12 @@ function cloneToolCallDisplay(toolCall: ToolCallDisplay): ToolCallDisplay {
   };
   if (toolCall.images && toolCall.images.length > 0) {
     clone.images = [...toolCall.images];
+  }
+  if (toolCall.progress) {
+    clone.progress = { ...toolCall.progress };
+  }
+  if (toolCall.executionMeta) {
+    clone.executionMeta = toolCall.executionMeta;
   }
   return clone;
 }
@@ -502,6 +517,7 @@ watch(
     if (sessionKey === previousSessionKey) return;
     clearToolCallHandoff("session-key-changed");
     clearRetainedCollapsedToolCalls("session-key-changed");
+    thinkingExpandOverrides.value = new Map();
   },
   { flush: "sync" },
 );
@@ -657,13 +673,16 @@ function toolCallTreeHasAnyIds(
 }
 
 function hasVisibleMessagePayload(message: ChatMessage) {
-  const status = message.knowledgeProposal?.status;
-  if (status === "stale" || status === "invalidated") return false;
+  const knowledgeStatus = message.knowledgeProposal?.status;
+  const memoryStatus = message.memoryProposal?.status;
+  if (knowledgeStatus === "stale" || knowledgeStatus === "invalidated") return false;
+  if (memoryStatus === "stale" || memoryStatus === "invalidated") return false;
   if (message.role === "tool") return false;
   return !!(
     message.content.trim()
     || message.thinkingContent?.trim()
     || message.knowledgeProposal
+    || message.memoryProposal
     || message.images?.length
     || message.assetRefs?.length
     || (message.role === "user" && messageConsoleEntries(message).length > 0)
@@ -915,8 +934,37 @@ function shouldRenderTransientThinkingSegment(part: Extract<AssistantRenderPart,
   return !!part.active || (!shouldHideThinkingBlocks() && part.content.trim().length > 0);
 }
 
+function shouldShowInlineThinkingContent(options: { active?: boolean; content: string; expanded: boolean }) {
+  if (!options.content.trim() || !options.expanded) return false;
+  if (options.active) return true;
+  return !shouldHideThinkingBlocks();
+}
+
+function shouldAutoExpandThinking() {
+  return displaySettings.thinkingAutoExpand !== false;
+}
+
+function isThinkingExpanded(segmentKey: string) {
+  const override = thinkingExpandOverrides.value.get(segmentKey);
+  if (override !== undefined) return override;
+  return shouldAutoExpandThinking();
+}
+
+function toggleThinkingCollapse(segmentKey: string) {
+  const next = new Map(thinkingExpandOverrides.value);
+  next.set(segmentKey, !isThinkingExpanded(segmentKey));
+  thinkingExpandOverrides.value = next;
+}
+
 function shouldRenderItem(item: MessageRenderItem) {
-  if (item.message.knowledgeProposal) return true;
+  const knowledgeStatus = item.message.knowledgeProposal?.status;
+  const memoryStatus = item.message.memoryProposal?.status;
+  if (knowledgeStatus && knowledgeStatus !== "stale" && knowledgeStatus !== "invalidated") {
+    if (item.message.knowledgeProposal) return true;
+  }
+  if (memoryStatus && memoryStatus !== "stale" && memoryStatus !== "invalidated") {
+    if (item.message.memoryProposal) return true;
+  }
 
   if (item.message.role === "user") {
     return !!(
@@ -1285,6 +1333,7 @@ const canonicalLiveRenderParts = computed(() => {
     order: toolCall.order,
     outcome: toolCall.status === "running" ? undefined : toolCall.status,
     recordedOutput: toolCall.output,
+    executionMeta: toolCall.executionMeta,
     nestedToolCalls: toolCall.nestedToolCalls?.map((nestedToolCall) => ({
       id: nestedToolCall.id,
       name: nestedToolCall.name,
@@ -1292,6 +1341,7 @@ const canonicalLiveRenderParts = computed(() => {
       order: nestedToolCall.order,
       outcome: nestedToolCall.status === "running" ? undefined : nestedToolCall.status,
       recordedOutput: nestedToolCall.output,
+      executionMeta: nestedToolCall.executionMeta,
     })),
   }));
   return synthesizeLegacyRenderParts({
@@ -1466,10 +1516,11 @@ type HistoryRenderSegment =
   | { type: "thinking"; key: string; part: AssistantRenderPart; itemId: string; content: string; duration?: number }
   | { type: "toolCalls"; key: string; part: Extract<AssistantRenderPart, { kind: "toolCall" }>; itemId: string; itemIds: string[]; toolCalls: ToolCallDisplay[] }
   | { type: "content"; key: string; part: AssistantRenderPart; itemId: string; content: string }
-  | { type: "knowledgeProposal"; key: string; part: AssistantRenderPart; itemId: string; message: ChatMessage };
+  | { type: "knowledgeProposal"; key: string; part: AssistantRenderPart; itemId: string; message: ChatMessage }
+  | { type: "memoryProposal"; key: string; part: AssistantRenderPart; itemId: string; message: ChatMessage };
 
 type TransientRenderSegment =
-  | { type: "thinking"; key: string; part: AssistantRenderPart; active: boolean; duration?: number }
+  | { type: "thinking"; key: string; part: Extract<AssistantRenderPart, { kind: "thinking" }>; content: string; active: boolean; duration?: number }
   | {
       type: "toolCalls";
       key: string;
@@ -1543,6 +1594,7 @@ function toolCallInfoFromDisplay(toolCall: ToolCallDisplay): ToolCallInfo {
     order: toolCall.order,
     outcome: toolCall.status === "running" ? undefined : toolCall.status,
     recordedOutput: toolCall.output,
+    executionMeta: toolCall.executionMeta,
     nestedToolCalls: toolCall.nestedToolCalls?.map((nestedToolCall) => toolCallInfoFromDisplay(nestedToolCall)),
   };
 }
@@ -1619,6 +1671,15 @@ function historyRenderSegments(item: MessageRenderItem): HistoryRenderSegment[] 
       flushPendingTools();
       segments.push({
         type: "knowledgeProposal",
+        key: `${item.id}:${part.id}`,
+        part,
+        itemId: item.id,
+        message: part.message,
+      });
+    } else if (part.kind === "memoryProposal") {
+      flushPendingTools();
+      segments.push({
+        type: "memoryProposal",
         key: `${item.id}:${part.id}`,
         part,
         itemId: item.id,
@@ -1808,6 +1869,7 @@ const transientRenderSegments = computed<TransientRenderSegment[]>(() => {
         type: "thinking",
         key: `transient:${part.id}`,
         part,
+        content: part.content,
         active: !!part.active && props.isThinking,
         duration: part.duration ?? props.thinkingDuration,
       });
@@ -2472,6 +2534,7 @@ function openImage(src: string) {
                 <div
                   v-if="segment.type === 'thinking'"
                   class="chat-transcript-thinking-block"
+                  :class="{ 'is-expanded': isThinkingExpanded(segment.key) }"
                   data-render-part-kind="thinking"
                   data-render-part-scope="history"
                   :data-render-part-key="segment.key"
@@ -2482,7 +2545,8 @@ function openImage(src: string) {
                     v-if="variant === 'session'"
                     type="button"
                     class="chat-transcript-thinking-header is-clickable"
-                    @click="emit('openThinking', segment.content)"
+                    :aria-expanded="isThinkingExpanded(segment.key)"
+                    @click="toggleThinkingCollapse(segment.key)"
                   >
                     <svg class="chat-transcript-thinking-chevron" viewBox="0 0 16 16" fill="currentColor" width="12" height="12">
                       <path d="M6 3l5 5-5 5V3z" />
@@ -2492,11 +2556,25 @@ function openImage(src: string) {
                     </span>
                   </button>
 
-                  <div v-else class="chat-transcript-thinking-chip">
+                  <button
+                    v-else
+                    type="button"
+                    class="chat-transcript-thinking-chip is-clickable"
+                    :aria-expanded="isThinkingExpanded(segment.key)"
+                    @click="toggleThinkingCollapse(segment.key)"
+                  >
+                    <svg class="chat-transcript-thinking-chevron" viewBox="0 0 16 16" fill="currentColor" width="12" height="12">
+                      <path d="M6 3l5 5-5 5V3z" />
+                    </svg>
                     <span class="chat-transcript-thinking-title">
                       {{ formatThoughtSummary(segment.duration) }}
                     </span>
-                  </div>
+                  </button>
+
+                  <pre
+                    v-if="shouldShowInlineThinkingContent({ content: segment.content, expanded: isThinkingExpanded(segment.key) })"
+                    class="chat-transcript-thinking-body"
+                  >{{ segment.content }}</pre>
                 </div>
 
                 <div
@@ -2555,6 +2633,18 @@ function openImage(src: string) {
                   @apply="emit('applyKnowledgeProposal', $event)"
                   @ignore="emit('ignoreKnowledgeProposal', $event)"
                 />
+
+                <MemoryProposalCard
+                  v-else-if="segment.type === 'memoryProposal'"
+                  data-render-part-kind="memoryProposal"
+                  data-render-part-scope="history"
+                  :data-render-part-key="segment.key"
+                  :data-chat-message-id="segment.itemId"
+                  data-chat-message-role="assistant"
+                  :proposal="segment.message.memoryProposal!"
+                  @apply="emit('applyMemoryProposal', $event)"
+                  @ignore="emit('ignoreMemoryProposal', $event)"
+                />
               </template>
             </div>
           </div>
@@ -2593,16 +2683,20 @@ function openImage(src: string) {
                 <div
                   v-if="segment.type === 'thinking'"
                   class="chat-transcript-thinking-block"
+                  :class="{ 'is-expanded': isThinkingExpanded(segment.key) }"
                   data-render-part-kind="thinking"
                   data-render-part-scope="transient"
                   :data-render-part-key="segment.key"
+                  :data-chat-message-id="TRANSIENT_CHAT_MESSAGE_ID"
+                  data-chat-message-role="assistant"
                 >
                   <button
                     v-if="variant === 'session'"
                     type="button"
                     class="chat-transcript-thinking-header"
                     :class="{ active: segment.active, 'is-clickable': true }"
-                    @click="emit('openThinking', '')"
+                    :aria-expanded="isThinkingExpanded(segment.key)"
+                    @click="toggleThinkingCollapse(segment.key)"
                   >
                     <svg class="chat-transcript-thinking-chevron" viewBox="0 0 16 16" fill="currentColor" width="12" height="12">
                       <path d="M6 3l5 5-5 5V3z" />
@@ -2615,12 +2709,28 @@ function openImage(src: string) {
                     </template>
                   </button>
 
-                  <div v-else class="chat-transcript-thinking-chip" :class="{ active: segment.active }">
+                  <button
+                    v-else
+                    type="button"
+                    class="chat-transcript-thinking-chip is-clickable"
+                    :class="{ active: segment.active }"
+                    :aria-expanded="isThinkingExpanded(segment.key)"
+                    @click="toggleThinkingCollapse(segment.key)"
+                  >
+                    <svg class="chat-transcript-thinking-chevron" viewBox="0 0 16 16" fill="currentColor" width="12" height="12">
+                      <path d="M6 3l5 5-5 5V3z" />
+                    </svg>
                     <ChatWaitingIndicator v-if="segment.active" :label="thinkingActiveLabel" compact />
                     <span v-else class="chat-transcript-thinking-title">
                       {{ formatThoughtSummary(segment.duration) }}
                     </span>
-                  </div>
+                  </button>
+
+                  <pre
+                    v-if="shouldShowInlineThinkingContent({ active: segment.active, content: segment.content, expanded: isThinkingExpanded(segment.key) })"
+                    class="chat-transcript-thinking-body"
+                    :class="{ active: segment.active }"
+                  >{{ segment.content }}</pre>
                 </div>
 
                 <div
@@ -2629,6 +2739,8 @@ function openImage(src: string) {
                   data-render-part-kind="toolCall"
                   data-render-part-scope="transient"
                   :data-render-part-key="segment.key"
+                  :data-chat-message-id="TRANSIENT_CHAT_MESSAGE_ID"
+                  data-chat-message-role="assistant"
                   data-tool-layout-kind="group"
                   data-tool-layout-scope="transient"
                   :data-tool-layout-key="segment.key"
@@ -3258,9 +3370,28 @@ function openImage(src: string) {
   position: relative;
   z-index: 0;
   display: flex;
+  flex-direction: column;
   align-items: flex-start;
+  gap: 4px;
   min-width: 0;
   min-height: 28px;
+}
+
+.chat-transcript-thinking-body {
+  width: 100%;
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0 10px 2px 22px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text-secondary);
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: var(--font-prose);
+}
+
+.chat-transcript-thinking-body.active {
+  color: var(--text-color);
 }
 
 .chat-transcript-thinking-block[data-render-part-scope="transient"] {
@@ -3314,6 +3445,21 @@ function openImage(src: string) {
   flex-shrink: 0;
   transition: transform 0.2s ease;
   opacity: 0.5;
+}
+
+.chat-transcript-thinking-block.is-expanded .chat-transcript-thinking-chevron {
+  transform: rotate(90deg);
+}
+
+.chat-transcript-thinking-chip.is-clickable {
+  cursor: pointer;
+  border: none;
+  font: inherit;
+  transition: background 0.15s;
+}
+
+.chat-transcript-thinking-chip.is-clickable:hover {
+  background: color-mix(in srgb, var(--hover-bg) 92%, transparent);
 }
 
 .chat-transcript-thinking-title {

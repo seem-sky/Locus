@@ -58,6 +58,9 @@ describe("chat sidebar layout", () => {
     expect(workspace).toContain("shell.style.width = \"0px\";");
     expect(workspace).toContain("shell.style.minWidth = \"0px\";");
     expect(workspace).toContain('shell.style.transform = "translateX(100%)";');
+    expect(workspace).toContain("chatStore.showThinkingPanel");
+    expect(sidebar).toContain("<ThinkingPanel");
+    expect(sidebar).toContain("chat-sidebar-section-thinking");
     expect(sidebar).toContain("<TodoPanel");
     expect(sidebar).toContain("<ChatChangesPanel");
     expect(sidebar).toContain("class=\"chat-sidebar-panel\"");
@@ -67,6 +70,7 @@ describe("chat sidebar layout", () => {
     expect(sidebar).toContain("chat-sidebar-section-changes");
     expect(sidebar).toContain("chat-sidebar-close");
     expect(sidebar).toContain("has-both-sections");
+    expect(sidebar).toContain("has-multiple-sections");
     expect(sidebar).toContain("STORAGE_KEY_SIDEBAR_WIDTH = \"locus:chatSidebarWidth\"");
     expect(sidebar).toContain("STORAGE_KEY_SIDEBAR_HEIGHT = \"locus:chatSidebarHeight\"");
     expect(sidebar).toContain("storageScope?: string;");

@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, defineAsyncComponent, ref } from "vue";
-import { useAssetState } from "../composables/useAssetState";
+import { useAssetState, type AssetExplorerNode } from "../composables/useAssetState";
+import { useChatStore } from "../stores/chat";
 import { t } from "../i18n";
 import AssetExplorer from "./asset/AssetExplorer.vue";
 import AssetLegacyExplorer from "./asset/AssetLegacyExplorer.vue";
@@ -14,9 +15,14 @@ const AssetPreviewHost = defineAsyncComponent(
   () => import("./asset/AssetPreviewHost.vue"),
 );
 
-const props = defineProps<{
+const props = withDefaults(defineProps<{
   workingDir: string;
-}>();
+  embedded?: boolean;
+}>(), {
+  embedded: false,
+});
+
+const chatStore = useChatStore();
 
 const {
   error,
@@ -110,10 +116,39 @@ const layoutToggleTitle = computed(() => (
     ? t("asset.layout.toggleToSingle")
     : t("asset.layout.toggleToDouble")
 ));
+function parentFolderPath(path: string): string | null {
+  const segments = path.split("/").filter(Boolean);
+  if (segments.length <= 1) return null;
+  return segments.slice(0, -1).join("/");
+}
+
+function selectEmbeddedFile(node: AssetExplorerNode) {
+  if (node.kind !== "file") return;
+  const parentPath = parentFolderPath(node.path);
+  if (parentPath) {
+    selectedFolderPath.value = parentPath;
+  }
+  selectedNode.value = node;
+  closePreview();
+}
+
+async function handleEmbeddedSelect(node: AssetExplorerNode) {
+  if (node.kind === "folder") {
+    await selectFolder(node.path, { revealInTree: "ancestors" });
+    return;
+  }
+  selectEmbeddedFile(node);
+}
+
+function handleEmbeddedPreview(node: AssetExplorerNode) {
+  if (node.kind !== "file") return;
+  selectEmbeddedFile(node);
+  chatStore.openFloatingAssetPreview({ path: node.path, name: node.name });
+}
 </script>
 
 <template>
-  <div class="asset-view">
+  <div class="asset-view" :class="{ 'is-embedded': embedded }">
     <WorkspaceRequiredState
       v-if="!hasWorkspace"
       :description="t('workspace.required.assetDescription')"
@@ -122,12 +157,33 @@ const layoutToggleTitle = computed(() => (
     <template v-else>
       <div v-if="error" class="ax-error" @click="error = ''">{{ error }}</div>
 
-      <div v-if="layoutMode === 'single'" class="ax-workspace">
+      <div v-if="embedded" class="ax-workspace ax-workspace-embedded">
+        <section class="ax-pane ax-pane-tree ax-pane-embedded-tree">
+          <div class="ax-pane-header">
+            <span class="ax-pane-title">{{ t("asset.layout.directory") }}</span>
+          </div>
+          <div class="ax-pane-body">
+            <AssetLegacyExplorer
+              :tree="explorerTree"
+              :selected-path="legacySelectedPath"
+              :is-path-expanded="isPathExpanded"
+              asset-ref-draggable
+              @select="handleEmbeddedSelect"
+              @preview="handleEmbeddedPreview"
+              @toggle="togglePath"
+              @load-more="loadMoreFolder"
+            />
+          </div>
+        </section>
+      </div>
+
+      <div v-else-if="layoutMode === 'single'" class="ax-workspace">
         <section class="ax-pane ax-pane-tree" :style="{ width: `${sidebarWidth}px` }">
           <div class="ax-pane-header">
             <span class="ax-pane-title">{{ t("asset.layout.directory") }}</span>
             <span class="ax-pane-spacer"></span>
             <button
+              v-if="!embedded"
               type="button"
               class="ax-layout-toggle"
               :title="layoutToggleTitle"
@@ -213,6 +269,7 @@ const layoutToggleTitle = computed(() => (
             <span class="ax-pane-title">{{ t("asset.layout.directory") }}</span>
             <span class="ax-pane-spacer"></span>
             <button
+              v-if="!embedded"
               type="button"
               class="ax-layout-toggle"
               :title="layoutToggleTitle"
@@ -359,6 +416,18 @@ const layoutToggleTitle = computed(() => (
 .ax-pane-tree {
   flex-shrink: 0;
   min-width: 220px;
+}
+
+.asset-view.is-embedded .ax-workspace-embedded {
+  flex-direction: column;
+  width: 100%;
+}
+
+.asset-view.is-embedded .ax-pane-embedded-tree {
+  flex: 1 1 0;
+  width: 100% !important;
+  min-width: 0;
+  min-height: 120px;
 }
 
 .ax-pane-directory {

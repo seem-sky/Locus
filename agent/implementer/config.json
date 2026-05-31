@@ -11,7 +11,12 @@
     "codegraph_search",
     "codegraph_context",
     "codegraph_callers",
-    "codegraph_callees"
+    "codegraph_callees",
+    "codegraph_impact",
+    "codegraph_trace",
+    "unity_execute",
+    "unity_recompile",
+    "unity_run_states"
   ],
   "sub_agents": [],
   "default": false,

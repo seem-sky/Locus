@@ -9,6 +9,7 @@ import {
   listDirEntriesPage,
   type DirEntry,
 } from "../../services/project";
+import { useWorkspaceBrowseFilters } from "../../composables/useWorkspaceBrowseFilters";
 import { useNotificationStore } from "../../stores/notification";
 import type {
   AssetRefAttachment,
@@ -34,6 +35,14 @@ import {
   type ComposerIntentState,
 } from "../../composables/chatInputIntents";
 import { buildProjectKnowledgeRefPath, extractChatAssetRefs } from "../../composables/chatAssetRefs";
+import {
+  acceptAssetRefDragEvent,
+  resolveAssetRefDrop,
+} from "../../composables/assetRefDrag";
+import { useComposerAssetRefDropTarget } from "../../composables/useComposerAssetRefDrop";
+import { useQuickChatSkills } from "../../composables/useQuickChatSkills";
+import { buildWorkspaceAssetRef } from "../../composables/workspaceAssetRef";
+import ComposerQuickSkills from "./ComposerQuickSkills.vue";
 import {
   readUserMessageDraftFromClipboardData,
   type UserMessageDraft,
@@ -96,8 +105,6 @@ const ASSET_REF_SYNC_STORAGE_KEY = "locus:chatAssetRefDraftSync";
 const RECENT_ASSET_REF_REMOVAL_SUPPRESS_MS = 100;
 const LOCAL_FILE_BOUNDARY_WARNING_OPERATION = "local-file-boundary-warning";
 const LOCAL_FILE_DRAG_STATE_TTL_MS = 1200;
-const UNITY_ASSET_REF_ROOT_RE = /^(?:Assets|Packages|ProjectSettings)(?:\/|$)/i;
-const PROJECT_KNOWLEDGE_REF_ROOT_RE = /^(?:design|memory|skill|reference)\/.+\.md$/i;
 const KNOWLEDGE_MENTION_TYPES: KnowledgeDocumentType[] = ["design", "memory", "skill", "reference"];
 
 interface AssetRefSyncMessage {
@@ -141,6 +148,7 @@ const props = withDefaults(defineProps<{
   maxImages?: number;
   showTopPlanBadge?: boolean;
   showSkillBadges?: boolean;
+  showQuickSkills?: boolean;
   compact?: boolean;
   showAction?: boolean;
   assetRefSyncKey?: string;
@@ -155,6 +163,7 @@ const props = withDefaults(defineProps<{
   maxImages: 5,
   showTopPlanBadge: true,
   showSkillBadges: true,
+  showQuickSkills: true,
   compact: false,
   showAction: true,
   assetRefSyncKey: "",
@@ -172,6 +181,7 @@ const emit = defineEmits<{
 
 const composerRef = ref<InstanceType<typeof ChatComposer> | null>(null);
 const notificationStore = useNotificationStore();
+const { payload: browseFilters } = useWorkspaceBrowseFilters();
 const projectStore = useProjectStore();
 const slots = useSlots();
 const { state: chatInputSettings } = useChatInputSettings();
@@ -183,6 +193,7 @@ const {
   filteredCommands: getFilteredCommands,
   findExactAvailableCommand,
 } = useCommandRegistry(skillsRef, agentIdRef);
+const { quickSkillCommands } = useQuickChatSkills(skillsRef, agentIdRef);
 
 const pastedContent = ref("");
 const showPasteEditor = ref(false);
@@ -264,7 +275,16 @@ const hasHeaderStart = computed(() =>
 );
 const hasHeaderEnd = computed(() => !!slots["header-end"]);
 const hasHeaderContent = computed(() => hasHeaderStart.value || hasHeaderEnd.value);
-const hasFooterStart = computed(() => !!slots["footer-start"] || !!slots["top-start"]);
+const showQuickSkillBar = computed(() =>
+  props.showQuickSkills
+  && !props.compact
+  && quickSkillCommands.value.length > 0,
+);
+const hasFooterStart = computed(() =>
+  !!slots["footer-start"]
+  || !!slots["top-start"]
+  || showQuickSkillBar.value,
+);
 const hasFooterEnd = computed(() =>
   !!slots["footer-end"] || !!slots["top-end"] || !!slots.footer,
 );
@@ -575,7 +595,7 @@ async function loadDirEntries(subPath: string) {
     const allEntries: DirEntry[] = [];
 
     while (hasMore) {
-      const page = await listDirEntriesPage(subPath, offset, 200, false);
+      const page = await listDirEntriesPage(subPath, offset, 200, false, browseFilters.value);
       if (
         requestSeq !== mentionRequestSeq
         || !showMentionPopup.value
@@ -931,30 +951,8 @@ function normalizeUnityAssetRefPath(path: string) {
   return path.trim().replace(/\\/g, "/").replace(/\/+$/, "");
 }
 
-function isSupportedUnityAssetRefPath(path: string) {
-  return UNITY_ASSET_REF_ROOT_RE.test(normalizeUnityAssetRefPath(path));
-}
-
-function isSupportedProjectKnowledgeRefPath(path: string) {
-  return PROJECT_KNOWLEDGE_REF_ROOT_RE.test(normalizeUnityAssetRefPath(path));
-}
-
 function buildManualAssetRef(path: string): AssetRefAttachment | null {
-  const normalizedPath = normalizeUnityAssetRefPath(path);
-  if (!normalizedPath) return null;
-  if (isSupportedProjectKnowledgeRefPath(normalizedPath)) {
-    return {
-      path: normalizedPath,
-      kind: "knowledge",
-      source: "manual",
-    };
-  }
-  if (!isSupportedUnityAssetRefPath(normalizedPath)) return null;
-  return {
-    path: normalizedPath,
-    kind: inferAssetRefKind(normalizedPath),
-    source: "manual",
-  };
+  return buildWorkspaceAssetRef(path);
 }
 
 function buildManualAssetRefs(paths: string[]) {
@@ -1138,6 +1136,23 @@ function addAssetRefs(
   const next = setAssetRefAttachments([...assetRefAttachments.value, ...refsToAdd]);
   if (next.length > 0) {
     nextTick(() => composerRef.value?.focus());
+  }
+}
+
+const composerAssetRefDrop = useComposerAssetRefDropTarget();
+
+function handleComposerDragOver(event: DragEvent) {
+  if (composerAssetRefDrop.acceptDragOver(event)) return;
+  acceptAssetRefDragEvent(event);
+}
+
+function handleComposerDrop(event: DragEvent) {
+  if (composerAssetRefDrop.handleDrop(event)) return;
+  const payload = resolveAssetRefDrop(event);
+  if (!payload) return;
+  const assetRef = buildWorkspaceAssetRef(payload.path);
+  if (assetRef) {
+    addAssetRefs([assetRef]);
   }
 }
 
@@ -2043,6 +2058,33 @@ function removeSkillBadge(skill: SkillIntentItem) {
   };
 }
 
+function isQuickSkillActive(command: CommandDef): boolean {
+  if (!command.skill) return false;
+  return composerIntent.value.skills.some(
+    (item) => item.dirName === command.skill!.dirName && item.source === command.skill!.source,
+  );
+}
+
+function toggleQuickSkill(command: CommandDef) {
+  if (!command.skill || props.disabled) return;
+  if (isQuickSkillActive(command)) {
+    removeSkillBadge(command.skill);
+  } else {
+    applyIntentCommand(command);
+  }
+  nextTick(() => {
+    composerRef.value?.focus();
+    syncOperatorState();
+  });
+}
+
+function handleQuickSkillUnpin(command: CommandDef) {
+  if (!command.skill) return;
+  if (isQuickSkillActive(command)) {
+    removeSkillBadge(command.skill);
+  }
+}
+
 watch(() => props.modelValue, () => {
   nextTick(syncOperatorState);
 });
@@ -2202,11 +2244,15 @@ defineExpose({
   resetDraft,
   applyPrefill,
   applyDraftPrefill,
+  addAssetRefs,
 });
 </script>
 
 <template>
-  <ChatInputShell>
+  <ChatInputShell
+    @dragover="handleComposerDragOver"
+    @drop="handleComposerDrop"
+  >
     <template #floating>
       <Transition name="cmd-popup">
         <div
@@ -2605,6 +2651,15 @@ defineExpose({
         </div>
       </template>
       <template v-if="hasFooterStart" #footer-start>
+        <ComposerQuickSkills
+          v-if="showQuickSkillBar"
+          :commands="quickSkillCommands"
+          :skills="skills"
+          :active-skills="composerIntent.skills"
+          :disabled="disabled || isStreaming"
+          @toggle="toggleQuickSkill"
+          @unpin="handleQuickSkillUnpin"
+        />
         <slot name="footer-start" />
         <slot name="top-start" />
       </template>

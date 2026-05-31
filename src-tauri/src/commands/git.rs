@@ -5065,6 +5065,7 @@ pub async fn git_generate_commit_message(
         thinking_duration: None,
         thinking_signature: None,
         knowledge_proposal: None,
+            memory_proposal: None,
         render_parts: None,
     };
 
@@ -5187,6 +5188,7 @@ pub async fn git_generate_commit_message(
             &history,
             &[],
             config.base_url.as_deref(),
+            None,
             None,
             None,
             |_| {},

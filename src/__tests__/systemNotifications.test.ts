@@ -27,12 +27,13 @@ function createDisplayState(): DisplaySettings {
     changesAutoOpen: true,
     changesAutoClose: true,
     fileChangePopoverEnabled: true,
+    thinkingAutoOpen: false,
+    thinkingAutoExpand: true,
     chatDiffReviewTarget: "inline",
     gitDiffReviewTarget: "inline",
     rightAlignUserMessages: false,
     compactToolCalls: true,
     hideThinkingBlocks: true,
-    showViewsInSessionPanel: false,
     mergeGitTreeStatusIcon: true,
     hideGitCommandSuggestions: false,
     systemNotificationsEnabled: true,
@@ -116,11 +117,11 @@ describe("systemNotifications", () => {
     displayState.changesAutoOpen = true;
     displayState.changesAutoClose = true;
     displayState.fileChangePopoverEnabled = true;
+    displayState.thinkingAutoOpen = false;
     displayState.chatDiffReviewTarget = "inline";
     displayState.gitDiffReviewTarget = "inline";
     displayState.compactToolCalls = true;
     displayState.hideThinkingBlocks = true;
-    displayState.showViewsInSessionPanel = false;
     displayState.mergeGitTreeStatusIcon = true;
     displayState.hideGitCommandSuggestions = false;
     displayState.systemNotificationsEnabled = true;

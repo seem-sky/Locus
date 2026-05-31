@@ -26,6 +26,7 @@ pub struct ToolExecutionContext {
     pub working_dir: Option<String>,
     pub unity_connected: Option<bool>,
     pub runtime_state: Option<Arc<ToolRuntimeState>>,
+    pub execution_meta_sink: Option<Arc<Mutex<Option<serde_json::Value>>>>,
 }
 
 impl ToolExecutionContext {
@@ -132,16 +133,24 @@ pub fn default_load_mode_for_builtin_tool(name: &str) -> ToolLoadMode {
 
     if matches!(
         normalize_tool_name_key(name).as_str(),
-        "knowledge_create"
-            | "knowledge_delete"
-            | "knowledge_move"
-            | "graph_view"
-            | "codegraph_search"
+        "codegraph_search"
             | "codegraph_context"
             | "codegraph_callers"
             | "codegraph_callees"
             | "codegraph_impact"
             | "codegraph_files"
+            | "codegraph_trace"
+    ) {
+        // READ-gate tools must be visible without tool_load so build-mode agents use them early.
+        return ToolLoadMode::Direct;
+    }
+
+    if matches!(
+        normalize_tool_name_key(name).as_str(),
+        "knowledge_create"
+            | "knowledge_delete"
+            | "knowledge_move"
+            | "graph_view"
             | "codegraph_status"
             | "codegraph_sync"
             | "skill_create"
@@ -450,6 +459,35 @@ mod tests {
     }
 
     #[test]
+    fn builtins_register_codegraph_analysis_tools_as_direct() {
+        let registry = ToolRegistry::with_builtins();
+
+        for name in [
+            "codegraph_search",
+            "codegraph_context",
+            "codegraph_callers",
+            "codegraph_callees",
+            "codegraph_impact",
+            "codegraph_files",
+            "codegraph_trace",
+        ] {
+            assert_eq!(
+                registry.default_load_mode(name),
+                ToolLoadMode::Direct,
+                "{name} should be direct-loaded for READ gate"
+            );
+        }
+        assert_eq!(
+            registry.default_load_mode("codegraph_status"),
+            ToolLoadMode::Lazy
+        );
+        assert_eq!(
+            registry.default_load_mode("codegraph_sync"),
+            ToolLoadMode::Lazy
+        );
+    }
+
+    #[test]
     fn builtins_register_graph_view_as_lazy() {
         let registry = ToolRegistry::with_builtins();
 
@@ -481,6 +519,7 @@ mod tests {
             working_dir: Some("C:/Project".to_string()),
             unity_connected: Some(true),
             runtime_state: Some(Arc::new(ToolRuntimeState::default())),
+            execution_meta_sink: None,
         };
 
         assert!(context.should_redirect_unity_asset_read("Assets/Test/MyAsset.asset"));
@@ -495,6 +534,7 @@ mod tests {
             working_dir: Some("C:/Project".to_string()),
             unity_connected: Some(false),
             runtime_state: Some(Arc::new(ToolRuntimeState::default())),
+            execution_meta_sink: None,
         };
         assert!(!disconnected.should_redirect_unity_asset_read("Assets/Test/MyAsset.asset"));
 
@@ -503,6 +543,7 @@ mod tests {
             working_dir: Some("C:/Project".to_string()),
             unity_connected: Some(true),
             runtime_state: Some(Arc::new(ToolRuntimeState::default())),
+            execution_meta_sink: None,
         };
         assert!(!connected.should_redirect_unity_asset_read("src/main.rs"));
     }

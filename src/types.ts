@@ -19,6 +19,18 @@ export interface SessionSummary {
 
 export type ServerToolKind = "web_search";
 
+export interface RtkRewriteMeta {
+  enabled: boolean;
+  available: boolean;
+  rewritten: boolean;
+  originalCommand: string;
+  executedCommand?: string;
+}
+
+export interface ToolExecutionMeta {
+  rtk?: RtkRewriteMeta;
+}
+
 export interface ToolCallInfo {
   id: string;
   name: string;
@@ -29,43 +41,8 @@ export interface ToolCallInfo {
   outcome?: ToolCallOutcome;
   recordedOutput?: string;
   nestedToolCalls?: ToolCallInfo[];
+  executionMeta?: ToolExecutionMeta;
 }
-
-export type ToolCallOutcome = "done" | "error" | "interrupted";
-
-export interface RenderOrderKey {
-  runId: string;
-  seq: number;
-}
-
-export type AssistantRenderPart =
-  | {
-      kind: "thinking";
-      id: string;
-      order: RenderOrderKey;
-      content: string;
-      active?: boolean;
-      duration?: number;
-      signature?: string;
-    }
-  | {
-      kind: "text";
-      id: string;
-      order: RenderOrderKey;
-      content: string;
-    }
-  | {
-      kind: "toolCall";
-      id: string;
-      order: RenderOrderKey;
-      toolCall: ToolCallInfo;
-    }
-  | {
-      kind: "knowledgeProposal";
-      id: string;
-      order: RenderOrderKey;
-      message: ChatMessage;
-    };
 
 export interface ImageAttachment {
   data: string;
@@ -129,6 +106,71 @@ export interface SkillIntentItem {
   name: string;
 }
 
+export type ToolCallOutcome = "done" | "error" | "interrupted";
+
+export interface RenderOrderKey {
+  runId: string;
+  seq: number;
+}
+
+export type AssistantRenderPart =
+  | {
+      kind: "thinking";
+      id: string;
+      order: RenderOrderKey;
+      content: string;
+      active?: boolean;
+      duration?: number;
+      signature?: string;
+    }
+  | {
+      kind: "text";
+      id: string;
+      order: RenderOrderKey;
+      content: string;
+    }
+  | {
+      kind: "toolCall";
+      id: string;
+      order: RenderOrderKey;
+      toolCall: ToolCallInfo;
+    }
+  | {
+      kind: "knowledgeProposal";
+      id: string;
+      order: RenderOrderKey;
+      message: ChatMessage;
+    }
+  | {
+      kind: "memoryProposal";
+      id: string;
+      order: RenderOrderKey;
+      message: ChatMessage;
+    };
+
+export interface UnityConnectionStatus {
+  connected: boolean;
+  editorStatus: string;
+  scenePath?: string | null;
+  editorProcessState: UnityEditorProcessState;
+  editorProcessId?: number | null;
+  editorProcessPath?: string | null;
+  editorProjectPath?: string | null;
+  processCheckedAtMs?: number | null;
+  processLastError?: string | null;
+  pipeName: string;
+  latencyMs?: number | null;
+  reconnectAttempts: number;
+  lastError?: string | null;
+  checkedAtMs: number;
+}
+
+export interface SkillIntentItem {
+  dirName: string;
+  source: "app" | "project";
+  name: string;
+}
+
 export interface UserIntentMeta {
   kind: "user_intent_v1";
   mode: "build" | "plan";
@@ -176,6 +218,51 @@ export interface KnowledgeProposal {
   updatedAt: number;
 }
 
+export type MemoryCategory = "user" | "feedback" | "topic" | "reference";
+export type MemoryScope = "project" | "user";
+export type MemoryProposalStatus = KnowledgeProposalStatus;
+
+export interface MemoryEntry {
+  id: string;
+  category: MemoryCategory;
+  scope: MemoryScope;
+  content: string;
+  tags: string[];
+  pinned: boolean;
+  pinWeight: number;
+  accessCount: number;
+  lastAccessedAt: number;
+  createdAt: number;
+  updatedAt: number;
+  sourceSessionId?: string;
+  linkedDocPath?: string;
+}
+
+export interface MemoryProposalItem {
+  category: MemoryCategory;
+  content: string;
+  tags: string[];
+  scope: MemoryScope;
+}
+
+export interface MemoryProposal {
+  proposalId: string;
+  status: MemoryProposalStatus;
+  confidence: number;
+  verify: KnowledgeProposalVerify;
+  estTokens: number;
+  items: MemoryProposalItem[];
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface MemoryRetrieveHit {
+  entry: MemoryEntry;
+  score: number;
+  keywordScore: number;
+  semanticScore: number;
+}
+
 export interface ChatMessage {
   id: string;
   role: "user" | "assistant" | "tool";
@@ -195,6 +282,7 @@ export interface ChatMessage {
   thinkingSignature?: string;
   intentMeta?: UserIntentMeta;
   knowledgeProposal?: KnowledgeProposal;
+  memoryProposal?: MemoryProposal;
   renderParts?: AssistantRenderPart[];
 }
 
@@ -653,6 +741,7 @@ export type StreamEvent = { runId: string } & (
       output: string;
       outcome: ToolCallOutcome;
       images?: ImageAttachment[];
+      executionMeta?: ToolExecutionMeta;
     }
   | {
       type: "toolCallDelta";
@@ -689,6 +778,7 @@ export type StreamEvent = { runId: string } & (
       output: string;
       outcome: ToolCallOutcome;
       images?: ImageAttachment[];
+      executionMeta?: ToolExecutionMeta;
     }
   | {
       type: "toolCallRoundDone";
@@ -701,6 +791,7 @@ export type StreamEvent = { runId: string } & (
       renderParts?: AssistantRenderPart[];
     }
   | { type: "knowledgeProposal"; sessionId: string; message: ChatMessage }
+  | { type: "memoryProposal"; sessionId: string; message: ChatMessage }
   | {
       type: "usageUpdate";
       sessionId: string;
@@ -799,6 +890,7 @@ export interface BasicToolConfirmDisplay {
   kind: "basic";
   toolName: string;
   arguments: string;
+  workflowNote?: string;
 }
 
 export type KnowledgeToolConfirmDirectoryMode = "auto" | "approval";
@@ -2303,6 +2395,7 @@ export interface ToolCallDisplay {
   images?: ImageAttachment[];
   progress?: ToolCallProgress | null;
   nestedToolCalls?: ToolCallDisplay[];
+  executionMeta?: ToolExecutionMeta;
 }
 
 export interface ToolCallProgress {

@@ -200,6 +200,24 @@ async function updateViewWindowsAboveMain(value: boolean) {
 
     <div class="toggle-row">
       <BaseSwitch
+        :model-value="display.thinkingAutoOpen"
+        :aria-label="t('settings.display.thinkingAutoOpen')"
+        @update:model-value="setDisplay('thinkingAutoOpen', $event)"
+      />
+      <span>{{ t("settings.display.thinkingAutoOpen") }}</span>
+    </div>
+
+    <div class="toggle-row">
+      <BaseSwitch
+        :model-value="display.thinkingAutoExpand"
+        :aria-label="t('settings.display.thinkingAutoExpand')"
+        @update:model-value="setDisplay('thinkingAutoExpand', $event)"
+      />
+      <span>{{ t("settings.display.thinkingAutoExpand") }}</span>
+    </div>
+
+    <div class="toggle-row">
+      <BaseSwitch
         :model-value="display.rightAlignUserMessages"
         :aria-label="t('settings.display.rightAlignUserMessages')"
         @update:model-value="setDisplay('rightAlignUserMessages', $event)"
@@ -223,15 +241,6 @@ async function updateViewWindowsAboveMain(value: boolean) {
         @update:model-value="setDisplay('hideThinkingBlocks', $event)"
       />
       <span>{{ t("settings.display.hideThinkingBlocks") }}</span>
-    </div>
-
-    <div class="toggle-row">
-      <BaseSwitch
-        :model-value="display.showViewsInSessionPanel"
-        :aria-label="t('settings.display.showViewsInSessionPanel')"
-        @update:model-value="setDisplay('showViewsInSessionPanel', $event)"
-      />
-      <span>{{ t("settings.display.showViewsInSessionPanel") }}</span>
     </div>
 
     <div class="toggle-row" :class="{ disabled: !viewOpenInExistingWindowReady || viewOpenInExistingWindowBusy }">

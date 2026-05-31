@@ -3,6 +3,7 @@ use std::io::BufRead;
 use std::sync::Arc;
 use std::time::Instant;
 
+use futures::TryFutureExt;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
 
@@ -3690,6 +3691,216 @@ pub async fn set_rule_order(
         cfg.order = i as i32;
     }
     save_rule_config(&working_dir, &agent_id, &configs).map_err(Into::into)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WebpagePreviewResult {
+    pub title: String,
+    pub content: String,
+    pub url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WebpageImportResult {
+    pub path: String,
+    pub success: bool,
+}
+
+async fn fetch_webpage_content(url: &str) -> Result<(String, String), String> {
+    let parsed_url = url::Url::parse(url).map_err(|_| "Invalid URL")?;
+    if !matches!(parsed_url.scheme(), "http" | "https") {
+        return Err("URL must start with http:// or https://".to_string());
+    }
+
+    let client = crate::network::reqwest_client(
+        crate::network::ReqwestClientOptions::new()
+            .timeout(std::time::Duration::from_secs(30))
+            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.37")
+            .gzip(true)
+            .deflate(true),
+    )
+    .map_err(|e| format!("HTTP client error: {}", e))?;
+
+    let response = client
+        .get(parsed_url.as_str())
+        .send()
+        .await
+        .map_err(|e| format!("Request failed: {}", e))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!("HTTP error: {}", status));
+    }
+
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("text/html")
+        .to_string();
+
+    let body = response
+        .text()
+        .await
+        .map_err(|e| format!("Failed to read response: {}", e))?;
+
+    // Extract title from HTML
+    let title = if let Some(start) = body.find("<title") {
+        if let Some(tag_end) = body[start..].find('>') {
+            let after_tag = &body[start + tag_end + 1..];
+            if let Some(end) = after_tag.find("</title>") {
+                after_tag[..end].trim().to_string()
+            } else {
+                String::new()
+            }
+        } else {
+            String::new()
+        }
+    } else {
+        String::new()
+    };
+
+    // Simple HTML to markdown conversion
+    let mut markdown = body.clone();
+
+    // Remove script and style tags
+    while let Some(start) = markdown.find("<script") {
+        if let Some(end) = markdown[start..].find("</script>") {
+            markdown = format!("{}{}", &markdown[..start], &markdown[start + end + 9..]);
+        } else {
+            break;
+        }
+    }
+    while let Some(start) = markdown.find("<style") {
+        if let Some(end) = markdown[start..].find("</style>") {
+            markdown = format!("{}{}", &markdown[..start], &markdown[start + end + 8..]);
+        } else {
+            break;
+        }
+    }
+
+    // Replace common HTML elements with markdown
+    let replacements: Vec<(&str, &str)> = vec![
+        ("<h1>", "\n# "), ("</h1>", "\n"),
+        ("<h2>", "\n## "), ("</h2>", "\n"),
+        ("<h3>", "\n### "), ("</h3>", "\n"),
+        ("<h4>", "\n#### "), ("</h4>", "\n"),
+        ("<p>", "\n"), ("</p>", "\n"),
+        ("<br>", "\n"), ("<br/>", "\n"), ("<br />", "\n"),
+        ("<li>", "- "), ("</li>", "\n"),
+        ("<strong>", "**"), ("</strong>", "**"),
+        ("<b>", "**"), ("</b>", "**"),
+        ("<em>", "*"), ("</em>", "*"),
+        ("<i>", "*"), ("</i>", "*"),
+        ("<code>", "`"), ("</code>", "`"),
+        ("<pre>", "\n```\n"), ("</pre>", "\n```\n"),
+        ("<a href=\"", "["), ("\">", "]: "),
+        ("</a>", ""),
+        ("&nbsp;", " "),
+        ("&lt;", "<"), ("&gt;", ">"), ("&amp;", "&"),
+        ("&quot;", "\""),
+    ];
+
+    for (html, md) in replacements {
+        markdown = markdown.replace(html, md);
+    }
+
+    // Remove remaining HTML tags
+    let mut result = String::new();
+    let mut in_tag = false;
+    for c in markdown.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => result.push(c),
+            _ => {}
+        }
+    }
+
+    // Clean up whitespace
+    result = result
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    result = result.trim().to_string();
+
+    Ok((title, result))
+}
+
+#[tauri::command]
+pub async fn knowledge_preview_webpage(
+    url: String,
+) -> Result<WebpagePreviewResult, AppError> {
+    let (title, content) = fetch_webpage_content(&url).await.map_err(|e| AppError::new("fetch.webpage.failed", e))?;
+
+    Ok(WebpagePreviewResult {
+        title: if title.is_empty() { url.clone() } else { title },
+        content,
+        url,
+    })
+}
+
+#[tauri::command]
+pub async fn knowledge_import_webpage(
+    url: String,
+    title: Option<String>,
+    target_path: String,
+    app_handle: AppHandle,
+    workspace: State<'_, Arc<Workspace>>,
+    knowledge_index_state: State<'_, Arc<KnowledgeIndexState>>,
+) -> Result<WebpageImportResult, AppError> {
+    let working_dir = workspace.path.read().await.clone();
+    let app_knowledge_dir: State<'_, AppKnowledgeDir> = app_handle.state();
+
+    let (fetched_title, content) = fetch_webpage_content(&url).await.map_err(|e| AppError::new("fetch.webpage.failed", e))?;
+
+    let doc_title = title.unwrap_or_else(|| {
+        if fetched_title.is_empty() {
+            url.clone()
+        } else {
+            fetched_title
+        }
+    });
+
+    let file_name = format!("{}.md", doc_title.replace("/", "_").replace(" ", "_"));
+    let full_path = if target_path.is_empty() {
+        file_name
+    } else {
+        format!("{}/{}", target_path, file_name)
+    };
+
+    let request = KnowledgeCreateRequest {
+        kind: KnowledgeTargetKind::Document,
+        path: full_path.clone(),
+        doc_type: Some(KnowledgeType::Reference),
+        document: Some(KnowledgeDocumentPatch {
+            body: Some(Some(content)),
+            title: Some(doc_title),
+            ..Default::default()
+        }),
+    };
+
+    let result = execute_knowledge_create_request(&working_dir, request).map_err(AppError::from)?;
+
+    if let Some(document) = result.document {
+        knowledge_index::upsert_document(
+            knowledge_index_state.inner().clone(),
+            &working_dir,
+            app_knowledge_dir.0.as_ref().as_ref(),
+            document,
+        )
+        .await
+        .map_err(AppError::from)?;
+    }
+
+    emit_knowledge_changed(&app_handle, &working_dir, "knowledge_import_webpage");
+
+    Ok(WebpageImportResult {
+        path: full_path,
+        success: true,
+    })
 }
 
 #[cfg(test)]

@@ -182,10 +182,6 @@ const assetView = createLazyViewState(
   () => import("./components/AssetView.vue"),
   "loadAssetView",
 );
-const viewPackageView = createLazyViewState(
-  () => import("./components/ViewPackageView.vue"),
-  "loadViewPackageView",
-);
 const agentView = createLazyViewState(
   () => import("./components/AgentView.vue"),
   "loadAgentView",
@@ -214,10 +210,6 @@ const knowledgeViewError = knowledgeView.error;
 const assetViewComponent = assetView.component;
 const assetViewLoading = assetView.loading;
 const assetViewError = assetView.error;
-
-const viewPackageViewComponent = viewPackageView.component;
-const viewPackageViewLoading = viewPackageView.loading;
-const viewPackageViewError = viewPackageView.error;
 
 const agentViewComponent = agentView.component;
 const agentViewLoading = agentView.loading;
@@ -249,11 +241,6 @@ watch(() => uiStore.knowledgeMounted, (mounted) => {
 watch(() => uiStore.assetMounted, (mounted) => {
   if (!mounted) return;
   void assetView.ensureLoaded();
-}, { immediate: true });
-
-watch(() => uiStore.viewMounted, (mounted) => {
-  if (!mounted) return;
-  void viewPackageView.ensureLoaded();
 }, { immediate: true });
 
 watch(() => uiStore.agentMounted, (mounted) => {
@@ -813,11 +800,6 @@ watch(() => projectStore.workingDir, () => {
         >{{ t("app.tab.asset") }}</button>
         <button
           class="tab-item"
-          :class="{ active: uiStore.activeTab === 'views' }"
-          @click="uiStore.setTab('views')"
-        >{{ t("app.tab.views") }}</button>
-        <button
-          class="tab-item"
           :class="{ active: uiStore.activeTab === 'agent' }"
           @click="uiStore.setTab('agent')"
         >{{ t("app.tab.agent") }}</button>
@@ -996,20 +978,6 @@ watch(() => projectStore.workingDir, () => {
           :class="{ 'is-loading': assetViewLoading, 'is-error': !!assetViewError }"
         >
           {{ assetViewError || t("common.loading") }}
-        </div>
-
-        <component
-          :is="viewPackageViewComponent"
-          v-if="uiStore.viewMounted && viewPackageViewComponent"
-          v-show="uiStore.activeTab === 'views'"
-          :working-dir="projectStore.workingDir"
-        />
-        <div
-          v-else-if="uiStore.viewMounted && uiStore.activeTab === 'views'"
-          class="tab-loading-state"
-          :class="{ 'is-loading': viewPackageViewLoading, 'is-error': !!viewPackageViewError }"
-        >
-          {{ viewPackageViewError || t("common.loading") }}
         </div>
 
         <component
@@ -1383,6 +1351,19 @@ body {
 body.is-dragging-select-lock,
 body.is-dragging-select-lock * {
   user-select: none !important;
+}
+
+body.asset-ref-pointer-dragging {
+  cursor: grabbing;
+}
+
+body.asset-ref-pointer-dragging * {
+  cursor: grabbing;
+}
+
+.is-asset-ref-drop-hover {
+  outline: 2px solid var(--accent-color);
+  outline-offset: -2px;
 }
 
 .app-layout {
@@ -1943,14 +1924,29 @@ body.is-dragging-select-lock * {
 
 .tab-content {
   flex: 1;
-  display: flex;
   position: relative;
   z-index: 0;
+  min-width: 0;
   min-height: 0;
   overflow: hidden;
 }
 
-.tab-content > :is(.chat-workspace-view, .chat-view-layout, .collab-view, .knowledge-view, .asset-view, .view-package-view, .agent-view, .settings-panel) {
+.tab-content > :is(
+  .chat-workspace-view,
+  .chat-view-layout,
+  .collab-view,
+  .knowledge-view,
+  .asset-view,
+  .agent-view,
+  .settings-panel,
+  .perf-view,
+  .tab-loading-state
+) {
+  position: absolute;
+  inset: 0;
+  flex: 1 1 0;
+  width: 100%;
+  height: 100%;
   min-width: 0;
   min-height: 0;
   contain: layout paint;

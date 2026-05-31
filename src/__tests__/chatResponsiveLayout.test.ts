@@ -127,7 +127,9 @@ describe("chat responsive layout", () => {
     expect(app).not.toContain(".app-layout.is-window-resizing .main-area");
     expect(app).toContain("content-visibility: visible;");
     expect(app).not.toContain("transform: translateZ(0);");
-    expect(app).not.toContain(".app-layout.is-window-resizing .tab-content *");
+    expect(app).toMatch(/\.tab-content\s*\{[\s\S]*position:\s*relative;/);
+    expect(app).toMatch(/\.tab-content > :is\([\s\S]*\.tab-loading-state[\s\S]*position:\s*absolute;/);
+    expect(app).toMatch(/\.tab-content > :is\([\s\S]*\.knowledge-view[\s\S]*inset:\s*0;/);
     expect(app).toContain('class="tab-drag-region"');
     expect(app).toContain('@pointerdown="onTabBarPointerDown"');
     expect(app).toContain("startCurrentWindowDragging()");

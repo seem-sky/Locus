@@ -3,6 +3,10 @@
 import { ref, watch, nextTick } from "vue";
 import { t } from "../i18n";
 
+defineOptions({
+  inheritAttrs: false,
+});
+
 const props = defineProps<{
   thinking: string;
   isThinking: boolean;
@@ -23,7 +27,7 @@ watch(() => props.thinking, () => {
 </script>
 
 <template>
-  <aside class="thinking-panel">
+  <aside class="thinking-panel" :class="($attrs.class as string | undefined)">
     <div class="panel-header">
       <span class="panel-title">
         <span v-if="isThinking" class="thinking-dot" />
@@ -40,32 +44,30 @@ watch(() => props.thinking, () => {
 
 <style scoped>
 .thinking-panel {
-  width: 340px;
-  min-width: 340px;
-  height: 100%;
-  background: var(--sidebar-bg);
-  border-left: 1px solid var(--border-color);
   display: flex;
   flex-direction: column;
   user-select: text;
+  background: var(--sidebar-bg);
 }
 
 .panel-header {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 16px;
+  gap: 6px;
+  padding: 8px 12px;
   border-bottom: 1px solid var(--border-color);
   flex-shrink: 0;
+  min-height: 36px;
 }
 
 .panel-title {
   flex: 1;
-  font-size: 14px;
+  font-size: 13px;
   font-weight: 600;
+  line-height: 1.2;
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
 }
 
 .thinking-dot {
@@ -83,13 +85,13 @@ watch(() => props.thinking, () => {
 }
 
 .close-btn {
-  width: 24px;
-  height: 24px;
+  width: 22px;
+  height: 22px;
   border-radius: 4px;
   border: none;
   background: transparent;
   color: var(--text-secondary);
-  font-size: 16px;
+  font-size: 15px;
   cursor: pointer;
   display: flex;
   align-items: center;

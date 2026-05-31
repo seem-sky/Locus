@@ -6,6 +6,9 @@
   "bundle": {
     "resources": {
       "./gen/ort-runtime": "ort-runtime/",
+      "./gen/codegraph-bundle": "codegraph-bundle/",
+      "./gen/agentmemory-bundle": "agentmemory-bundle/",
+      "./gen/rtk": "rtk/",
       "./gen/managed-python": "managed-python/",
       "./gen/managed-git": "managed-git/"
     }

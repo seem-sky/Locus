@@ -240,6 +240,7 @@ fn build_interrupted_tool_result_message(
         thinking_duration: None,
         thinking_signature: None,
         knowledge_proposal: None,
+            memory_proposal: None,
         render_parts: None,
     }
 }
@@ -278,6 +279,7 @@ mod tests {
             thinking_duration: None,
             thinking_signature: None,
             knowledge_proposal: None,
+            memory_proposal: None,
             render_parts: None,
         }
     }
@@ -301,6 +303,7 @@ mod tests {
             thinking_duration: None,
             thinking_signature: None,
             knowledge_proposal: None,
+            memory_proposal: None,
             render_parts: None,
         }
     }
@@ -324,6 +327,7 @@ mod tests {
             thinking_duration: None,
             thinking_signature: None,
             knowledge_proposal: None,
+            memory_proposal: None,
             render_parts: None,
         }
     }
@@ -344,6 +348,7 @@ mod tests {
                         outcome: None,
                         recorded_output: None,
                         nested_tool_calls: None,
+                    execution_meta: None,
                     },
                     ToolCallInfo {
                         id: "tc-2".to_string(),
@@ -355,6 +360,7 @@ mod tests {
                         outcome: None,
                         recorded_output: None,
                         nested_tool_calls: None,
+                    execution_meta: None,
                     },
                 ],
             ),
@@ -387,6 +393,7 @@ mod tests {
                         outcome: None,
                         recorded_output: None,
                         nested_tool_calls: None,
+                    execution_meta: None,
                     },
                     ToolCallInfo {
                         id: "tc-2".to_string(),
@@ -398,6 +405,7 @@ mod tests {
                         outcome: None,
                         recorded_output: None,
                         nested_tool_calls: None,
+                    execution_meta: None,
                     },
                 ],
             ),
@@ -428,6 +436,7 @@ mod tests {
                     outcome: None,
                     recorded_output: None,
                     nested_tool_calls: None,
+                execution_meta: None,
                 }],
             ),
             tool_message("tool-valid", "tc-1", "valid"),
@@ -458,6 +467,7 @@ mod tests {
                     outcome: None,
                     recorded_output: None,
                     nested_tool_calls: None,
+                execution_meta: None,
                 }],
             ),
             tool_message("tool-first", "tc-1", "first"),
@@ -490,6 +500,7 @@ mod tests {
                         outcome: None,
                         recorded_output: None,
                         nested_tool_calls: None,
+                    execution_meta: None,
                     },
                     ToolCallInfo {
                         id: "tc-local".to_string(),
@@ -501,6 +512,7 @@ mod tests {
                         outcome: None,
                         recorded_output: None,
                         nested_tool_calls: None,
+                    execution_meta: None,
                     },
                 ],
             ),
@@ -526,6 +538,7 @@ mod tests {
                 outcome: None,
                 recorded_output: None,
                 nested_tool_calls: None,
+            execution_meta: None,
             }],
         )];
 
@@ -550,6 +563,7 @@ mod tests {
                         outcome: None,
                         recorded_output: None,
                         nested_tool_calls: None,
+                    execution_meta: None,
                     },
                     ToolCallInfo {
                         id: "tc-missing".to_string(),
@@ -561,6 +575,7 @@ mod tests {
                         outcome: None,
                         recorded_output: None,
                         nested_tool_calls: None,
+                    execution_meta: None,
                     },
                 ],
             ),
@@ -596,6 +611,7 @@ mod tests {
                     outcome: None,
                     recorded_output: None,
                     nested_tool_calls: None,
+                execution_meta: None,
                 }],
             ),
             tool_message("tool-1", "tc-1", "done"),
@@ -611,6 +627,7 @@ mod tests {
                     outcome: None,
                     recorded_output: None,
                     nested_tool_calls: None,
+                execution_meta: None,
                 }],
             ),
         ]);

@@ -1,7 +1,7 @@
 
 <script setup lang="ts">
 import { ref, nextTick, watch, computed, onMounted, onUnmounted } from "vue";
-import { PanelTopOpen } from "lucide";
+import { Folder, PanelTopOpen } from "lucide";
 import {
   selectUnityAsset,
   openUnityAssetInspector,
@@ -19,7 +19,9 @@ import SessionPanel from "./chat/SessionPanel.vue";
 import SessionCompactPicker from "./chat/SessionCompactPicker.vue";
 import ChatTranscript from "./chat/ChatTranscript.vue";
 import ChatStatusIndicators from "./chat/ChatStatusIndicators.vue";
+import MemoryContextIndicator from "./chat/MemoryContextIndicator.vue";
 import RichChatInput from "./chat/RichChatInput.vue";
+import ChatFloatingAssetPreview from "./chat/ChatFloatingAssetPreview.vue";
 import TokenUsageBar from "./chat/TokenUsageBar.vue";
 import AskUserCard from "./chat/AskUserCard.vue";
 import ToolConfirmCard from "./chat/ToolConfirmCard.vue";
@@ -69,13 +71,19 @@ import {
   getChatSubmitModifierLabel,
   useChatInputSettings,
 } from "../composables/useChatInputSettings";
-import { useDisplaySettings } from "../composables/useDisplaySettings";
+import { provideComposerAssetRefDrop } from "../composables/useComposerAssetRefDrop";
 import { useKnowledgeAccessMode } from "../composables/useKnowledgeAccessMode";
 import {
-  buildChatMessageClipboardPayload,
   buildUserMessageDraft,
   writeChatMessageClipboard,
 } from "../composables/chatMessageDraft";
+import {
+  buildChatMessageClipboardPayloadWithTarget,
+  canCopyMessageContextTarget,
+  parseMessageCopyTargetFromElement,
+  TRANSIENT_CHAT_MESSAGE_ID,
+  type MessageCopyTarget,
+} from "../composables/chatMessageCopy";
 import { logToolCollapseTrace, previewTraceText } from "../services/toolCollapseTrace";
 import {
   captureTranscriptLayoutSnapshot,
@@ -92,7 +100,6 @@ const uiStore = useUiStore();
 const notificationStore = useNotificationStore();
 const { state: shortcutState } = useKeyboardShortcuts();
 const { state: chatInputSettings } = useChatInputSettings();
-const { state: displaySettings } = useDisplaySettings();
 const { state: knowledgeAccessState, setMode: setKnowledgeAccessMode } = useKnowledgeAccessMode();
 
 const isPlanStreaming = computed(() => !!chatStore.pendingPlanRun && props.isStreaming);
@@ -149,6 +156,14 @@ const showInlineDiff = computed(() =>
   !!chatChangesStore.inlineDiffPayload || chatChangesStore.inlineDiffLoading || !!chatChangesStore.inlineDiffError,
 );
 const hasPanelToggleRow = computed(() => chatChangesStore.currentFileCount > 0);
+const showProjectViewFab = computed(() => !showInlineDiff.value);
+const projectViewFabActive = computed(() => chatStore.showProjectViewPanel);
+const projectViewFabTitle = computed(() =>
+  projectViewFabActive.value
+    ? t("chat.projectView.hide")
+    : t("chat.projectView.show"),
+);
+const floatingAssetPreview = computed(() => chatStore.floatingAssetPreview);
 
 const chatDiffViewerRef = ref<InstanceType<typeof FileDiffViewer> | null>(null);
 const chatDiffTabOptions = computed(() => [
@@ -297,6 +312,7 @@ type MessageContextMenuState = {
   x: number;
   y: number;
   messageId: string;
+  copyTarget: MessageCopyTarget;
 };
 
 const KNOWLEDGE_DOCUMENT_ROOT_RE = /^(design|memory|skill|reference)\/(.+\.md)$/i;
@@ -526,16 +542,23 @@ function handleContentContextMenu(e: MouseEvent) {
     return;
   }
 
-  const messageEl = e.target.closest("[data-chat-message-id]") as HTMLElement | null;
-  const hitMessageId = messageEl?.dataset.chatMessageId?.trim();
+  const { hitMessageId, copyTarget } = parseMessageCopyTargetFromElement(e.target);
   if (!hitMessageId) return;
-  const groupEl = messageEl?.closest("[data-chat-message-group-end-id]") as HTMLElement | null;
+  const groupEl = e.target.closest("[data-chat-message-group-end-id]") as HTMLElement | null;
   const groupEndMessageId = groupEl?.dataset.chatMessageGroupEndId?.trim();
   const messageId =
-    groupEl?.dataset.chatMessageGroupRole === "assistant" && groupEndMessageId
-      ? groupEndMessageId
-      : hitMessageId;
-  if (!props.messages.some((message) => message.id === messageId)) return;
+    hitMessageId === TRANSIENT_CHAT_MESSAGE_ID
+      ? TRANSIENT_CHAT_MESSAGE_ID
+      : groupEl?.dataset.chatMessageGroupRole === "assistant" && groupEndMessageId
+        ? groupEndMessageId
+        : hitMessageId;
+  const isTransientContext =
+    hitMessageId === TRANSIENT_CHAT_MESSAGE_ID
+    || (copyTarget.kind !== "message" && copyTarget.scope === "transient");
+  if (
+    !isTransientContext
+    && !props.messages.some((message) => message.id === messageId)
+  ) return;
 
   e.preventDefault();
   e.stopPropagation();
@@ -544,6 +567,7 @@ function handleContentContextMenu(e: MouseEvent) {
     x: e.clientX,
     y: e.clientY,
     messageId,
+    copyTarget,
   };
 }
 
@@ -573,7 +597,7 @@ function handleContentClick(e: MouseEvent) {
     const entryKind = workspaceRef.dataset.entryKind;
     if (!workspacePath) return;
     const knowledgeTarget = parseKnowledgeDocumentRefPath(workspacePath);
-    if (knowledgeTarget) {
+    if (knowledgeTarget?.kind === "knowledge") {
       handleKnowledgeRefClick(knowledgeTarget.docType, knowledgeTarget.path);
       return;
     }
@@ -616,7 +640,7 @@ function handleContentClick(e: MouseEvent) {
     const filePath = fileRef.dataset.filePath;
     if (!filePath) return;
     const knowledgeTarget = parseKnowledgeDocumentRefPath(filePath);
-    if (knowledgeTarget) {
+    if (knowledgeTarget?.kind === "knowledge") {
       handleKnowledgeRefClick(knowledgeTarget.docType, knowledgeTarget.path);
       return;
     }
@@ -820,7 +844,7 @@ const messageContextMessage = computed(() => {
 });
 
 const messageContextCanCopy = computed(() =>
-  !!messageContextMessage.value && messageContextMessage.value.role !== "tool",
+  canCopyMessageContextTarget(messageCtxMenu.value?.copyTarget, messageContextMessage.value),
 );
 
 const messageContextCanAct = computed(() =>
@@ -831,11 +855,20 @@ const messageContextCanAct = computed(() =>
 );
 
 async function doMessageCopy() {
-  const message = messageContextMessage.value;
-  if (!message || !messageContextCanCopy.value) return;
+  const menu = messageCtxMenu.value;
+  if (!menu || !messageContextCanCopy.value) return;
   closeMessageContextMenu();
   try {
-    await writeChatMessageClipboard(buildChatMessageClipboardPayload(message));
+    await writeChatMessageClipboard(buildChatMessageClipboardPayloadWithTarget(
+      messageContextMessage.value,
+      menu.copyTarget,
+      {
+        messages: props.messages,
+        liveRenderParts: props.liveRenderParts,
+        activeToolCalls: props.activeToolCalls,
+        streamingThinking: props.thinkingText,
+      },
+    ));
     notificationStore.addNotice("success", t("common.copied"), {
       operation: "messageCopy",
       replaceOperation: true,
@@ -874,6 +907,10 @@ const composerDrafts = ref(new Map<string, string>());
 const composerPanelRef = ref<InstanceType<typeof RichChatInput> | null>(null);
 const transcriptRef = ref<InstanceType<typeof ChatTranscript> | null>(null);
 
+provideComposerAssetRefDrop((refs) => {
+  composerPanelRef.value?.addAssetRefs(refs);
+});
+
 function draftSessionKey(sessionId: string | null) {
   return sessionId ?? NEW_CHAT_DRAFT_KEY;
 }
@@ -907,6 +944,12 @@ const latestConversationTurn = computed(() => {
     userMessage: props.messages[userIndex] ?? null,
     fileUndoTarget,
   };
+});
+
+const memoryQueryText = computed(() => {
+  const draft = inputText.value.trim();
+  if (draft) return draft;
+  return latestConversationTurn.value?.userMessage?.content.trim() ?? "";
 });
 
 function rollbackTargetForMessage(messageId: string) {
@@ -1146,7 +1189,11 @@ const isWaitingForResponse = computed(
 function hasRenderableTranscriptMessage(message: ChatMessage) {
   if (message.role === "tool") return false;
   const knowledgeStatus = message.knowledgeProposal?.status;
+  const memoryStatus = message.memoryProposal?.status;
   if (knowledgeStatus === "stale" || knowledgeStatus === "invalidated") {
+    return false;
+  }
+  if (memoryStatus === "stale" || memoryStatus === "invalidated") {
     return false;
   }
 
@@ -1164,6 +1211,7 @@ function hasRenderableTranscriptMessage(message: ChatMessage) {
     || message.thinkingContent
     || (message.toolCalls && message.toolCalls.length > 0)
     || message.knowledgeProposal
+    || message.memoryProposal
   );
 }
 
@@ -2274,22 +2322,29 @@ onUnmounted(() => {
       <div v-else-if="chatChangesStore.inlineDiffError" class="diff-inline-error">{{ chatChangesStore.inlineDiffError }}</div>
     </div>
 
-    <SessionPanel
+    <div
       v-show="showSessionPanel"
-      :sessions="sessions"
-      :active-session-id="activeSessionId"
-      :streaming-session-ids="streamingSessionIds"
-      :session-panel-width="sessionPanelWidth"
-      :working-dir="workingDir"
-      :show-views="displaySettings.showViewsInSessionPanel"
-      @select-session="emit('selectSession', $event)"
-      @new-chat="handleNewChatRequest"
-      @rename-session="(id: string, title: string) => emit('renameSession', id, title)"
-      @archive-session="emit('archiveSession', $event)"
-      @delete-session="emit('deleteSession', $event)"
-      @save-raw-context="emit('saveRawContext', $event)"
-      @toggle-panel-collapsed="setSessionPanelCollapsed(true)"
-    />
+      class="session-sidebar-stack"
+      :style="{
+        width: sessionPanelWidth + 'px',
+        minWidth: sessionPanelWidth + 'px',
+      }"
+    >
+      <SessionPanel
+        :sessions="sessions"
+        :active-session-id="activeSessionId"
+        :streaming-session-ids="streamingSessionIds"
+        :session-panel-width="sessionPanelWidth"
+        :working-dir="workingDir"
+        @select-session="emit('selectSession', $event)"
+        @new-chat="handleNewChatRequest"
+        @rename-session="(id: string, title: string) => emit('renameSession', id, title)"
+        @archive-session="emit('archiveSession', $event)"
+        @delete-session="emit('deleteSession', $event)"
+        @save-raw-context="emit('saveRawContext', $event)"
+        @toggle-panel-collapsed="setSessionPanelCollapsed(true)"
+      />
+    </div>
 
     <div v-show="showSessionPanel" class="session-divider" @mousedown="onSessionSplitterMouseDown"></div>
 
@@ -2305,12 +2360,23 @@ onUnmounted(() => {
         :streaming-session-ids="streamingSessionIds"
         :show-expand-panel-button="sessionPanelCollapsed && !isVerticalLayout"
         :working-dir="workingDir"
-        :show-views="displaySettings.showViewsInSessionPanel"
         @select-session="emit('selectSession', $event)"
         @new-chat="handleNewChatRequest"
         @expand-panel="setSessionPanelCollapsed(false)"
       />
       <div class="chat-main">
+        <button
+          v-if="showProjectViewFab"
+          type="button"
+          class="chat-project-view-fab ui-select-none"
+          :class="{ 'is-active': projectViewFabActive }"
+          :title="projectViewFabTitle"
+          :aria-label="projectViewFabTitle"
+          :aria-pressed="projectViewFabActive"
+          @click="chatStore.toggleProjectViewPanel()"
+        >
+          <LucideIcon :icon="Folder" :size="16" :stroke-width="2" />
+        </button>
         <ChatTranscript
           ref="transcriptRef"
           variant="session"
@@ -2347,6 +2413,8 @@ onUnmounted(() => {
           @open-image="openLightbox"
           @apply-knowledge-proposal="chatStore.applyKnowledgeProposal"
           @ignore-knowledge-proposal="chatStore.ignoreKnowledgeProposal"
+          @apply-memory-proposal="chatStore.applyMemoryProposal"
+          @ignore-memory-proposal="chatStore.ignoreMemoryProposal"
           @tool-handoff-quiet-change="handleToolHandoffQuietChange"
           @tool-viewport-anchor-start="handleToolViewportAnchorStart"
           @tool-viewport-anchor-end="handleToolViewportAnchorEnd"
@@ -2422,6 +2490,7 @@ onUnmounted(() => {
     <div
       v-if="!isViewingSubagent"
       class="input-area"
+      data-composer-asset-ref-drop
       :class="{
         'is-controls-collapsed': inputControlsCollapsed,
         'is-controls-switching': inputControlsSwitching,
@@ -2486,6 +2555,10 @@ onUnmounted(() => {
             @launch-unity-project="emit('launchUnityProject')"
             @update-knowledge-access-mode="setKnowledgeAccessMode"
           />
+          <MemoryContextIndicator
+            :working-dir="workingDir"
+            :query-text="memoryQueryText"
+          />
         </div>
         <div class="input-backdrop-action">
           <button
@@ -2537,6 +2610,13 @@ onUnmounted(() => {
         </template>
       </RichChatInput>
     </div>
+
+    <ChatFloatingAssetPreview
+      v-if="floatingAssetPreview && workingDir"
+      :working-dir="workingDir"
+      :path="floatingAssetPreview.path"
+      :name="floatingAssetPreview.name"
+    />
     </div><!-- /chat-view -->
 
     <Teleport to="body">
@@ -2724,9 +2804,23 @@ onUnmounted(() => {
   background: var(--sidebar-bg);
   flex-shrink: 0;
   min-height: 0;
-  height: 100%;
   overflow: hidden;
   contain: layout paint;
+}
+
+.session-sidebar-stack {
+  display: flex;
+  flex-direction: column;
+  flex-shrink: 0;
+  min-height: 0;
+  height: 100%;
+  overflow: hidden;
+  background: var(--sidebar-bg);
+}
+
+.session-sidebar-stack :deep(.session-panel) {
+  flex: 1 1 0;
+  height: auto;
 }
 
 .session-divider {
@@ -2996,6 +3090,42 @@ onUnmounted(() => {
   display: flex;
 }
 
+.chat-project-view-fab {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  z-index: 4;
+  width: 32px;
+  height: 32px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--bg-color) 88%, transparent);
+  color: var(--text-secondary);
+  box-shadow: 0 2px 8px color-mix(in srgb, var(--shadow-color, #000) 12%, transparent);
+  cursor: pointer;
+  backdrop-filter: blur(6px);
+  transition:
+    background 0.15s ease,
+    color 0.15s ease,
+    border-color 0.15s ease;
+}
+
+.chat-project-view-fab:hover,
+.chat-project-view-fab:focus-visible {
+  color: var(--text-color);
+  border-color: var(--text-secondary);
+  background: var(--hover-bg);
+}
+
+.chat-project-view-fab.is-active {
+  color: var(--text-color);
+  border-color: var(--accent-color, var(--text-secondary));
+  background: var(--active-bg);
+}
+
 .chat-empty-overlay {
   position: absolute;
   inset: 0;
@@ -3129,6 +3259,7 @@ onUnmounted(() => {
   justify-self: start;
   display: flex;
   align-items: center;
+  gap: 6px;
 }
 
 .input-backdrop-action {

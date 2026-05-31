@@ -10,11 +10,12 @@ import * as undoService from "../services/undo";
 import { buildToolResultMessages, mergeUserMessage, reduceStreamEvent, type StreamMutation } from "../composables/useStreamReducer";
 import { hydrateChatMessagesIntent, withClientMessageId } from "../composables/chatInputIntents";
 import type { SessionScrollState } from "../composables/chatScrollState";
-import { t } from "../i18n";
+import { locale, t } from "../i18n";
 import { useChatChangesStore } from "./chatChanges";
 import { useDisplaySettings } from "../composables/useDisplaySettings";
 import { useKnowledgeAccessMode } from "../composables/useKnowledgeAccessMode";
 import { useChatInputSettings } from "../composables/useChatInputSettings";
+import { resolveChatResponseLocale } from "../composables/useAgentResponseSettings";
 import { logToolCollapseTrace, previewTraceText } from "../services/toolCollapseTrace";
 import type {
   SessionSummary, SessionDetail, ChatMessage, TokenUsage,
@@ -22,6 +23,7 @@ import type {
   PendingQuestion, PendingToolConfirm,
   UserIntentMeta,
   KnowledgeProposalStatus,
+  MemoryProposalStatus,
   UndoConflictInfo,
   TodoSnapshot,
   TodoPanelMode,
@@ -293,6 +295,8 @@ export const useChatStore = defineStore("chat", () => {
   const todos = ref<TodoItem[]>([]);
   const todoWriteVersion = ref(0);
   const showTodoPanel = ref(false);
+  const showProjectViewPanel = ref(false);
+  const floatingAssetPreview = ref<{ path: string; name: string } | null>(null);
   const todoPanelVisibility = ref(new Map<string, boolean>());
   const todoMode = ref<TodoPanelMode>("current");
   const sessionLatestTodoRunIds = ref(new Map<string, string | null>());
@@ -996,6 +1000,53 @@ export const useChatStore = defineStore("chat", () => {
     return changed;
   }
 
+  function patchMemoryProposalOnMessage(
+    message: ChatMessage,
+    status: MemoryProposalStatus,
+    proposalId?: string,
+  ): ChatMessage | null {
+    const proposal = message.memoryProposal;
+    if (!proposal || proposal.status !== "pending") return null;
+    if (proposalId && proposal.proposalId !== proposalId) return null;
+    return {
+      ...message,
+      memoryProposal: {
+        ...proposal,
+        status,
+        updatedAt: Math.floor(Date.now() / 1000),
+      },
+    };
+  }
+
+  function updateMemoryProposalStatuses(status: MemoryProposalStatus, proposalId?: string) {
+    let changed = false;
+    messages.value = messages.value.map((message) => {
+      let next = message;
+      const patched = patchMemoryProposalOnMessage(message, status, proposalId);
+      if (patched) {
+        next = patched;
+        changed = true;
+      }
+      if (!message.renderParts?.length) {
+        return next;
+      }
+      let renderPartsChanged = false;
+      const renderParts = message.renderParts.map((part) => {
+        if (part.kind !== "memoryProposal") return part;
+        const patchedPartMessage = patchMemoryProposalOnMessage(part.message, status, proposalId);
+        if (!patchedPartMessage) return part;
+        renderPartsChanged = true;
+        return { ...part, message: patchedPartMessage };
+      });
+      if (!renderPartsChanged) {
+        return next;
+      }
+      changed = true;
+      return { ...next, renderParts };
+    });
+    return changed;
+  }
+
   function reconcileStreamingSessions(nextSessions: SessionSummary[]) {
     if (streamingSessionIds.value.size === 0) return;
 
@@ -1165,6 +1216,10 @@ export const useChatStore = defineStore("chat", () => {
       case "setThinking":
         isThinking.value = m.value;
         if (m.startTime !== undefined) thinkingStartTime.value = m.startTime;
+        if (m.value && useDisplaySettings().state.thinkingAutoOpen) {
+          thinkingPanelContent.value = "";
+          showThinkingPanel.value = true;
+        }
         break;
       case "updateThinkingDuration":
         thinkingDuration.value = m.duration;
@@ -1434,6 +1489,13 @@ export const useChatStore = defineStore("chat", () => {
     }
 
     if (event.type === "knowledgeProposal") {
+      if (event.sessionId === activeSessionId.value) {
+        applyMutation({ type: "upsertMessage", message: event.message });
+      }
+      return true;
+    }
+
+    if (event.type === "memoryProposal") {
       if (event.sessionId === activeSessionId.value) {
         applyMutation({ type: "upsertMessage", message: event.message });
       }
@@ -1848,6 +1910,27 @@ export const useChatStore = defineStore("chat", () => {
     showThinkingPanel.value = true;
   }
 
+  function closeProjectViewPanel() {
+    showProjectViewPanel.value = false;
+  }
+
+  function toggleProjectViewPanel() {
+    showProjectViewPanel.value = !showProjectViewPanel.value;
+  }
+
+  function openFloatingAssetPreview(target: { path: string; name: string }) {
+    const path = target.path.trim().replace(/\\/g, "/");
+    if (!path) return;
+    floatingAssetPreview.value = {
+      path,
+      name: target.name.trim() || path.split("/").filter(Boolean).pop() || path,
+    };
+  }
+
+  function closeFloatingAssetPreview() {
+    floatingAssetPreview.value = null;
+  }
+
   async function renameSession(id: string, title: string) {
     try {
       await sessionService.renameSession(id, title);
@@ -2063,10 +2146,16 @@ export const useChatStore = defineStore("chat", () => {
     }
 
     const staleSessionId = activeSessionId.value;
-    const markedStale = updateKnowledgeProposalStatuses("stale");
-    if (markedStale && staleSessionId) {
+    const markedKnowledgeStale = updateKnowledgeProposalStatuses("stale");
+    const markedMemoryStale = updateMemoryProposalStatuses("stale");
+    if (markedKnowledgeStale && staleSessionId) {
       sessionService.staleKnowledgeProposals(staleSessionId).catch((e) => {
         console.warn("stale_knowledge_proposals failed:", e);
+      });
+    }
+    if (markedMemoryStale && staleSessionId) {
+      sessionService.staleMemoryProposals(staleSessionId).catch((e) => {
+        console.warn("stale_memory_proposals failed:", e);
       });
     }
 
@@ -2130,6 +2219,7 @@ export const useChatStore = defineStore("chat", () => {
         userIntent,
         subagentModels: Object.keys(modelStore.modelDefaults.subagentModels).length > 0 ? modelStore.modelDefaults.subagentModels : null,
         knowledgeMode: knowledgeAccessState.mode,
+        responseLocale: resolveChatResponseLocale(locale.value),
       });
       logChatStreamDebug("chat request resolved", {
         sessionId: sid,
@@ -2231,6 +2321,7 @@ export const useChatStore = defineStore("chat", () => {
         userIntent: null,
         subagentModels: Object.keys(modelStore.modelDefaults.subagentModels).length > 0 ? modelStore.modelDefaults.subagentModels : null,
         knowledgeMode: knowledgeAccessState.mode,
+        responseLocale: resolveChatResponseLocale(locale.value),
       });
 
       logChatStreamDebug("compact request resolved", {
@@ -2471,6 +2562,30 @@ export const useChatStore = defineStore("chat", () => {
     await loadSessionState(sessionId);
   }
 
+  async function ignoreMemoryProposal(proposalId: string) {
+    if (!activeSessionId.value) return;
+    updateMemoryProposalStatuses("invalidated", proposalId);
+    try {
+      await sessionService.ignoreMemoryProposal(activeSessionId.value, proposalId);
+    } catch (e) {
+      console.error("ignore_memory_proposal failed:", e);
+      await loadSessionState(activeSessionId.value);
+    }
+  }
+
+  async function applyMemoryProposal(proposalId: string) {
+    if (!activeSessionId.value) return;
+    updateMemoryProposalStatuses("applying", proposalId);
+    try {
+      await sessionService.applyMemoryProposal(activeSessionId.value, proposalId);
+      useNotificationStore().addNotice("success", t("memory.saved"));
+    } catch (e) {
+      console.error("apply_memory_proposal failed:", e);
+      useNotificationStore().addNotice("error", normalizeAppError(e).message);
+      await loadSessionState(activeSessionId.value);
+    }
+  }
+
   async function checkUndoConflicts(assistantMessageId: string): Promise<UndoConflictInfo[]> {
     if (!activeSessionId.value) return [];
     return undoService.undoCheckConflicts(activeSessionId.value, assistantMessageId);
@@ -2638,6 +2753,12 @@ export const useChatStore = defineStore("chat", () => {
     todoCelebrationEnabled,
     todoMode,
     showTodoPanel,
+    showProjectViewPanel,
+    floatingAssetPreview,
+    openFloatingAssetPreview,
+    closeFloatingAssetPreview,
+    closeProjectViewPanel,
+    toggleProjectViewPanel,
     closeTodoPanel,
     toggleTodoPanel,
     setTodoMode,
@@ -2682,6 +2803,8 @@ export const useChatStore = defineStore("chat", () => {
     ignoreKnowledgeProposal,
     applyKnowledgeProposal,
     refreshSessionAfterExternalChange,
+    ignoreMemoryProposal,
+    applyMemoryProposal,
     checkUndoConflicts,
     performUndo,
     rollbackToMessage,
