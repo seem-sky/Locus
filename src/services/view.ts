@@ -37,6 +37,7 @@ export interface ViewManifest {
   name: string;
   version: string;
   template: string;
+  displayPath?: string | null;
   icon?: string | null;
   entry: string;
   style: string;
@@ -58,6 +59,7 @@ export interface ViewPackageSummary {
   version: string;
   template: string;
   icon?: string | null;
+  displayPath: string;
   packageRelPath?: string;
   packageRoot: string;
   manifestPath: string;
@@ -77,6 +79,7 @@ export interface ViewFolderSummary {
 export interface ViewTreeSnapshot {
   views: ViewPackageSummary[];
   folders: ViewFolderSummary[];
+  order?: string[];
 }
 
 export interface ViewPackageFile {
@@ -99,6 +102,7 @@ export interface ViewCreateRequest {
   name?: string | null;
   template?: string | null;
   icon?: string | null;
+  displayPath?: string | null;
   temporary?: boolean;
 }
 
@@ -111,9 +115,16 @@ export interface ViewDeleteEntryRequest {
   relPath: string;
 }
 
+export interface ViewRenameEntryRequest {
+  relPath: string;
+  name: string;
+}
+
 export interface ViewMoveEntryRequest {
   sourceRelPath: string;
   targetDirRelPath?: string | null;
+  insertBeforeRelPath?: string | null;
+  insertAfterRelPath?: string | null;
 }
 
 export interface ViewExportPackageRequest {
@@ -136,6 +147,29 @@ export interface ViewRunResult {
   windowLabel: string;
   hostUrl: string;
   packageRoot: string;
+}
+
+export interface ViewSetTabHostRequest {
+  hostLabel: string;
+  viewIds: string[];
+  keepExistingForHost?: boolean;
+}
+
+export interface ViewDetachTabRequest {
+  viewId: string;
+  sourceHostLabel?: string | null;
+  x?: number | null;
+  y?: number | null;
+}
+
+export interface ViewContentMountRequest {
+  viewId: string;
+  hostLabel: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  visible?: boolean;
 }
 
 export const VIEW_UNITY_CONNECTION_REQUIRED_ERROR_CODE = "view.unity_connection_required";
@@ -184,6 +218,22 @@ export interface ViewFrontendLogEntry {
   time: number;
   level: ViewFrontendLogLevel;
   message: string;
+}
+
+export interface ViewStorageGetRequest {
+  viewId: string;
+  key: string;
+}
+
+export interface ViewStorageSetRequest {
+  viewId: string;
+  key: string;
+  value: unknown;
+}
+
+export interface ViewStorageRemoveRequest {
+  viewId: string;
+  key: string;
 }
 
 export interface ViewAutomationRequest {
@@ -446,13 +496,23 @@ export interface ViewLlmCallResult {
 }
 
 export const VIEW_HOST_PATH = "/view-host";
+export const VIEW_CONTENT_PATH = "/view-content";
 
 export function isViewHostWindowLocation(): boolean {
   return window.location.pathname === VIEW_HOST_PATH;
 }
 
+export function isViewContentWindowLocation(): boolean {
+  return window.location.pathname === VIEW_CONTENT_PATH;
+}
+
 export function viewHostIdFromLocation(): string {
   return new URLSearchParams(window.location.search).get("id") || "";
+}
+
+export function isViewHostPoolWindowLocation(): boolean {
+  return window.location.pathname === VIEW_HOST_PATH
+    && new URLSearchParams(window.location.search).get("pool") === "1";
 }
 
 export function viewTemplates(): Promise<ViewTemplateSummary[]> {
@@ -479,6 +539,10 @@ export function viewDeleteEntry(request: ViewDeleteEntryRequest): Promise<ViewTr
   return ipcInvoke<ViewTreeSnapshot>("view_delete_entry", { request });
 }
 
+export function viewRenameEntry(request: ViewRenameEntryRequest): Promise<ViewTreeSnapshot> {
+  return ipcInvoke<ViewTreeSnapshot>("view_rename_entry", { request });
+}
+
 export function viewMoveEntry(request: ViewMoveEntryRequest): Promise<ViewTreeSnapshot> {
   return ipcInvoke<ViewTreeSnapshot>("view_move_entry", { request });
 }
@@ -503,6 +567,42 @@ export function viewReload(viewId: string): Promise<ViewPackageSummary> {
 
 export function viewRun(viewId: string): Promise<ViewRunResult> {
   return ipcInvoke<ViewRunResult>("view_run", { viewId });
+}
+
+export function viewRunInUnity(viewId: string): Promise<ViewRunResult> {
+  return ipcInvoke<ViewRunResult>("view_run_in_unity", { viewId });
+}
+
+export function viewSetTabHost(request: ViewSetTabHostRequest): Promise<void> {
+  return ipcInvoke<void>("view_set_tab_host", { request });
+}
+
+export function viewDetachTab(request: ViewDetachTabRequest): Promise<ViewRunResult> {
+  return ipcInvoke<ViewRunResult>("view_detach_tab", { request });
+}
+
+export function viewHostPoolPrepare(): Promise<ViewRunResult> {
+  return ipcInvoke<ViewRunResult>("view_host_pool_prepare");
+}
+
+export function viewHostPoolReady(hostLabel: string): Promise<void> {
+  return ipcInvoke<void>("view_host_pool_ready", { hostLabel });
+}
+
+export function viewHostRevealed(hostLabel: string): Promise<void> {
+  return ipcInvoke<void>("view_host_revealed", { hostLabel });
+}
+
+export function viewContentMount(request: ViewContentMountRequest): Promise<ViewRunResult> {
+  return ipcInvoke<ViewRunResult>("view_content_mount", { request });
+}
+
+export function viewContentHide(viewId: string): Promise<void> {
+  return ipcInvoke<void>("view_content_hide", { viewId });
+}
+
+export function viewContentDestroy(viewId: string): Promise<void> {
+  return ipcInvoke<void>("view_content_destroy", { viewId });
 }
 
 export function viewRequiresUnityConnection(
@@ -588,6 +688,18 @@ export function viewReadFrontendLog(request: ViewFrontendLogReadRequest): Promis
 
 export function viewOpenFrontendLog(viewId: string): Promise<void> {
   return ipcInvoke<void>("view_open_frontend_log", { viewId });
+}
+
+export function viewStorageGet(request: ViewStorageGetRequest): Promise<unknown | null> {
+  return ipcInvoke<unknown | null>("view_storage_get", { request });
+}
+
+export function viewStorageSet(request: ViewStorageSetRequest): Promise<void> {
+  return ipcInvoke<void>("view_storage_set", { request });
+}
+
+export function viewStorageRemove(request: ViewStorageRemoveRequest): Promise<void> {
+  return ipcInvoke<void>("view_storage_remove", { request });
 }
 
 export function viewAutomationRespond(

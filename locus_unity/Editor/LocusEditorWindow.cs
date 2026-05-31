@@ -29,15 +29,38 @@ namespace Locus
         private const double DesktopProbeIntervalSeconds = 2d;
         private const int PipeConnectTimeoutMs = 500;
         private const string CloseReasonWindowClosed = "windowClosed";
+        private const string CloseReasonWindowDisabled = "windowDisabled";
         private const string CloseReasonEditorQuit = "editorQuit";
         private const string CloseReasonDomainReload = "domainReload";
+        private const string DefaultWindowId = "session";
+        private const string DefaultTargetKind = "session";
+        private const string TargetKindSession = "session";
+        private const string TargetKindView = "view";
 
         private static readonly Encoding Utf8NoBom = new UTF8Encoding(false);
         private static Texture2D _titleIcon;
         private static bool _lifecycleHooksRegistered;
         private static bool _assemblyReloadInProgress;
         private static bool _editorQuitting;
-
+        private static bool _creatingFrontendWindow;
+        private static volatile bool _globalAssetDragStateSendInFlight;
+        private static double _nextGlobalAssetDragStateAt;
+        private static string _lastGlobalAssetDragSignature = "";
+        private static readonly DroppedAssetRef[] EmptyDroppedAssetRefs = new DroppedAssetRef[0];
+        private static readonly DroppedAssetRefKeyComparer DroppedAssetRefKeys =
+            new DroppedAssetRefKeyComparer();
+        private static readonly List<DroppedAssetRef> DroppedAssetRefsScratch =
+            new List<DroppedAssetRef>(16);
+        private static readonly HashSet<DroppedAssetRefKey> DroppedAssetRefsSeenScratch =
+            new HashSet<DroppedAssetRefKey>(DroppedAssetRefKeys);
+        private static readonly List<DroppedAssetRef> SelectedAssetRefsScratch =
+            new List<DroppedAssetRef>(16);
+        private static readonly HashSet<DroppedAssetRefKey> SelectedAssetRefsSeenScratch =
+            new HashSet<DroppedAssetRefKey>(DroppedAssetRefKeys);
+        private static readonly List<DroppedAssetRef> SanitizedAssetRefsScratch =
+            new List<DroppedAssetRef>(16);
+        private static readonly HashSet<DroppedAssetRefKey> SanitizedAssetRefsSeenScratch =
+            new HashSet<DroppedAssetRefKey>(DroppedAssetRefKeys);
         private double _nextSyncAt;
         private double _resizeBoostUntil;
         private volatile bool _sendInFlight;
@@ -62,17 +85,30 @@ namespace Locus
         private int _lastSentHeight;
         private bool _lastSentVisible;
         private long _lastSentParentHwnd;
+        private long _controlRevision;
         private double _nextDesktopProbeAt;
         private LocusDesktopInstall _desktopInstall = LocusDesktopInstall.NotFound;
         private bool _desktopProcessRunning;
         private volatile bool _desktopLaunchInFlight;
         private volatile bool _assetDragStateSendInFlight;
         private string _connectedPipeName = "";
+        [SerializeField] private string _windowId = DefaultWindowId;
+        [SerializeField] private string _targetKind = DefaultTargetKind;
+        [SerializeField] private string _targetId = "";
+        [SerializeField] private string _windowTitle = "Locus";
+        [SerializeField] private bool _frontendWindowConfigured = true;
+        private string _instanceId = "";
 
         [Serializable]
         private sealed class EmbedControlMessage
         {
             public string type;
+            public string windowId;
+            public string targetKind;
+            public string targetId;
+            public string title;
+            public string instanceId;
+            public long revision;
             public int x;
             public int y;
             public int width;
@@ -84,13 +120,55 @@ namespace Locus
         }
 
         [Serializable]
-        private sealed class DroppedAssetRef
+        internal sealed class OpenFrontendWindowRequest
+        {
+            public string windowId;
+            public string targetKind;
+            public string targetId;
+            public string title;
+            public string windowLabel;
+            public string hostUrl;
+        }
+
+        [Serializable]
+        internal sealed class DroppedAssetRef
         {
             public string path;
             public string kind;
             public string name;
             public string typeLabel;
             public string source;
+        }
+
+        private struct DroppedAssetRefKey
+        {
+            public readonly string Kind;
+            public readonly string Path;
+
+            public DroppedAssetRefKey(string kind, string path)
+            {
+                Kind = kind ?? "";
+                Path = path ?? "";
+            }
+        }
+
+        private sealed class DroppedAssetRefKeyComparer : IEqualityComparer<DroppedAssetRefKey>
+        {
+            public bool Equals(DroppedAssetRefKey left, DroppedAssetRefKey right)
+            {
+                return string.Equals(left.Kind, right.Kind, StringComparison.Ordinal)
+                    && string.Equals(left.Path, right.Path, StringComparison.OrdinalIgnoreCase);
+            }
+
+            public int GetHashCode(DroppedAssetRefKey key)
+            {
+                unchecked
+                {
+                    int kindHash = StringComparer.Ordinal.GetHashCode(key.Kind ?? "");
+                    int pathHash = StringComparer.OrdinalIgnoreCase.GetHashCode(key.Path ?? "");
+                    return (kindHash * 397) ^ pathHash;
+                }
+            }
         }
 
         private sealed class LocusDesktopInstall
@@ -111,9 +189,99 @@ namespace Locus
         public static void OpenWindow()
         {
             LocusEditorWindow window = GetWindow<LocusEditorWindow>();
-            window.titleContent = CreateTitleContent();
+            window.ConfigureFrontendWindow(DefaultWindowId, TargetKindSession, "", "Locus");
             window.minSize = new Vector2(360f, 420f);
             window.Show();
+            if (OverlaySyncEnabled)
+                window.SendOpenOrUpdate(true);
+        }
+
+        internal static string OpenFrontendWindowFromJson(string json)
+        {
+            OpenFrontendWindowRequest request = ParseOpenFrontendWindowRequest(json);
+            LocusEditorWindow window = OpenFrontendWindow(
+                request.windowId,
+                request.targetKind,
+                request.targetId,
+                request.title);
+            return window != null ? "ok" : "failed";
+        }
+
+        internal static LocusEditorWindow OpenFrontendWindow(
+            string windowId,
+            string targetKind,
+            string targetId,
+            string title)
+        {
+            EnsureLifecycleHooks();
+            string normalizedWindowId = NormalizeWindowId(windowId);
+            string normalizedTargetKind = NormalizeTargetKind(targetKind);
+            string normalizedTargetId = (targetId ?? "").Trim();
+            string normalizedTitle = NormalizeWindowTitle(title, normalizedTargetKind, normalizedTargetId);
+
+            LocusEditorWindow window = FindFrontendWindow(normalizedWindowId);
+            bool reused = window != null;
+            if (!reused)
+            {
+                _creatingFrontendWindow = true;
+                try
+                {
+                    window = CreateInstance<LocusEditorWindow>();
+                }
+                finally
+                {
+                    _creatingFrontendWindow = false;
+                }
+            }
+
+            window.ConfigureFrontendWindow(
+                normalizedWindowId,
+                normalizedTargetKind,
+                normalizedTargetId,
+                normalizedTitle);
+            window.minSize = new Vector2(360f, 420f);
+            window.Show();
+            window.Focus();
+            if (OverlaySyncEnabled)
+                window.SendOpenOrUpdate(true);
+            return window;
+        }
+
+        internal static bool QueueOutboundAssetDrag(
+            DroppedAssetRef[] assetRefs,
+            out string message)
+        {
+            DroppedAssetRef[] sanitized = SanitizeOutboundAssetDragRefs(assetRefs);
+            if (sanitized.Length == 0)
+            {
+                message = "No supported Unity references were provided.";
+                return false;
+            }
+
+            bool queued = LocusExternalAssetDragBridge.QueueAssetDrag(sanitized, out message);
+            if (queued)
+            {
+                foreach (LocusEditorWindow window in Resources.FindObjectsOfTypeAll<LocusEditorWindow>())
+                {
+                    if (window == null)
+                        continue;
+                    window._statusMessage = "Unity drag reference armed.";
+                    window.Repaint();
+                }
+            }
+            return queued;
+        }
+
+        internal static void CancelOutboundAssetDrag()
+        {
+            LocusExternalAssetDragBridge.CancelAssetDrag();
+            foreach (LocusEditorWindow window in Resources.FindObjectsOfTypeAll<LocusEditorWindow>())
+            {
+                if (window == null)
+                    continue;
+                window._statusMessage = "Unity drag reference cleared.";
+                window.Repaint();
+            }
         }
 
         [MenuItem("Assets/Send to Locus", false, 0)]
@@ -176,6 +344,107 @@ namespace Locus
             EditorApplication.quitting += OnEditorQuitting;
         }
 
+        private static OpenFrontendWindowRequest ParseOpenFrontendWindowRequest(string json)
+        {
+            string payload = (json ?? "").Trim();
+            if (payload.StartsWith("{", StringComparison.Ordinal))
+            {
+                try
+                {
+                    OpenFrontendWindowRequest request =
+                        JsonUtility.FromJson<OpenFrontendWindowRequest>(payload);
+                    if (request != null)
+                        return request;
+                }
+                catch (Exception ex)
+                {
+                    UnityEngine.Debug.LogWarning("[Locus] Failed to parse open_frontend_window payload: " + ex.Message);
+                }
+            }
+            return new OpenFrontendWindowRequest();
+        }
+
+        private static LocusEditorWindow FindFrontendWindow(string windowId)
+        {
+            foreach (LocusEditorWindow window in Resources.FindObjectsOfTypeAll<LocusEditorWindow>())
+            {
+                if (window == null)
+                    continue;
+                window.EnsureWindowIdentity();
+                if (string.Equals(window._windowId, windowId, StringComparison.Ordinal))
+                    return window;
+            }
+            return null;
+        }
+
+        private static string NormalizeWindowId(string windowId)
+        {
+            string value = (windowId ?? "").Trim();
+            return string.IsNullOrEmpty(value) ? DefaultWindowId : value;
+        }
+
+        private static string NormalizeTargetKind(string targetKind)
+        {
+            return string.Equals((targetKind ?? "").Trim(), TargetKindView, StringComparison.Ordinal)
+                ? TargetKindView
+                : TargetKindSession;
+        }
+
+        private static string NormalizeWindowTitle(
+            string title,
+            string targetKind,
+            string targetId)
+        {
+            string value = (title ?? "").Trim();
+            if (!string.IsNullOrEmpty(value))
+                return value;
+
+            if (string.Equals(targetKind, TargetKindView, StringComparison.Ordinal))
+                return string.IsNullOrEmpty(targetId) ? "View" : targetId;
+
+            return string.IsNullOrEmpty(targetId) ? "Locus" : "Locus Session (" + targetId + ")";
+        }
+
+        private void ConfigureFrontendWindow(
+            string windowId,
+            string targetKind,
+            string targetId,
+            string title)
+        {
+            _windowId = NormalizeWindowId(windowId);
+            _targetKind = NormalizeTargetKind(targetKind);
+            _targetId = (targetId ?? "").Trim();
+            _windowTitle = NormalizeWindowTitle(title, _targetKind, _targetId);
+            _frontendWindowConfigured = true;
+            EnsureInstanceId();
+            titleContent = CreateTitleContent(_windowTitle);
+        }
+
+        private void EnsureWindowIdentity()
+        {
+            _windowId = NormalizeWindowId(_windowId);
+            _targetKind = NormalizeTargetKind(_targetKind);
+            _targetId = (_targetId ?? "").Trim();
+            _windowTitle = NormalizeWindowTitle(_windowTitle, _targetKind, _targetId);
+            EnsureInstanceId();
+            titleContent = CreateTitleContent(_windowTitle);
+        }
+
+        private void EnsureInstanceId()
+        {
+            if (string.IsNullOrEmpty(_instanceId))
+                _instanceId = Guid.NewGuid().ToString("N");
+        }
+
+        private void BeginControlEpoch()
+        {
+            _instanceId = Guid.NewGuid().ToString("N");
+            _controlRevision = 0;
+            _sentOpen = false;
+            _hasLastSent = false;
+            _nextHeartbeatAt = 0d;
+        }
+
         private static void OnBeforeAssemblyReload()
         {
             _assemblyReloadInProgress = true;
@@ -194,13 +463,19 @@ namespace Locus
         private void OnEnable()
         {
             EnsureLifecycleHooks();
-            titleContent = CreateTitleContent();
+            if (_creatingFrontendWindow)
+                _frontendWindowConfigured = false;
+            else if (!_frontendWindowConfigured)
+                _frontendWindowConfigured = true;
+            EnsureWindowIdentity();
+            BeginControlEpoch();
             minSize = new Vector2(360f, 420f);
             RefreshDesktopState(true);
             if (OverlaySyncEnabled)
             {
                 EditorApplication.update += SyncOverlay;
-                SendOpenOrUpdate(true);
+                if (_frontendWindowConfigured)
+                    SendOpenOrUpdate(true);
             }
         }
 
@@ -208,10 +483,22 @@ namespace Locus
         {
             if (OverlaySyncEnabled)
             {
+                string reason = GetDisableCloseReason();
                 EditorApplication.update -= SyncOverlay;
-                SendClose(GetCloseReason());
+                if (_frontendWindowConfigured)
+                    SendClose(reason);
             }
             DisconnectPipe();
+        }
+
+        private void OnDestroy()
+        {
+            if (!OverlaySyncEnabled || !_frontendWindowConfigured)
+                return;
+            if (_editorQuitting || _assemblyReloadInProgress)
+                return;
+
+            SendClose(CloseReasonWindowClosed);
         }
 
         private void OnFocus()
@@ -249,6 +536,8 @@ namespace Locus
 
         private void SendOpenOrUpdate(bool force)
         {
+            if (!_frontendWindowConfigured)
+                return;
             if (_sendInFlight && !force)
                 return;
 
@@ -262,7 +551,8 @@ namespace Locus
 
         private void SendClose(string reason)
         {
-            SendControlMessage(BuildMessage("close", false, reason), true);
+            EmbedControlMessage message = BuildMessage("close", false, reason);
+            SendControlMessage(message, true);
             _sentOpen = false;
         }
 
@@ -274,6 +564,11 @@ namespace Locus
             SendControlMessage(new EmbedControlMessage
             {
                 type = "assetDrop",
+                windowId = _windowId,
+                targetKind = _targetKind,
+                targetId = _targetId,
+                title = _windowTitle,
+                instanceId = _instanceId,
                 assetRefs = assetRefs
             }, true);
         }
@@ -311,6 +606,11 @@ namespace Locus
             string json = JsonUtility.ToJson(new EmbedControlMessage
             {
                 type = "assetDrag",
+                windowId = _windowId,
+                targetKind = _targetKind,
+                targetId = _targetId,
+                title = _windowTitle,
+                instanceId = _instanceId,
                 assetRefs = assetRefs
             });
             string pipeName = GetControlPipeName();
@@ -333,13 +633,91 @@ namespace Locus
             });
         }
 
-        private string GetCloseReason()
+        internal static void PublishCurrentUnityAssetDragState(bool force)
+        {
+            DroppedAssetRef[] assetRefs = BuildDroppedAssetRefs();
+            if (assetRefs.Length == 0)
+            {
+                ClearPublishedUnityAssetDragState();
+                return;
+            }
+
+            double now = EditorApplication.timeSinceStartup;
+            string signature = BuildAssetRefsSignature(assetRefs);
+            if (!force
+                && string.Equals(signature, _lastGlobalAssetDragSignature, StringComparison.Ordinal)
+                && now < _nextGlobalAssetDragStateAt)
+                return;
+
+            _lastGlobalAssetDragSignature = signature;
+            _nextGlobalAssetDragStateAt = now + AssetDragStateRefreshSeconds;
+            SendAssetDragStateMessageOnce(assetRefs);
+        }
+
+        internal static bool HasCurrentUnityDragAndDropRefs()
+        {
+            return HasAnyDragAndDropObjectReferences()
+                || HasAnyDragAndDropPaths();
+        }
+
+        internal static void ClearPublishedUnityAssetDragState()
+        {
+            if (_lastGlobalAssetDragSignature.Length == 0)
+                return;
+
+            _lastGlobalAssetDragSignature = "";
+            _nextGlobalAssetDragStateAt = 0d;
+            SendAssetDragStateMessageOnce(EmptyDroppedAssetRefs);
+        }
+
+        private static bool HasAnyDragAndDropObjectReferences()
+        {
+            UnityEngine.Object[] objects = DragAndDrop.objectReferences;
+            return objects != null && objects.Length > 0;
+        }
+
+        private static bool HasAnyDragAndDropPaths()
+        {
+            string[] paths = DragAndDrop.paths;
+            return paths != null && paths.Length > 0;
+        }
+
+        private static void SendAssetDragStateMessageOnce(DroppedAssetRef[] assetRefs)
+        {
+            if (assetRefs == null || _globalAssetDragStateSendInFlight)
+                return;
+
+            string json = JsonUtility.ToJson(new EmbedControlMessage
+            {
+                type = "assetDrag",
+                assetRefs = assetRefs
+            });
+            string pipeName = GetControlPipeName();
+            _globalAssetDragStateSendInFlight = true;
+
+            Task.Run(() =>
+            {
+                try
+                {
+                    WritePipeLineOnce(pipeName, json);
+                }
+                catch
+                {
+                }
+                finally
+                {
+                    _globalAssetDragStateSendInFlight = false;
+                }
+            });
+        }
+
+        private string GetDisableCloseReason()
         {
             if (_editorQuitting)
                 return CloseReasonEditorQuit;
             if (_assemblyReloadInProgress)
                 return CloseReasonDomainReload;
-            return CloseReasonWindowClosed;
+            return CloseReasonWindowDisabled;
         }
 
         private EmbedControlMessage BuildMessage(string type, bool visible, string reason = "")
@@ -350,6 +728,12 @@ namespace Locus
             return new EmbedControlMessage
             {
                 type = type,
+                windowId = _windowId,
+                targetKind = _targetKind,
+                targetId = _targetId,
+                title = _windowTitle,
+                instanceId = _instanceId,
+                revision = ++_controlRevision,
                 x = _screenX,
                 y = _screenY,
                 width = _screenWidth,
@@ -383,78 +767,94 @@ namespace Locus
 
         private static DroppedAssetRef[] BuildDroppedAssetRefs()
         {
-            List<DroppedAssetRef> refs = new List<DroppedAssetRef>();
-            HashSet<string> seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            List<DroppedAssetRef> refs = DroppedAssetRefsScratch;
+            HashSet<DroppedAssetRefKey> seen = DroppedAssetRefsSeenScratch;
 
-            UnityEngine.Object[] objects = DragAndDrop.objectReferences;
-            if (objects != null)
+            try
             {
-                foreach (UnityEngine.Object obj in objects)
+                UnityEngine.Object[] objects = DragAndDrop.objectReferences;
+                if (objects != null)
                 {
-                    DroppedAssetRef assetRef = BuildDroppedObjectRef(obj);
-                    AddDroppedAssetRef(refs, seen, assetRef);
-                }
-            }
-
-            string[] paths = DragAndDrop.paths;
-            if (paths != null)
-            {
-                foreach (string path in paths)
-                {
-                    string normalizedPath = NormalizeProjectRelativePath(path);
-                    if (!IsSupportedUnityRefPath(normalizedPath))
-                        continue;
-                    AddDroppedAssetRef(refs, seen, new DroppedAssetRef
+                    foreach (UnityEngine.Object obj in objects)
                     {
-                        path = normalizedPath,
-                        kind = "asset",
-                        name = Path.GetFileNameWithoutExtension(normalizedPath),
-                        typeLabel = "",
-                        source = "unity"
-                    });
+                        DroppedAssetRef assetRef = BuildDroppedObjectRef(obj);
+                        AddDroppedAssetRef(refs, seen, assetRef);
+                    }
                 }
-            }
 
-            return refs.ToArray();
+                string[] paths = DragAndDrop.paths;
+                if (paths != null)
+                {
+                    foreach (string path in paths)
+                    {
+                        string normalizedPath = NormalizeProjectRelativePath(path);
+                        if (!IsSupportedUnityRefPath(normalizedPath))
+                            continue;
+                        AddDroppedAssetRef(refs, seen, new DroppedAssetRef
+                        {
+                            path = normalizedPath,
+                            kind = "asset",
+                            name = Path.GetFileNameWithoutExtension(normalizedPath),
+                            typeLabel = "",
+                            source = "unity"
+                        });
+                    }
+                }
+
+                return refs.Count == 0 ? EmptyDroppedAssetRefs : refs.ToArray();
+            }
+            finally
+            {
+                refs.Clear();
+                seen.Clear();
+            }
         }
 
         private static DroppedAssetRef[] BuildSelectedAssetRefs()
         {
-            List<DroppedAssetRef> refs = new List<DroppedAssetRef>();
-            HashSet<string> seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            List<DroppedAssetRef> refs = SelectedAssetRefsScratch;
+            HashSet<DroppedAssetRefKey> seen = SelectedAssetRefsSeenScratch;
 
-            UnityEngine.Object[] objects = Selection.objects;
-            if (objects != null)
+            try
             {
-                foreach (UnityEngine.Object obj in objects)
+                UnityEngine.Object[] objects = Selection.objects;
+                if (objects != null)
                 {
-                    DroppedAssetRef assetRef = BuildDroppedObjectRef(obj);
-                    AddDroppedAssetRef(refs, seen, assetRef);
-                }
-            }
-
-            string[] assetGuids = Selection.assetGUIDs;
-            if (assetGuids != null)
-            {
-                foreach (string guid in assetGuids)
-                {
-                    string path = NormalizeUnityPath(AssetDatabase.GUIDToAssetPath(guid));
-                    if (!IsSupportedUnityRefPath(path))
-                        continue;
-
-                    UnityEngine.Object obj = AssetDatabase.LoadMainAssetAtPath(path);
-                    AddDroppedAssetRef(refs, seen, new DroppedAssetRef
+                    foreach (UnityEngine.Object obj in objects)
                     {
-                        path = path,
-                        kind = "asset",
-                        name = obj != null ? obj.name : Path.GetFileNameWithoutExtension(path),
-                        typeLabel = obj != null ? obj.GetType().Name : "",
-                        source = "unity"
-                    });
+                        DroppedAssetRef assetRef = BuildDroppedObjectRef(obj);
+                        AddDroppedAssetRef(refs, seen, assetRef);
+                    }
                 }
-            }
 
-            return refs.ToArray();
+                string[] assetGuids = Selection.assetGUIDs;
+                if (assetGuids != null)
+                {
+                    foreach (string guid in assetGuids)
+                    {
+                        string path = NormalizeUnityPath(AssetDatabase.GUIDToAssetPath(guid));
+                        if (!IsSupportedUnityRefPath(path))
+                            continue;
+
+                        UnityEngine.Object obj = AssetDatabase.LoadMainAssetAtPath(path);
+                        AddDroppedAssetRef(refs, seen, new DroppedAssetRef
+                        {
+                            path = path,
+                            kind = "asset",
+                            name = obj != null ? obj.name : Path.GetFileNameWithoutExtension(path),
+                            typeLabel = obj != null ? obj.GetType().Name : "",
+                            source = "unity"
+                        });
+                    }
+                }
+
+                return refs.Count == 0 ? EmptyDroppedAssetRefs : refs.ToArray();
+            }
+            finally
+            {
+                refs.Clear();
+                seen.Clear();
+            }
         }
 
         private static string BuildAssetRefsSignature(DroppedAssetRef[] assetRefs)
@@ -470,6 +870,48 @@ namespace Locus
                 sb.Append(assetRef.kind).Append('\n').Append(assetRef.path).Append('\n');
             }
             return sb.ToString();
+        }
+
+        private static DroppedAssetRef[] SanitizeOutboundAssetDragRefs(DroppedAssetRef[] assetRefs)
+        {
+            if (assetRefs == null || assetRefs.Length == 0)
+                return EmptyDroppedAssetRefs;
+
+            List<DroppedAssetRef> sanitized = SanitizedAssetRefsScratch;
+            HashSet<DroppedAssetRefKey> seen = SanitizedAssetRefsSeenScratch;
+
+            try
+            {
+                foreach (DroppedAssetRef assetRef in assetRefs)
+                {
+                    if (assetRef == null)
+                        continue;
+
+                    string path = NormalizeUnityPath(assetRef.path);
+                    string kind = (assetRef.kind ?? "").Trim();
+                    if (string.IsNullOrEmpty(path) || (kind != "asset" && kind != "sceneObject"))
+                        continue;
+
+                    if (!seen.Add(new DroppedAssetRefKey(kind, path)))
+                        continue;
+
+                    sanitized.Add(new DroppedAssetRef
+                    {
+                        path = path,
+                        kind = kind,
+                        name = (assetRef.name ?? "").Trim(),
+                        typeLabel = (assetRef.typeLabel ?? "").Trim(),
+                        source = (assetRef.source ?? "").Trim()
+                    });
+                }
+
+                return sanitized.Count == 0 ? EmptyDroppedAssetRefs : sanitized.ToArray();
+            }
+            finally
+            {
+                sanitized.Clear();
+                seen.Clear();
+            }
         }
 
         private static DroppedAssetRef BuildDroppedObjectRef(UnityEngine.Object obj)
@@ -521,18 +963,14 @@ namespace Locus
 
         private static void AddDroppedAssetRef(
             List<DroppedAssetRef> refs,
-            HashSet<string> seen,
+            HashSet<DroppedAssetRefKey> seen,
             DroppedAssetRef assetRef)
         {
             if (assetRef == null || string.IsNullOrEmpty(assetRef.path))
                 return;
 
-            string key = assetRef.kind + "\n" + assetRef.path;
-            if (seen.Contains(key))
-                return;
-
-            seen.Add(key);
-            refs.Add(assetRef);
+            if (seen.Add(new DroppedAssetRefKey(assetRef.kind, assetRef.path)))
+                refs.Add(assetRef);
         }
 
         private static string BuildHierarchyPath(Transform transform)
@@ -815,7 +1253,7 @@ namespace Locus
                 Mathf.Min(116f, inner.width),
                 24f);
 
-            GUI.Label(titleRect, "Locus", EditorStyles.boldLabel);
+            GUI.Label(titleRect, _windowTitle, EditorStyles.boldLabel);
             GUI.Label(statusRect, _statusMessage, EditorStyles.wordWrappedLabel);
             EditorGUI.SelectableLabel(pipeRect, GetFullControlPipeName(), EditorStyles.miniLabel);
             if (!string.IsNullOrEmpty(executablePathText))
@@ -1299,9 +1737,9 @@ namespace Locus
             return FullPipeNamePrefix + GetControlPipeName();
         }
 
-        private static GUIContent CreateTitleContent()
+        private static GUIContent CreateTitleContent(string title)
         {
-            return new GUIContent("Locus", GetTitleIcon());
+            return new GUIContent(string.IsNullOrEmpty(title) ? "Locus" : title, GetTitleIcon());
         }
 
         private static Texture2D GetTitleIcon()

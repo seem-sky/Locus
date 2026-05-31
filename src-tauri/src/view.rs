@@ -7,10 +7,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use notify::{Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter, Manager, WebviewUrl};
+use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, WebviewUrl};
 
 pub const VIEW_SCHEMA: &str = "locus.view.v1";
 pub const VIEW_BINDINGS_SCHEMA: &str = "locus.view.bindings.v1";
+pub const VIEW_TREE_METADATA_SCHEMA: &str = "locus.view.tree.v1";
 pub const VIEW_ROOT_RELATIVE: &str = "Locus/View";
 pub const VIEW_WORKSPACE_SRC_DIR: &str = "src";
 pub const TEMP_VIEW_ROOT_RELATIVE: &str = "view-packages";
@@ -18,11 +19,23 @@ pub const VIEW_RELOAD_EVENT: &str = "view-package-reloaded";
 pub const VIEW_TREE_CHANGED_EVENT: &str = "view-tree-changed";
 pub const VIEW_AUTOMATION_REQUEST_EVENT: &str = "view-automation-request";
 
+const MAIN_WINDOW_LABEL: &str = "main";
 const VIEW_HOST_ROUTE: &str = "/view-host";
+const VIEW_CONTENT_ROUTE: &str = "/view-content";
+const VIEW_HOST_TABS_MERGE_EVENT: &str = "view-host-tabs-merge";
+const VIEW_HOST_TABS_SELECT_EVENT: &str = "view-host-tabs-select";
 const VIEW_FRONTEND_LOG_REL_PATH: &str = ".locus/logs/frontend.log";
 const VIEW_FRONTEND_LOG_MAX_CHARS: usize = 16_384;
 const VIEW_PACKAGE_ARCHIVE_MAX_ENTRIES: usize = 20_000;
 const VIEW_PACKAGE_ARCHIVE_MAX_UNCOMPRESSED_BYTES: u64 = 256 * 1024 * 1024;
+const VIEW_WINDOW_LABEL_PREFIX: &str = "view-";
+const VIEW_HOST_POOL_LABEL_PREFIX: &str = "view-pool-";
+const VIEW_HOST_POOL_ROUTE: &str = "/view-host?pool=1";
+const VIEW_CONTENT_WINDOW_LABEL_PREFIX: &str = "view-content-";
+const UNITY_EMBED_VIEW_WINDOW_LABEL_PREFIX: &str = "unity-embed-view-";
+const VIEW_CONTENT_DESTROY_DELAY: Duration = Duration::from_secs(30);
+const VIEW_TREE_METADATA_REL_PATH: &str = ".locus/view-tree.json";
+const VIEW_STORAGE_REL_PATH: &str = ".locus/data/storage.json";
 
 mod templates;
 
@@ -127,6 +140,8 @@ pub struct ViewManifest {
     pub version: String,
     pub template: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icon: Option<String>,
     pub entry: String,
     pub style: String,
@@ -151,6 +166,8 @@ pub struct ViewCreateRequest {
     pub template: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icon: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -170,6 +187,7 @@ pub struct ViewPackageSummary {
     pub template: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub icon: Option<String>,
+    pub display_path: String,
     pub package_rel_path: String,
     pub package_root: String,
     pub manifest_path: String,
@@ -194,6 +212,18 @@ pub struct ViewFolderSummary {
 pub struct ViewTreeSnapshot {
     pub views: Vec<ViewPackageSummary>,
     pub folders: Vec<ViewFolderSummary>,
+    pub order: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ViewTreeMetadata {
+    #[serde(default = "default_view_tree_metadata_schema")]
+    schema: String,
+    #[serde(default)]
+    folders: Vec<String>,
+    #[serde(default)]
+    order: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -212,10 +242,21 @@ pub struct ViewDeleteEntryRequest {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ViewRenameEntryRequest {
+    pub rel_path: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ViewMoveEntryRequest {
     pub source_rel_path: String,
     #[serde(default)]
     pub target_dir_rel_path: Option<String>,
+    #[serde(default)]
+    pub insert_before_rel_path: Option<String>,
+    #[serde(default)]
+    pub insert_after_rel_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -265,6 +306,48 @@ pub struct ViewRunResult {
     pub window_label: String,
     pub host_url: String,
     pub package_root: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ViewSetTabHostRequest {
+    pub host_label: String,
+    pub view_ids: Vec<String>,
+    #[serde(default)]
+    pub keep_existing_for_host: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ViewDetachTabRequest {
+    pub view_id: String,
+    #[serde(default)]
+    pub source_host_label: Option<String>,
+    #[serde(default)]
+    pub x: Option<f64>,
+    #[serde(default)]
+    pub y: Option<f64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ViewContentMountRequest {
+    pub view_id: String,
+    pub host_label: String,
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+    #[serde(default = "default_view_content_visible")]
+    pub visible: bool,
+}
+
+fn default_view_content_visible() -> bool {
+    true
+}
+
+fn default_view_tree_metadata_schema() -> String {
+    VIEW_TREE_METADATA_SCHEMA.to_string()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -327,6 +410,29 @@ pub struct ViewFrontendLogEntry {
     pub time: i64,
     pub level: String,
     pub message: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ViewStorageGetRequest {
+    pub view_id: String,
+    pub key: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ViewStorageSetRequest {
+    pub view_id: String,
+    pub key: String,
+    #[serde(default)]
+    pub value: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ViewStorageRemoveRequest {
+    pub view_id: String,
+    pub key: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -661,6 +767,56 @@ fn normalize_view_tree_rel_path(value: &str, allow_empty: bool) -> Result<String
     Ok(normalized)
 }
 
+fn normalize_view_display_path(value: &str) -> Result<String, String> {
+    normalize_view_tree_rel_path(value, false)
+}
+
+fn normalize_optional_view_display_path(value: Option<&str>) -> Result<Option<String>, String> {
+    match value.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(value) => normalize_view_display_path(value).map(Some),
+        None => Ok(None),
+    }
+}
+
+fn view_path_dirname(rel_path: &str) -> String {
+    let mut parts = rel_path.split('/').collect::<Vec<_>>();
+    parts.pop();
+    parts.join("/")
+}
+
+fn view_path_basename(rel_path: &str) -> Result<String, String> {
+    normalize_view_tree_rel_path(rel_path, false)?
+        .rsplit('/')
+        .next()
+        .map(str::to_string)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("Invalid View path: {}", rel_path))
+}
+
+fn join_view_display_path(parent: &str, name: &str) -> String {
+    let parent = parent.trim_matches('/');
+    if parent.is_empty() {
+        name.to_string()
+    } else {
+        format!("{}/{}", parent, name)
+    }
+}
+
+fn display_path_is_under(path: &str, parent: &str) -> bool {
+    path == parent || path.starts_with(&format!("{}/", parent))
+}
+
+fn replace_display_path_prefix(path: &str, source: &str, target: &str) -> String {
+    if path == source {
+        return target.to_string();
+    }
+    let suffix = path
+        .strip_prefix(&format!("{}/", source))
+        .unwrap_or(path)
+        .trim_start_matches('/');
+    join_view_display_path(target, suffix)
+}
+
 fn normalize_view_folder_name(value: &str) -> Result<String, String> {
     let name = value.trim();
     if name.is_empty() {
@@ -679,6 +835,14 @@ fn normalize_view_folder_name(value: &str) -> Result<String, String> {
     Ok(name.to_string())
 }
 
+fn normalize_view_name(value: &str) -> Result<String, String> {
+    let name = value.trim();
+    if name.is_empty() {
+        return Err("View name cannot be empty.".to_string());
+    }
+    Ok(name.to_string())
+}
+
 pub fn validate_view_manifest(manifest: &ViewManifest) -> Result<(), String> {
     if manifest.schema != VIEW_SCHEMA {
         return Err(format!("Unsupported View schema: {}", manifest.schema));
@@ -692,6 +856,14 @@ pub fn validate_view_manifest(manifest: &ViewManifest) -> Result<(), String> {
     }
     if !templates::is_supported_template(&manifest.template) {
         return Err(format!("Unsupported View template: {}", manifest.template));
+    }
+    if let Some(display_path) = manifest
+        .display_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        normalize_view_display_path(display_path)?;
     }
     if let Some(icon) = manifest
         .icon
@@ -925,23 +1097,36 @@ fn manifest_path(root: &Path) -> PathBuf {
     root.join("view.json")
 }
 
-fn view_tree_path(views_root: &Path, rel_path: &str, allow_empty: bool) -> Result<PathBuf, String> {
-    let rel_path = normalize_view_tree_rel_path(rel_path, allow_empty)?;
-    if rel_path.is_empty() {
-        Ok(views_root.to_path_buf())
-    } else {
-        Ok(views_root.join(rel_path))
-    }
+fn view_tree_metadata_path(views_root: &Path) -> PathBuf {
+    views_root.join(VIEW_TREE_METADATA_REL_PATH)
 }
 
-fn view_rel_path_for_root(views_root: &Path, root: &Path) -> Result<String, String> {
-    let rel_path = root
-        .strip_prefix(views_root)
-        .map_err(|_| format!("Path is outside View root: {}", root.display()))?
-        .display()
-        .to_string()
-        .replace('\\', "/");
-    normalize_view_tree_rel_path(&rel_path, false)
+fn view_package_rel_path_for_root(
+    views_root: &Path,
+    root: &Path,
+    manifest: &ViewManifest,
+) -> String {
+    root.strip_prefix(views_root)
+        .ok()
+        .map(|path| path.display().to_string().replace('\\', "/"))
+        .filter(|path| !path.is_empty())
+        .unwrap_or_else(|| manifest.id.clone())
+}
+
+fn view_display_path_for_manifest(
+    views_root: &Path,
+    root: &Path,
+    manifest: &ViewManifest,
+) -> String {
+    manifest
+        .display_path
+        .as_deref()
+        .and_then(|path| {
+            normalize_optional_view_display_path(Some(path))
+                .ok()
+                .flatten()
+        })
+        .unwrap_or_else(|| view_package_rel_path_for_root(views_root, root, manifest))
 }
 
 fn inferred_view_requirements(capabilities: &ViewCapabilities) -> ViewRequirements {
@@ -954,6 +1139,11 @@ fn normalize_view_requirements(manifest: &mut ViewManifest) {
     if manifest.requirements.is_none() {
         manifest.requirements = Some(inferred_view_requirements(&manifest.capabilities));
     }
+}
+
+fn normalize_view_manifest_display_path(manifest: &mut ViewManifest) -> Result<(), String> {
+    manifest.display_path = normalize_optional_view_display_path(manifest.display_path.as_deref())?;
+    Ok(())
 }
 
 fn view_manifest_requirements(manifest: &ViewManifest) -> ViewRequirements {
@@ -970,8 +1160,16 @@ fn load_manifest_from_root(root: &Path) -> Result<ViewManifest, String> {
     let mut manifest: ViewManifest = serde_json::from_str(&raw)
         .map_err(|e| format!("Invalid View manifest {}: {}", path.display(), e))?;
     normalize_view_requirements(&mut manifest);
+    normalize_view_manifest_display_path(&mut manifest)?;
     validate_view_manifest(&manifest)?;
     Ok(manifest)
+}
+
+fn write_manifest_to_root(root: &Path, manifest: &ViewManifest) -> Result<(), String> {
+    let raw = serde_json::to_string_pretty(manifest)
+        .map_err(|e| format!("Failed to serialize View manifest: {}", e))?;
+    std::fs::write(manifest_path(root), raw + "\n")
+        .map_err(|e| format!("Failed to write {}: {}", manifest_path(root).display(), e))
 }
 
 fn summary_from_manifest(
@@ -986,12 +1184,8 @@ fn summary_from_manifest(
         version: manifest.version.clone(),
         template: manifest.template.clone(),
         icon: manifest.icon.clone(),
-        package_rel_path: root
-            .strip_prefix(views_root)
-            .ok()
-            .map(|path| path.display().to_string().replace('\\', "/"))
-            .filter(|path| !path.is_empty())
-            .unwrap_or_else(|| manifest.id.clone()),
+        display_path: view_display_path_for_manifest(views_root, root, manifest),
+        package_rel_path: view_package_rel_path_for_root(views_root, root, manifest),
         package_root: root.display().to_string().replace('\\', "/"),
         manifest_path: manifest_path(root).display().to_string().replace('\\', "/"),
         updated_at: updated_at(&manifest_path(root)),
@@ -1010,7 +1204,7 @@ fn path_is_under_root(path: &Path, root: &Path) -> bool {
 fn is_skippable_view_scan_dir(name: &str) -> bool {
     matches!(
         name,
-        "node_modules" | ".git" | "dist" | "target" | "Library" | "Temp"
+        "node_modules" | ".git" | ".locus" | "dist" | "target" | "Library" | "Temp"
     )
 }
 
@@ -1117,6 +1311,394 @@ pub fn list_views_sync(working_dir: &str) -> Result<Vec<ViewPackageSummary>, Str
     Ok(views)
 }
 
+fn load_view_tree_metadata(views_root: &Path) -> Result<ViewTreeMetadata, String> {
+    let path = view_tree_metadata_path(views_root);
+    if !path.is_file() {
+        return Ok(ViewTreeMetadata {
+            schema: VIEW_TREE_METADATA_SCHEMA.to_string(),
+            folders: Vec::new(),
+            order: Vec::new(),
+        });
+    }
+
+    let raw = std::fs::read_to_string(&path)
+        .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
+    let mut metadata: ViewTreeMetadata = serde_json::from_str(&raw)
+        .map_err(|e| format!("Invalid View tree metadata {}: {}", path.display(), e))?;
+    if metadata.schema.trim().is_empty() {
+        metadata.schema = VIEW_TREE_METADATA_SCHEMA.to_string();
+    }
+    if metadata.schema != VIEW_TREE_METADATA_SCHEMA {
+        return Err(format!(
+            "Unsupported View tree metadata schema: {}",
+            metadata.schema
+        ));
+    }
+
+    let mut folders = BTreeSet::new();
+    for folder in metadata.folders {
+        folders.insert(normalize_view_tree_rel_path(&folder, false)?);
+    }
+    let mut order = Vec::new();
+    let mut seen_order = BTreeSet::new();
+    for rel_path in metadata.order {
+        let rel_path = normalize_view_tree_rel_path(&rel_path, false)?;
+        if seen_order.insert(rel_path.clone()) {
+            order.push(rel_path);
+        }
+    }
+    Ok(ViewTreeMetadata {
+        schema: VIEW_TREE_METADATA_SCHEMA.to_string(),
+        folders: folders.into_iter().collect(),
+        order,
+    })
+}
+
+fn save_view_tree_metadata(
+    views_root: &Path,
+    folders: BTreeSet<String>,
+    order: Vec<String>,
+) -> Result<(), String> {
+    let path = view_tree_metadata_path(views_root);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create {}: {}", parent.display(), e))?;
+    }
+    let mut normalized_order = Vec::new();
+    let mut seen_order = BTreeSet::new();
+    for rel_path in order {
+        let rel_path = normalize_view_tree_rel_path(&rel_path, false)?;
+        if seen_order.insert(rel_path.clone()) {
+            normalized_order.push(rel_path);
+        }
+    }
+    let metadata = ViewTreeMetadata {
+        schema: VIEW_TREE_METADATA_SCHEMA.to_string(),
+        folders: folders.into_iter().collect(),
+        order: normalized_order,
+    };
+    let raw = serde_json::to_string_pretty(&metadata)
+        .map_err(|e| format!("Failed to serialize View tree metadata: {}", e))?;
+    std::fs::write(&path, raw + "\n")
+        .map_err(|e| format!("Failed to write {}: {}", path.display(), e))
+}
+
+fn view_display_folder_paths(views: &[ViewPackageSummary]) -> BTreeSet<String> {
+    let mut folders = BTreeSet::new();
+    for view in views {
+        let mut parent = view_path_dirname(&view.display_path);
+        while !parent.is_empty() {
+            folders.insert(parent.clone());
+            parent = view_path_dirname(&parent);
+        }
+    }
+    folders
+}
+
+fn view_display_view_paths(views: &[ViewPackageSummary]) -> BTreeSet<String> {
+    views
+        .iter()
+        .map(|view| view.display_path.clone())
+        .collect::<BTreeSet<_>>()
+}
+
+fn view_folder_summary(rel_path: String, views_root: &Path) -> ViewFolderSummary {
+    let name = rel_path.rsplit('/').next().unwrap_or(&rel_path).to_string();
+    ViewFolderSummary {
+        rel_path,
+        name,
+        package_root: String::new(),
+        updated_at: updated_at(&view_tree_metadata_path(views_root)),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ViewTreeOrderEntryKind {
+    Folder,
+    View,
+}
+
+#[derive(Debug, Clone)]
+struct ViewTreeOrderEntry {
+    rel_path: String,
+    parent_rel_path: String,
+    label: String,
+    kind: ViewTreeOrderEntryKind,
+}
+
+fn view_tree_order_entries(
+    views: &[ViewPackageSummary],
+    folder_paths: &BTreeSet<String>,
+) -> Vec<ViewTreeOrderEntry> {
+    let mut entries = Vec::new();
+    for folder in folder_paths {
+        entries.push(ViewTreeOrderEntry {
+            rel_path: folder.clone(),
+            parent_rel_path: view_path_dirname(folder),
+            label: folder.rsplit('/').next().unwrap_or(folder).to_string(),
+            kind: ViewTreeOrderEntryKind::Folder,
+        });
+    }
+    for view in views {
+        entries.push(ViewTreeOrderEntry {
+            rel_path: view.display_path.clone(),
+            parent_rel_path: view_path_dirname(&view.display_path),
+            label: view.name.clone(),
+            kind: ViewTreeOrderEntryKind::View,
+        });
+    }
+    entries
+}
+
+fn view_tree_order_index(order: &[String]) -> HashMap<&str, usize> {
+    order
+        .iter()
+        .enumerate()
+        .map(|(index, rel_path)| (rel_path.as_str(), index))
+        .collect()
+}
+
+fn view_tree_kind_rank(kind: ViewTreeOrderEntryKind) -> u8 {
+    match kind {
+        ViewTreeOrderEntryKind::Folder => 0,
+        ViewTreeOrderEntryKind::View => 1,
+    }
+}
+
+fn view_tree_ordered_child_paths(
+    entries: &[ViewTreeOrderEntry],
+    parent_rel_path: &str,
+    order: &[String],
+) -> Vec<String> {
+    let order_index = view_tree_order_index(order);
+    let mut children = entries
+        .iter()
+        .filter(|entry| entry.parent_rel_path == parent_rel_path)
+        .collect::<Vec<_>>();
+    children.sort_by(|left, right| {
+        match (
+            order_index.get(left.rel_path.as_str()),
+            order_index.get(right.rel_path.as_str()),
+        ) {
+            (Some(left_index), Some(right_index)) => {
+                return left_index.cmp(right_index);
+            }
+            (Some(_), None) => return std::cmp::Ordering::Less,
+            (None, Some(_)) => return std::cmp::Ordering::Greater,
+            (None, None) => {}
+        }
+        view_tree_kind_rank(left.kind)
+            .cmp(&view_tree_kind_rank(right.kind))
+            .then_with(|| {
+                left.label
+                    .to_ascii_lowercase()
+                    .cmp(&right.label.to_ascii_lowercase())
+            })
+            .then(left.rel_path.cmp(&right.rel_path))
+    });
+    children
+        .into_iter()
+        .map(|entry| entry.rel_path.clone())
+        .collect()
+}
+
+fn view_tree_valid_order_paths(
+    views: &[ViewPackageSummary],
+    folder_paths: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    let mut paths = folder_paths.clone();
+    paths.extend(views.iter().map(|view| view.display_path.clone()));
+    paths
+}
+
+fn filter_view_tree_order(order: Vec<String>, valid_paths: &BTreeSet<String>) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    order
+        .into_iter()
+        .filter(|rel_path| valid_paths.contains(rel_path) && seen.insert(rel_path.clone()))
+        .collect()
+}
+
+fn remap_view_tree_order_for_move(order: &[String], source: &str, target: &str) -> Vec<String> {
+    let mut next = Vec::new();
+    let mut seen = BTreeSet::new();
+    for rel_path in order {
+        let mapped = if display_path_is_under(rel_path, source) {
+            replace_display_path_prefix(rel_path, source, target)
+        } else {
+            rel_path.clone()
+        };
+        if seen.insert(mapped.clone()) {
+            next.push(mapped);
+        }
+    }
+    next
+}
+
+fn normalize_insert_anchor(value: Option<&str>) -> Result<Option<String>, String> {
+    match value.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(value) => normalize_view_tree_rel_path(value, false).map(Some),
+        None => Ok(None),
+    }
+}
+
+fn view_tree_order_after_move(
+    order: &[String],
+    entries_after_move: &[ViewTreeOrderEntry],
+    valid_paths_after_move: &BTreeSet<String>,
+    source_rel_path: &str,
+    moved_rel_path: &str,
+    target_dir_rel_path: &str,
+    insert_before_rel_path: Option<&str>,
+    insert_after_rel_path: Option<&str>,
+) -> Result<Vec<String>, String> {
+    let insert_before = normalize_insert_anchor(insert_before_rel_path)?;
+    let insert_after = normalize_insert_anchor(insert_after_rel_path)?;
+    if insert_before.is_some() && insert_after.is_some() {
+        return Err("Only one View insert anchor can be set.".to_string());
+    }
+
+    if insert_before.as_deref() == Some(moved_rel_path)
+        || insert_after.as_deref() == Some(moved_rel_path)
+    {
+        return Ok(filter_view_tree_order(
+            remap_view_tree_order_for_move(order, source_rel_path, moved_rel_path),
+            valid_paths_after_move,
+        ));
+    }
+
+    let moved_parent = view_path_dirname(moved_rel_path);
+    if moved_parent != target_dir_rel_path {
+        return Err(format!(
+            "Moved View entry '{}' is not inside '{}'.",
+            moved_rel_path, target_dir_rel_path
+        ));
+    }
+
+    for anchor in [insert_before.as_deref(), insert_after.as_deref()]
+        .into_iter()
+        .flatten()
+    {
+        if view_path_dirname(anchor) != target_dir_rel_path {
+            return Err(format!(
+                "View insert anchor is outside target folder: {}",
+                anchor
+            ));
+        }
+        if !valid_paths_after_move.contains(anchor) {
+            return Err(format!("View insert anchor not found: {}", anchor));
+        }
+    }
+
+    let remapped_order = remap_view_tree_order_for_move(order, source_rel_path, moved_rel_path);
+    let mut target_group =
+        view_tree_ordered_child_paths(entries_after_move, target_dir_rel_path, &remapped_order);
+    target_group.retain(|rel_path| rel_path != moved_rel_path);
+    match (insert_before, insert_after) {
+        (Some(anchor), None) => {
+            let index = target_group
+                .iter()
+                .position(|rel_path| rel_path == &anchor)
+                .ok_or_else(|| format!("View insert anchor not found: {}", anchor))?;
+            target_group.insert(index, moved_rel_path.to_string());
+        }
+        (None, Some(anchor)) => {
+            let index = target_group
+                .iter()
+                .position(|rel_path| rel_path == &anchor)
+                .ok_or_else(|| format!("View insert anchor not found: {}", anchor))?;
+            target_group.insert(index + 1, moved_rel_path.to_string());
+        }
+        (None, None) => target_group.push(moved_rel_path.to_string()),
+        (Some(_), Some(_)) => unreachable!(),
+    }
+
+    let target_group_set = target_group.iter().cloned().collect::<BTreeSet<_>>();
+    let mut next_order = remapped_order
+        .into_iter()
+        .filter(|rel_path| !target_group_set.contains(rel_path))
+        .collect::<Vec<_>>();
+    next_order.extend(target_group);
+    Ok(filter_view_tree_order(next_order, valid_paths_after_move))
+}
+
+fn unique_view_at_display_path<'a>(
+    views: &'a [ViewPackageSummary],
+    display_path: &str,
+) -> Result<Option<&'a ViewPackageSummary>, String> {
+    let matches = views
+        .iter()
+        .filter(|view| view.display_path == display_path)
+        .collect::<Vec<_>>();
+    match matches.len() {
+        0 => Ok(None),
+        1 => Ok(Some(matches[0])),
+        _ => Err(format!(
+            "Multiple Views use display path '{}': {}",
+            display_path,
+            matches
+                .iter()
+                .map(|view| view.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
+}
+
+fn ensure_display_path_available(
+    views: &[ViewPackageSummary],
+    folders: &BTreeSet<String>,
+    display_path: &str,
+    except_view_id: Option<&str>,
+) -> Result<(), String> {
+    if folders.contains(display_path) {
+        return Err(format!("View path already exists: {}", display_path));
+    }
+    if views
+        .iter()
+        .any(|view| view.display_path == display_path && except_view_id != Some(view.id.as_str()))
+    {
+        return Err(format!("View path already exists: {}", display_path));
+    }
+    Ok(())
+}
+
+fn set_view_manifest_display_path(package_root: &str, display_path: &str) -> Result<(), String> {
+    let root = PathBuf::from(package_root);
+    let mut manifest = load_manifest_from_root(&root)?;
+    manifest.display_path = Some(normalize_view_display_path(display_path)?);
+    write_manifest_to_root(&root, &manifest)
+}
+
+fn set_view_manifest_name(package_root: &str, name: &str) -> Result<(), String> {
+    let root = PathBuf::from(package_root);
+    let mut manifest = load_manifest_from_root(&root)?;
+    manifest.name = normalize_view_name(name)?;
+    validate_view_manifest(&manifest)?;
+    write_manifest_to_root(&root, &manifest)
+}
+
+fn remove_view_package_root(views_root: &Path, root: &Path, label: &str) -> Result<(), String> {
+    if !path_is_under_root(root, views_root) {
+        return Err(format!(
+            "Refusing to delete View package outside View root: {}",
+            root.display()
+        ));
+    }
+    if !root.is_dir() {
+        return Ok(());
+    }
+    let metadata = std::fs::symlink_metadata(root)
+        .map_err(|e| format!("Failed to inspect {}: {}", root.display(), e))?;
+    if metadata.file_type().is_symlink() {
+        return Err(format!(
+            "Refusing to delete symlinked View entry: {}",
+            label
+        ));
+    }
+    std::fs::remove_dir_all(root).map_err(|e| format!("Failed to delete {}: {}", root.display(), e))
+}
+
 pub fn list_view_tree_sync(working_dir: &str) -> Result<ViewTreeSnapshot, String> {
     let views_root = views_root_for_workspace(working_dir)?;
     let views = list_views_sync(working_dir)?;
@@ -1124,45 +1706,33 @@ pub fn list_view_tree_sync(working_dir: &str) -> Result<ViewTreeSnapshot, String
         return Ok(ViewTreeSnapshot {
             views,
             folders: Vec::new(),
+            order: Vec::new(),
         });
     }
 
-    let mut folders = Vec::new();
-    for entry in walkdir::WalkDir::new(&views_root)
-        .min_depth(1)
-        .follow_links(false)
-        .into_iter()
-        .filter_entry(|entry| {
-            if entry.file_type().is_file() {
-                return false;
-            }
-            if is_skippable_view_scan_entry(&views_root, entry) {
-                return false;
-            }
-            !manifest_path(entry.path()).is_file()
-        })
-    {
-        let entry = entry.map_err(|error| format!("Failed to scan View folders: {}", error))?;
-        if !entry.file_type().is_dir() {
-            continue;
+    let metadata = load_view_tree_metadata(&views_root)?;
+    let view_paths = view_display_view_paths(&views);
+    let mut folder_paths = view_display_folder_paths(&views);
+    for folder in metadata.folders {
+        if !view_paths.contains(&folder) {
+            folder_paths.insert(folder);
         }
-        let rel_path = view_rel_path_for_root(&views_root, entry.path())?;
-        let name = entry
-            .path()
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or(&rel_path)
-            .to_string();
-        folders.push(ViewFolderSummary {
-            rel_path,
-            name,
-            package_root: entry.path().display().to_string().replace('\\', "/"),
-            updated_at: updated_at(entry.path()),
-        });
     }
-
-    folders.sort_by(|left, right| left.rel_path.cmp(&right.rel_path));
-    Ok(ViewTreeSnapshot { views, folders })
+    let folders: Vec<ViewFolderSummary> = folder_paths
+        .into_iter()
+        .map(|rel_path| view_folder_summary(rel_path, &views_root))
+        .collect();
+    let folder_paths = folders
+        .iter()
+        .map(|folder| folder.rel_path.clone())
+        .collect::<BTreeSet<_>>();
+    let valid_paths = view_tree_valid_order_paths(&views, &folder_paths);
+    let order = filter_view_tree_order(metadata.order, &valid_paths);
+    Ok(ViewTreeSnapshot {
+        views,
+        folders,
+        order,
+    })
 }
 
 pub fn create_view_folder_sync(
@@ -1173,31 +1743,25 @@ pub fn create_view_folder_sync(
     let parent_rel_path = request.parent_rel_path.as_deref().unwrap_or("").trim();
     let parent_rel_path = normalize_view_tree_rel_path(parent_rel_path, true)?;
     let folder_name = normalize_view_folder_name(&request.name)?;
-    let parent = view_tree_path(&views_root, &parent_rel_path, true)?;
-    if parent_rel_path.is_empty() {
-        std::fs::create_dir_all(&parent)
-            .map_err(|e| format!("Failed to create {}: {}", parent.display(), e))?;
-    }
-    if !parent.is_dir() {
+    let views = list_views_sync(working_dir)?;
+    let mut metadata = load_view_tree_metadata(&views_root)?;
+    let mut folder_paths = view_display_folder_paths(&views);
+    folder_paths.extend(metadata.folders.iter().cloned());
+    let view_paths = view_display_view_paths(&views);
+
+    if !parent_rel_path.is_empty() && !folder_paths.contains(&parent_rel_path) {
         return Err(format!("View folder not found: {}", parent_rel_path));
     }
-    if manifest_path(&parent).is_file() {
-        return Err("Cannot create a folder inside a View package.".to_string());
+
+    let rel_path = join_view_display_path(&parent_rel_path, &folder_name);
+    if folder_paths.contains(&rel_path) || view_paths.contains(&rel_path) {
+        return Err(format!("View path already exists: {}", rel_path));
     }
 
-    let folder = parent.join(&folder_name);
-    if folder.exists() {
-        return Err(format!("View folder already exists: {}", folder.display()));
-    }
-    std::fs::create_dir_all(&folder)
-        .map_err(|e| format!("Failed to create {}: {}", folder.display(), e))?;
-    let rel_path = view_rel_path_for_root(&views_root, &folder)?;
-    Ok(ViewFolderSummary {
-        rel_path,
-        name: folder_name,
-        package_root: folder.display().to_string().replace('\\', "/"),
-        updated_at: updated_at(&folder),
-    })
+    metadata.folders.push(rel_path.clone());
+    let folders = metadata.folders.into_iter().collect::<BTreeSet<_>>();
+    save_view_tree_metadata(&views_root, folders, metadata.order)?;
+    Ok(view_folder_summary(rel_path, &views_root))
 }
 
 pub fn delete_view_entry_sync(
@@ -1206,20 +1770,128 @@ pub fn delete_view_entry_sync(
 ) -> Result<ViewTreeSnapshot, String> {
     let views_root = views_root_for_workspace(working_dir)?;
     let rel_path = normalize_view_tree_rel_path(&request.rel_path, false)?;
-    let target = view_tree_path(&views_root, &rel_path, false)?;
-    if !target.is_dir() {
+    let views = list_views_sync(working_dir)?;
+    let mut metadata = load_view_tree_metadata(&views_root)?;
+    let folder_paths = view_display_folder_paths(&views)
+        .into_iter()
+        .chain(metadata.folders.iter().cloned())
+        .collect::<BTreeSet<_>>();
+
+    let mut roots_to_delete = Vec::new();
+    if let Some(view) = unique_view_at_display_path(&views, &rel_path)? {
+        roots_to_delete.push(PathBuf::from(&view.package_root));
+        metadata.order.retain(|path| path != &view.display_path);
+    } else if folder_paths.contains(&rel_path) {
+        for view in views
+            .iter()
+            .filter(|view| display_path_is_under(&view.display_path, &rel_path))
+        {
+            roots_to_delete.push(PathBuf::from(&view.package_root));
+        }
+        metadata
+            .folders
+            .retain(|folder| !display_path_is_under(folder, &rel_path));
+        metadata
+            .order
+            .retain(|path| !display_path_is_under(path, &rel_path));
+    } else {
         return Err(format!("View entry not found: {}", rel_path));
     }
-    let metadata = std::fs::symlink_metadata(&target)
-        .map_err(|e| format!("Failed to inspect {}: {}", target.display(), e))?;
-    if metadata.file_type().is_symlink() {
-        return Err(format!(
-            "Refusing to delete symlinked View entry: {}",
-            rel_path
-        ));
+
+    save_view_tree_metadata(
+        &views_root,
+        metadata.folders.into_iter().collect(),
+        metadata.order,
+    )?;
+
+    roots_to_delete.sort();
+    roots_to_delete.dedup();
+    for root in roots_to_delete {
+        remove_view_package_root(&views_root, &root, &rel_path)?;
     }
-    std::fs::remove_dir_all(&target)
-        .map_err(|e| format!("Failed to delete {}: {}", target.display(), e))?;
+    list_view_tree_sync(working_dir)
+}
+
+pub fn rename_view_entry_sync(
+    working_dir: &str,
+    request: ViewRenameEntryRequest,
+) -> Result<ViewTreeSnapshot, String> {
+    let views_root = views_root_for_workspace(working_dir)?;
+    let source_rel_path = normalize_view_tree_rel_path(&request.rel_path, false)?;
+    let views = list_views_sync(working_dir)?;
+    let metadata = load_view_tree_metadata(&views_root)?;
+    let folder_paths = view_display_folder_paths(&views)
+        .into_iter()
+        .chain(metadata.folders.iter().cloned())
+        .collect::<BTreeSet<_>>();
+
+    if let Some(view) = unique_view_at_display_path(&views, &source_rel_path)? {
+        set_view_manifest_name(&view.package_root, &request.name)?;
+        return list_view_tree_sync(working_dir);
+    }
+
+    if !folder_paths.contains(&source_rel_path) {
+        return Err(format!("View entry not found: {}", source_rel_path));
+    }
+
+    let folder_name = normalize_view_folder_name(&request.name)?;
+    let target_rel_path =
+        join_view_display_path(&view_path_dirname(&source_rel_path), &folder_name);
+    if source_rel_path == target_rel_path {
+        return list_view_tree_sync(working_dir);
+    }
+    if folder_paths.contains(&target_rel_path)
+        || view_display_view_paths(&views).contains(&target_rel_path)
+    {
+        return Err(format!("View path already exists: {}", target_rel_path));
+    }
+
+    let moving_views = views
+        .iter()
+        .filter(|view| display_path_is_under(&view.display_path, &source_rel_path))
+        .collect::<Vec<_>>();
+    for view in &moving_views {
+        let next_path =
+            replace_display_path_prefix(&view.display_path, &source_rel_path, &target_rel_path);
+        ensure_display_path_available(&views, &folder_paths, &next_path, Some(&view.id))?;
+    }
+    for view in moving_views {
+        let next_path =
+            replace_display_path_prefix(&view.display_path, &source_rel_path, &target_rel_path);
+        set_view_manifest_display_path(&view.package_root, &next_path)?;
+    }
+
+    let mut next_views = views.clone();
+    for view in &mut next_views {
+        if display_path_is_under(&view.display_path, &source_rel_path) {
+            view.display_path =
+                replace_display_path_prefix(&view.display_path, &source_rel_path, &target_rel_path);
+        }
+    }
+
+    let mut next_folders = BTreeSet::new();
+    for folder in metadata.folders {
+        if display_path_is_under(&folder, &source_rel_path) {
+            next_folders.insert(replace_display_path_prefix(
+                &folder,
+                &source_rel_path,
+                &target_rel_path,
+            ));
+        } else {
+            next_folders.insert(folder);
+        }
+    }
+    next_folders.insert(target_rel_path.clone());
+    let next_folder_paths = view_display_folder_paths(&next_views)
+        .into_iter()
+        .chain(next_folders.iter().cloned())
+        .collect::<BTreeSet<_>>();
+    let valid_paths = view_tree_valid_order_paths(&next_views, &next_folder_paths);
+    let next_order = filter_view_tree_order(
+        remap_view_tree_order_for_move(&metadata.order, &source_rel_path, &target_rel_path),
+        &valid_paths,
+    );
+    save_view_tree_metadata(&views_root, next_folders, next_order)?;
     list_view_tree_sync(working_dir)
 }
 
@@ -1231,65 +1903,145 @@ pub fn move_view_entry_sync(
     let source_rel_path = normalize_view_tree_rel_path(&request.source_rel_path, false)?;
     let target_dir_rel_path = request.target_dir_rel_path.as_deref().unwrap_or("");
     let target_dir_rel_path = normalize_view_tree_rel_path(target_dir_rel_path, true)?;
+    let has_insert_anchor = request
+        .insert_before_rel_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_some()
+        || request
+            .insert_after_rel_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .is_some();
     if source_rel_path == target_dir_rel_path
         || target_dir_rel_path.starts_with(&format!("{}/", source_rel_path))
     {
         return Err("Cannot move a View entry into itself.".to_string());
     }
 
-    let source = view_tree_path(&views_root, &source_rel_path, false)?;
-    let target_dir = view_tree_path(&views_root, &target_dir_rel_path, true)?;
-    if !source.is_dir() {
-        return Err(format!("View entry not found: {}", source_rel_path));
-    }
-    if !target_dir.is_dir() {
+    let views = list_views_sync(working_dir)?;
+    let metadata = load_view_tree_metadata(&views_root)?;
+    let folder_paths = view_display_folder_paths(&views)
+        .into_iter()
+        .chain(metadata.folders.iter().cloned())
+        .collect::<BTreeSet<_>>();
+    if !target_dir_rel_path.is_empty() && !folder_paths.contains(&target_dir_rel_path) {
         return Err(format!(
             "Target View folder not found: {}",
             target_dir_rel_path
         ));
     }
-    if manifest_path(&target_dir).is_file() {
-        return Err("Cannot move a View entry inside a View package.".to_string());
-    }
-    let metadata = std::fs::symlink_metadata(&source)
-        .map_err(|e| format!("Failed to inspect {}: {}", source.display(), e))?;
-    if metadata.file_type().is_symlink() {
-        return Err(format!(
-            "Refusing to move symlinked View entry: {}",
-            source_rel_path
-        ));
-    }
 
-    let source_name = source
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| format!("Invalid View entry path: {}", source_rel_path))?;
-    let target = target_dir.join(source_name);
-    if source == target {
+    let source_name = view_path_basename(&source_rel_path)?;
+    let target_rel_path = join_view_display_path(&target_dir_rel_path, &source_name);
+    if source_rel_path == target_rel_path && !has_insert_anchor {
         return Ok(list_view_tree_sync(working_dir)?);
     }
-    if target.exists() {
-        return Err(format!(
-            "Target View entry already exists: {}",
-            target.display()
-        ));
-    }
 
-    if manifest_path(&source).is_file() {
-        if target_dir_rel_path.is_empty() {
-            return Err("Cannot move a View outside a package workspace.".to_string());
+    if let Some(view) = unique_view_at_display_path(&views, &source_rel_path)? {
+        if source_rel_path != target_rel_path {
+            ensure_display_path_available(&views, &folder_paths, &target_rel_path, Some(&view.id))?;
+            set_view_manifest_display_path(&view.package_root, &target_rel_path)?;
         }
-        ensure_view_package_workspace(&target_dir)?;
+        let mut next_views = views.clone();
+        for next_view in &mut next_views {
+            if next_view.id == view.id {
+                next_view.display_path = target_rel_path.clone();
+            }
+        }
+        let next_folder_paths = view_display_folder_paths(&next_views)
+            .into_iter()
+            .chain(metadata.folders.iter().cloned())
+            .collect::<BTreeSet<_>>();
+        let entries_after_move = view_tree_order_entries(&next_views, &next_folder_paths);
+        let valid_paths = view_tree_valid_order_paths(&next_views, &next_folder_paths);
+        let next_order = view_tree_order_after_move(
+            &metadata.order,
+            &entries_after_move,
+            &valid_paths,
+            &source_rel_path,
+            &target_rel_path,
+            &target_dir_rel_path,
+            request.insert_before_rel_path.as_deref(),
+            request.insert_after_rel_path.as_deref(),
+        )?;
+        save_view_tree_metadata(
+            &views_root,
+            metadata.folders.into_iter().collect(),
+            next_order,
+        )?;
+        return list_view_tree_sync(working_dir);
     }
 
-    std::fs::rename(&source, &target).map_err(|e| {
-        format!(
-            "Failed to move {} to {}: {}",
-            source.display(),
-            target.display(),
-            e
-        )
-    })?;
+    if !folder_paths.contains(&source_rel_path) {
+        return Err(format!("View entry not found: {}", source_rel_path));
+    }
+    if target_rel_path != source_rel_path && folder_paths.contains(&target_rel_path) {
+        return Err(format!("View path already exists: {}", target_rel_path));
+    }
+    if target_rel_path != source_rel_path
+        && view_display_view_paths(&views).contains(&target_rel_path)
+    {
+        return Err(format!("View path already exists: {}", target_rel_path));
+    }
+
+    let moving_views = views
+        .iter()
+        .filter(|view| display_path_is_under(&view.display_path, &source_rel_path))
+        .collect::<Vec<_>>();
+    if source_rel_path != target_rel_path {
+        for view in &moving_views {
+            let next_path =
+                replace_display_path_prefix(&view.display_path, &source_rel_path, &target_rel_path);
+            ensure_display_path_available(&views, &folder_paths, &next_path, Some(&view.id))?;
+        }
+        for view in moving_views {
+            let next_path =
+                replace_display_path_prefix(&view.display_path, &source_rel_path, &target_rel_path);
+            set_view_manifest_display_path(&view.package_root, &next_path)?;
+        }
+    }
+
+    let mut next_views = views.clone();
+    for view in &mut next_views {
+        if display_path_is_under(&view.display_path, &source_rel_path) {
+            view.display_path =
+                replace_display_path_prefix(&view.display_path, &source_rel_path, &target_rel_path);
+        }
+    }
+
+    let mut next_folders = BTreeSet::new();
+    for folder in metadata.folders {
+        if display_path_is_under(&folder, &source_rel_path) {
+            next_folders.insert(replace_display_path_prefix(
+                &folder,
+                &source_rel_path,
+                &target_rel_path,
+            ));
+        } else {
+            next_folders.insert(folder);
+        }
+    }
+    next_folders.insert(target_rel_path.clone());
+    let next_folder_paths = view_display_folder_paths(&next_views)
+        .into_iter()
+        .chain(next_folders.iter().cloned())
+        .collect::<BTreeSet<_>>();
+    let entries_after_move = view_tree_order_entries(&next_views, &next_folder_paths);
+    let valid_paths = view_tree_valid_order_paths(&next_views, &next_folder_paths);
+    let next_order = view_tree_order_after_move(
+        &metadata.order,
+        &entries_after_move,
+        &valid_paths,
+        &source_rel_path,
+        &target_rel_path,
+        &target_dir_rel_path,
+        request.insert_before_rel_path.as_deref(),
+        request.insert_after_rel_path.as_deref(),
+    )?;
+    save_view_tree_metadata(&views_root, next_folders, next_order)?;
     list_view_tree_sync(working_dir)
 }
 
@@ -1485,28 +2237,39 @@ fn read_view_archive_manifest(
     Ok((view_archive_package_prefix(&manifest_rel_path), manifest))
 }
 
-fn view_import_target_workspace_root(
-    working_dir: &str,
-    target_dir_rel_path: Option<&str>,
-) -> Result<PathBuf, String> {
-    let views_root = views_root_for_workspace(working_dir)?;
-    let target_dir_rel_path = target_dir_rel_path.unwrap_or("").trim();
-    if target_dir_rel_path.is_empty() {
-        return Ok(views_root.join(default_view_package_name(working_dir)?));
-    }
+fn view_import_target_workspace_root(working_dir: &str) -> Result<PathBuf, String> {
+    Ok(views_root_for_workspace(working_dir)?.join(default_view_package_name(working_dir)?))
+}
 
-    let target_dir_rel_path = normalize_view_tree_rel_path(target_dir_rel_path, false)?;
-    let target_dir = view_tree_path(&views_root, &target_dir_rel_path, false)?;
-    if !target_dir.is_dir() {
+fn imported_view_display_path(
+    working_dir: &str,
+    request_target_dir: Option<&str>,
+    manifest: &ViewManifest,
+) -> Result<String, String> {
+    let views_root = views_root_for_workspace(working_dir)?;
+    let views = list_views_sync(working_dir)?;
+    let metadata = load_view_tree_metadata(&views_root)?;
+    let folder_paths = view_display_folder_paths(&views)
+        .into_iter()
+        .chain(metadata.folders.iter().cloned())
+        .collect::<BTreeSet<_>>();
+    let target_dir_rel_path =
+        normalize_view_tree_rel_path(request_target_dir.unwrap_or("").trim(), true)?;
+    if !target_dir_rel_path.is_empty() && !folder_paths.contains(&target_dir_rel_path) {
         return Err(format!(
             "Target View folder not found: {}",
             target_dir_rel_path
         ));
     }
-    if manifest_path(&target_dir).is_file() {
-        return Err("Cannot import a View inside a View package.".to_string());
-    }
-    Ok(target_dir)
+
+    let display_path = if !target_dir_rel_path.is_empty() {
+        join_view_display_path(&target_dir_rel_path, &manifest.id)
+    } else {
+        normalize_optional_view_display_path(manifest.display_path.as_deref())?
+            .unwrap_or_else(|| manifest.id.clone())
+    };
+    ensure_display_path_available(&views, &folder_paths, &display_path, None)?;
+    Ok(display_path)
 }
 
 fn is_zip_entry_symlink(file: &zip::read::ZipFile<'_>) -> bool {
@@ -1613,8 +2376,12 @@ pub fn import_view_package_sync(
         return Err(format!("View package id already exists: {}", manifest.id));
     }
 
-    let workspace_root =
-        view_import_target_workspace_root(working_dir, request.target_dir_rel_path.as_deref())?;
+    let display_path = imported_view_display_path(
+        working_dir,
+        request.target_dir_rel_path.as_deref(),
+        &manifest,
+    )?;
+    let workspace_root = view_import_target_workspace_root(working_dir)?;
     if manifest_path(&workspace_root).is_file() {
         return Err("Cannot import a View inside a View package.".to_string());
     }
@@ -1634,7 +2401,7 @@ pub fn import_view_package_sync(
         return Err(error);
     }
 
-    let imported_manifest = match load_manifest_from_root(&target_root) {
+    let mut imported_manifest = match load_manifest_from_root(&target_root) {
         Ok(manifest) => manifest,
         Err(error) => {
             let _ = std::fs::remove_dir_all(&target_root);
@@ -1647,6 +2414,11 @@ pub fn import_view_package_sync(
             "View id mismatch after import: archive has {}, extracted manifest has {}",
             manifest.id, imported_manifest.id
         ));
+    }
+    imported_manifest.display_path = Some(display_path);
+    if let Err(error) = write_manifest_to_root(&target_root, &imported_manifest) {
+        let _ = std::fs::remove_dir_all(&target_root);
+        return Err(error);
     }
 
     let summary = summary_from_manifest(&views_root, &target_root, &imported_manifest, false);
@@ -1735,7 +2507,20 @@ pub fn create_view_sync_with_scope(
     std::fs::create_dir_all(&root)
         .map_err(|e| format!("Failed to create {}: {}", root.display(), e))?;
 
-    let manifest = templates::template_manifest(&id, &name, template, icon.as_deref());
+    let mut manifest = templates::template_manifest(&id, &name, template, icon.as_deref());
+    if !temporary {
+        let views_root = views_root_for_workspace(working_dir)?;
+        let views = list_views_sync(working_dir)?;
+        let metadata = load_view_tree_metadata(&views_root)?;
+        let folder_paths = view_display_folder_paths(&views)
+            .into_iter()
+            .chain(metadata.folders.iter().cloned())
+            .collect::<BTreeSet<_>>();
+        let display_path = normalize_optional_view_display_path(request.display_path.as_deref())?
+            .unwrap_or_else(|| view_package_rel_path_for_root(&views_root, &root, &manifest));
+        ensure_display_path_available(&views, &folder_paths, &display_path, None)?;
+        manifest.display_path = Some(display_path);
+    }
     let manifest_raw = serde_json::to_string_pretty(&manifest)
         .map_err(|e| format!("Failed to serialize View manifest: {}", e))?;
     write_package_file(&root, "view.json", &(manifest_raw + "\n"))?;
@@ -1975,36 +2760,1609 @@ pub fn reload_view_sync(working_dir: &str, view_id: &str) -> Result<ViewPackageS
     Ok(detail.summary)
 }
 
+fn view_tab_hosts() -> &'static Mutex<HashMap<String, String>> {
+    static VIEW_TAB_HOSTS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+    VIEW_TAB_HOSTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[derive(Debug, Default)]
+struct ViewHostPoolState {
+    next_index: u64,
+    pending_label: Option<String>,
+    available_label: Option<String>,
+}
+
+fn view_host_pool_state() -> &'static Mutex<ViewHostPoolState> {
+    static VIEW_HOST_POOL_STATE: OnceLock<Mutex<ViewHostPoolState>> = OnceLock::new();
+    VIEW_HOST_POOL_STATE.get_or_init(|| Mutex::new(ViewHostPoolState::default()))
+}
+
+fn view_content_destroy_tokens() -> &'static Mutex<HashMap<String, Instant>> {
+    static VIEW_CONTENT_DESTROY_TOKENS: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+    VIEW_CONTENT_DESTROY_TOKENS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[derive(Debug, Clone)]
+struct UnityOwnedViewWindow {
+    project_key: String,
+    revealed: bool,
+    attached_owner_hwnd: Option<isize>,
+    owner_sync_suspended: bool,
+}
+
+fn unity_owner_project_key(project_path: &str) -> String {
+    let raw = project_path.trim();
+    let path = dunce::canonicalize(raw).unwrap_or_else(|_| PathBuf::from(raw));
+    let normalized = path
+        .to_string_lossy()
+        .replace('\\', "/")
+        .trim_end_matches('/')
+        .to_string();
+    #[cfg(target_os = "windows")]
+    {
+        normalized.to_ascii_lowercase()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        normalized
+    }
+}
+
+fn unity_owned_view_windows() -> &'static Mutex<HashMap<String, UnityOwnedViewWindow>> {
+    static UNITY_OWNED_VIEW_WINDOWS: OnceLock<Mutex<HashMap<String, UnityOwnedViewWindow>>> =
+        OnceLock::new();
+    UNITY_OWNED_VIEW_WINDOWS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn register_unity_owned_view_window(project_path: &str, label: &str) {
+    if let Ok(mut windows) = unity_owned_view_windows().lock() {
+        let existing = windows.get(label);
+        let revealed = existing.map(|entry| entry.revealed).unwrap_or(false);
+        let attached_owner_hwnd = existing.and_then(|entry| entry.attached_owner_hwnd);
+        let owner_sync_suspended = existing
+            .map(|entry| entry.owner_sync_suspended)
+            .unwrap_or(false);
+        windows.insert(
+            label.to_string(),
+            UnityOwnedViewWindow {
+                project_key: unity_owner_project_key(project_path),
+                revealed,
+                attached_owner_hwnd,
+                owner_sync_suspended,
+            },
+        );
+    }
+}
+
+fn track_view_host_unity_owner(
+    working_dir: &str,
+    label: &str,
+    unity_status: Option<&crate::unity_bridge::UnityConnectionStatus>,
+) {
+    if unity_status.is_some() {
+        register_unity_owned_view_window(working_dir, label);
+    }
+}
+
+fn mark_unity_owned_view_window_revealed(project_path: &str, label: &str) -> bool {
+    let project_key = unity_owner_project_key(project_path);
+    unity_owned_view_windows()
+        .lock()
+        .map(|mut windows| {
+            let Some(entry) = windows.get_mut(label) else {
+                return false;
+            };
+            entry.project_key = project_key;
+            entry.revealed = true;
+            true
+        })
+        .unwrap_or(false)
+}
+
+fn unity_owned_view_window_exists(label: &str) -> bool {
+    unity_owned_view_windows()
+        .lock()
+        .map(|windows| windows.contains_key(label))
+        .unwrap_or(false)
+}
+
+fn set_unity_owned_view_window_sync_suspended(label: &str, suspended: bool) -> bool {
+    unity_owned_view_windows()
+        .lock()
+        .map(|mut windows| {
+            let Some(entry) = windows.get_mut(label) else {
+                return false;
+            };
+            entry.owner_sync_suspended = suspended;
+            true
+        })
+        .unwrap_or(false)
+}
+
+fn unity_owned_view_window_attached_owner_hwnd(label: &str) -> Option<isize> {
+    unity_owned_view_windows().lock().ok().and_then(|windows| {
+        windows
+            .get(label)
+            .and_then(|entry| entry.attached_owner_hwnd)
+    })
+}
+
+fn set_unity_owned_view_window_attached_owner_hwnd(label: &str, hwnd: Option<isize>) {
+    if let Ok(mut windows) = unity_owned_view_windows().lock() {
+        if let Some(entry) = windows.get_mut(label) {
+            entry.attached_owner_hwnd = hwnd;
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+pub fn sync_unity_owned_view_windows_for_project(
+    app_handle: &AppHandle,
+    project_path: &str,
+    editor_process_id: Option<u32>,
+    editor_running: bool,
+) {
+    let project_key = unity_owner_project_key(project_path);
+    let labels = unity_owned_view_windows()
+        .lock()
+        .map(|windows| {
+            windows
+                .iter()
+                .filter_map(|(label, entry)| {
+                    if entry.project_key == project_key
+                        && entry.revealed
+                        && !entry.owner_sync_suspended
+                    {
+                        Some(label.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if labels.is_empty() {
+        return;
+    }
+
+    let app_for_main = app_handle.clone();
+    if let Err(error) = app_handle.run_on_main_thread(move || {
+        sync_unity_owned_view_window_labels_on_main(
+            &app_for_main,
+            &project_key,
+            editor_process_id,
+            editor_running,
+            labels,
+        );
+    }) {
+        eprintln!("[Locus ViewHost] failed to dispatch Unity owner sync: {error}");
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn sync_unity_owned_view_windows_for_project(
+    _app_handle: &AppHandle,
+    _project_path: &str,
+    _editor_process_id: Option<u32>,
+    _editor_running: bool,
+) {
+}
+
+#[cfg(target_os = "windows")]
+fn sync_unity_owned_view_window_labels_on_main(
+    app_handle: &AppHandle,
+    project_key: &str,
+    editor_process_id: Option<u32>,
+    editor_running: bool,
+    labels: Vec<String>,
+) {
+    let owner = editor_process_id.and_then(find_unity_owner_window_for_process);
+
+    for label in labels {
+        let Some(window) = app_handle.get_webview_window(&label) else {
+            if let Ok(mut windows) = unity_owned_view_windows().lock() {
+                windows.remove(&label);
+            }
+            continue;
+        };
+
+        let result = if let Some(owner) = owner {
+            attach_view_window_to_unity_owner(&window, owner).map(|_| Some(Some(owner.0 as isize)))
+        } else if !editor_running {
+            clear_view_window_unity_owner(&window).map(|_| Some(None))
+        } else {
+            Ok(None)
+        };
+
+        match result {
+            Ok(attached_owner_hwnd) => {
+                if let Some(attached_owner_hwnd) = attached_owner_hwnd {
+                    set_unity_owned_view_window_attached_owner_hwnd(&label, attached_owner_hwnd);
+                }
+            }
+            Err(error) => {
+                eprintln!(
+                    "[Locus ViewHost] Unity owner sync failed label={} project={} error={}",
+                    label, project_key, error
+                );
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn attach_view_window_to_unity_owner(
+    window: &tauri::WebviewWindow,
+    owner: windows::Win32::Foundation::HWND,
+) -> Result<(), String> {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        IsWindow, SetWindowLongPtrW, SetWindowPos, GWLP_HWNDPARENT, HWND_TOP, SWP_NOACTIVATE,
+        SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE,
+    };
+
+    let hwnd = window
+        .hwnd()
+        .map_err(|error| format!("Failed to read View host HWND: {error}"))?;
+    unsafe {
+        if !IsWindow(Some(owner)).as_bool() {
+            return Err("Unity owner HWND is no longer valid".to_string());
+        }
+        SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, owner.0 as isize);
+        SetWindowPos(
+            hwnd,
+            Some(HWND_TOP),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+        )
+        .map_err(|error| format!("SetWindowPos failed for View Unity owner: {error}"))?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn clear_view_window_unity_owner(window: &tauri::WebviewWindow) -> Result<(), String> {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SetWindowLongPtrW, SetWindowPos, GWLP_HWNDPARENT, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+        SWP_NOZORDER,
+    };
+
+    let hwnd = window
+        .hwnd()
+        .map_err(|error| format!("Failed to read View host HWND: {error}"))?;
+    unsafe {
+        SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, 0);
+        SetWindowPos(
+            hwnd,
+            None,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER,
+        )
+        .map_err(|error| format!("SetWindowPos failed for View Unity owner reset: {error}"))?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn view_window_owner_matches(
+    window: &tauri::WebviewWindow,
+    owner_hwnd: isize,
+) -> Result<bool, String> {
+    use windows::Win32::UI::WindowsAndMessaging::{GetWindowLongPtrW, GWLP_HWNDPARENT};
+
+    let hwnd = window
+        .hwnd()
+        .map_err(|error| format!("Failed to read View host HWND: {error}"))?;
+    let current_owner = unsafe { GetWindowLongPtrW(hwnd, GWLP_HWNDPARENT) };
+    Ok(current_owner != 0 && current_owner == owner_hwnd)
+}
+
+#[cfg(target_os = "windows")]
+fn clear_view_host_unity_owner_for_focus(
+    window_label: &str,
+    window: &tauri::WebviewWindow,
+) -> Result<Option<isize>, String> {
+    let Some(owner_hwnd) = unity_owned_view_window_attached_owner_hwnd(window_label) else {
+        return Ok(None);
+    };
+    if !view_window_owner_matches(window, owner_hwnd)? {
+        return Ok(None);
+    }
+    clear_view_window_unity_owner(window)?;
+    Ok(Some(owner_hwnd))
+}
+
+#[cfg(not(target_os = "windows"))]
+fn clear_view_host_unity_owner_for_focus(
+    _window_label: &str,
+    _window: &tauri::WebviewWindow,
+) -> Result<Option<isize>, String> {
+    Ok(None)
+}
+
+#[cfg(target_os = "windows")]
+fn restore_view_host_unity_owner_after_focus(
+    window_label: &str,
+    window: &tauri::WebviewWindow,
+    owner_hwnd: isize,
+) -> Result<(), String> {
+    let owner = windows::Win32::Foundation::HWND(owner_hwnd as *mut std::ffi::c_void);
+    attach_view_window_to_unity_owner(window, owner)?;
+    set_unity_owned_view_window_attached_owner_hwnd(window_label, Some(owner_hwnd));
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn restore_view_host_unity_owner_after_focus(
+    _window_label: &str,
+    _window: &tauri::WebviewWindow,
+    _owner_hwnd: isize,
+) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn find_unity_owner_window_for_process(
+    process_id: u32,
+) -> Option<windows::Win32::Foundation::HWND> {
+    use windows::core::BOOL;
+    use windows::Win32::Foundation::{HWND, LPARAM, RECT};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GetAncestor, GetClassNameW, GetWindowRect, GetWindowThreadProcessId,
+        IsWindowVisible, GA_ROOT,
+    };
+
+    struct SearchState {
+        process_id: u32,
+        best_hwnd: HWND,
+        best_class_rank: u8,
+        best_area: i64,
+    }
+
+    unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let state = &mut *(lparam.0 as *mut SearchState);
+        let mut hwnd_process_id = 0u32;
+        GetWindowThreadProcessId(hwnd, Some(&mut hwnd_process_id));
+        if hwnd_process_id != state.process_id || !IsWindowVisible(hwnd).as_bool() {
+            return BOOL(1);
+        }
+
+        if GetAncestor(hwnd, GA_ROOT) != hwnd {
+            return BOOL(1);
+        }
+
+        let mut rect = RECT::default();
+        if GetWindowRect(hwnd, &mut rect).is_err() {
+            return BOOL(1);
+        }
+        let width = (rect.right - rect.left).max(0) as i64;
+        let height = (rect.bottom - rect.top).max(0) as i64;
+        let area = width * height;
+        if area <= 0 {
+            return BOOL(1);
+        }
+
+        let class_rank = if hwnd_class_name(hwnd) == "UnityContainerWndClass" {
+            1
+        } else {
+            0
+        };
+        if class_rank > state.best_class_rank
+            || (class_rank == state.best_class_rank && area > state.best_area)
+        {
+            state.best_hwnd = hwnd;
+            state.best_class_rank = class_rank;
+            state.best_area = area;
+        }
+        BOOL(1)
+    }
+
+    unsafe fn hwnd_class_name(hwnd: HWND) -> String {
+        let mut class_name = [0u16; 256];
+        let len = GetClassNameW(hwnd, &mut class_name);
+        if len <= 0 {
+            return String::new();
+        }
+        String::from_utf16_lossy(&class_name[..len as usize])
+    }
+
+    let mut state = SearchState {
+        process_id,
+        best_hwnd: HWND(std::ptr::null_mut()),
+        best_class_rank: 0,
+        best_area: 0,
+    };
+    unsafe {
+        let _ = EnumWindows(
+            Some(enum_proc),
+            LPARAM(&mut state as *mut SearchState as isize),
+        );
+    }
+
+    if state.best_hwnd.0.is_null() {
+        None
+    } else {
+        Some(state.best_hwnd)
+    }
+}
+
+fn is_view_host_pool_label(label: &str) -> bool {
+    label.starts_with(VIEW_HOST_POOL_LABEL_PREFIX)
+}
+
+fn sanitize_view_host_label(label: &str) -> Result<String, String> {
+    let normalized = label.trim();
+    let is_locus_view_host = normalized.starts_with(VIEW_WINDOW_LABEL_PREFIX)
+        && normalized.len() > VIEW_WINDOW_LABEL_PREFIX.len()
+        && !normalized.starts_with(VIEW_CONTENT_WINDOW_LABEL_PREFIX);
+    let is_unity_embed_view_host = normalized.starts_with(UNITY_EMBED_VIEW_WINDOW_LABEL_PREFIX)
+        && normalized.len() > UNITY_EMBED_VIEW_WINDOW_LABEL_PREFIX.len();
+    if !is_locus_view_host && !is_unity_embed_view_host {
+        return Err(format!("Invalid View host window label: {}", label));
+    }
+    Ok(normalized.to_string())
+}
+
+pub fn set_view_tab_host_sync(request: ViewSetTabHostRequest) -> Result<(), String> {
+    let host_label = sanitize_view_host_label(&request.host_label)?;
+    let mut view_ids = Vec::new();
+    for view_id in request.view_ids {
+        let normalized = normalize_view_id(&view_id)?;
+        if !view_ids.contains(&normalized) {
+            view_ids.push(normalized);
+        }
+    }
+    if view_ids.is_empty() {
+        return Err("View tab host must contain at least one View id.".to_string());
+    }
+
+    let mut hosts = view_tab_hosts()
+        .lock()
+        .map_err(|_| "View tab host registry is unavailable".to_string())?;
+    let previous_host_labels = view_ids
+        .iter()
+        .filter_map(|view_id| hosts.get(view_id).cloned())
+        .collect::<Vec<_>>();
+    let inherited_unity_owner = unity_owned_view_windows().lock().ok().and_then(|windows| {
+        previous_host_labels
+            .iter()
+            .find_map(|label| windows.get(label).cloned())
+    });
+    if request.keep_existing_for_host {
+        hosts.retain(|view_id, _| !view_ids.contains(view_id));
+    } else {
+        hosts.retain(|view_id, label| label != &host_label && !view_ids.contains(view_id));
+    }
+    for view_id in view_ids {
+        hosts.insert(view_id, host_label.clone());
+    }
+    if let Some(entry) = inherited_unity_owner {
+        if let Ok(mut windows) = unity_owned_view_windows().lock() {
+            windows.insert(host_label, entry);
+        }
+    }
+    Ok(())
+}
+
+fn registered_view_host_label(view_id: &str) -> Option<String> {
+    view_tab_hosts()
+        .lock()
+        .ok()
+        .and_then(|hosts| hosts.get(view_id).cloned())
+}
+
+fn clear_registered_view_host(view_id: &str) {
+    if let Ok(mut hosts) = view_tab_hosts().lock() {
+        hosts.remove(view_id);
+    }
+}
+
+fn active_view_window_label(app_handle: &AppHandle, view_id: &str) -> String {
+    let default_label = view_window_label(view_id);
+    let Some(host_label) = registered_view_host_label(view_id) else {
+        return default_label;
+    };
+    if app_handle.get_webview_window(&host_label).is_some() {
+        return host_label;
+    }
+    clear_registered_view_host(view_id);
+    default_label
+}
+
+fn active_view_content_window_label(app_handle: &AppHandle, view_id: &str) -> Option<String> {
+    let label = view_content_window_label(view_id);
+    app_handle.get_webview_window(&label).map(|_| label)
+}
+
+fn is_independent_view_host_window_label(label: &str) -> bool {
+    label.starts_with(VIEW_WINDOW_LABEL_PREFIX)
+        && !label.starts_with(VIEW_CONTENT_WINDOW_LABEL_PREFIX)
+}
+
+fn is_reusable_view_host_window_label(label: &str) -> bool {
+    label.starts_with(VIEW_WINDOW_LABEL_PREFIX)
+        && !label.starts_with(VIEW_CONTENT_WINDOW_LABEL_PREFIX)
+        && !is_view_host_pool_label(label)
+}
+
+fn reusable_view_host_window_label(app_handle: &AppHandle, view_id: &str) -> Option<String> {
+    let excluded_label = view_window_label(view_id);
+    let mut labels = BTreeSet::new();
+
+    if let Ok(hosts) = view_tab_hosts().lock() {
+        labels.extend(hosts.values().filter_map(|label| {
+            if label != &excluded_label && is_reusable_view_host_window_label(label) {
+                Some(label.clone())
+            } else {
+                None
+            }
+        }));
+    }
+
+    labels.extend(app_handle.webview_windows().keys().filter_map(|label| {
+        if label != &excluded_label && is_reusable_view_host_window_label(label) {
+            Some(label.clone())
+        } else {
+            None
+        }
+    }));
+
+    labels
+        .into_iter()
+        .find(|label| app_handle.get_webview_window(label).is_some())
+}
+
+fn view_host_url_for_label(view_id: &str, label: &str) -> String {
+    if label.starts_with(UNITY_EMBED_VIEW_WINDOW_LABEL_PREFIX) {
+        return crate::commands::unity_embed_host_url(&format!("view-{view_id}"), "view", view_id);
+    }
+    if is_view_host_pool_label(label) {
+        return VIEW_HOST_POOL_ROUTE.to_string();
+    }
+    format!("{}?id={}", VIEW_HOST_ROUTE, view_id)
+}
+
+fn unity_embed_view_window_label(view_id: &str) -> String {
+    format!("{}{}", UNITY_EMBED_VIEW_WINDOW_LABEL_PREFIX, view_id)
+}
+
+fn emit_view_host_tab_select(
+    app_handle: &AppHandle,
+    window_label: &str,
+    view_id: &str,
+    allow_pool_claim: bool,
+) {
+    if app_handle.get_webview_window(window_label).is_some() {
+        let _ = app_handle.emit_to(
+            window_label,
+            VIEW_HOST_TABS_SELECT_EVENT,
+            serde_json::json!({
+                "viewId": view_id,
+                "targetLabel": window_label,
+                "allowPoolClaim": allow_pool_claim,
+            }),
+        );
+    }
+}
+
+fn sync_unity_owner_after_view_host_focus(
+    app_handle: &AppHandle,
+    working_dir: &str,
+    unity_status: Option<&crate::unity_bridge::UnityConnectionStatus>,
+) {
+    if let Some(status) = unity_status {
+        sync_unity_owned_view_windows_for_project(
+            app_handle,
+            working_dir,
+            status.editor_process_id,
+            matches!(
+                status.editor_process_state,
+                crate::unity_bridge::UnityEditorProcessState::Running
+            ),
+        );
+    }
+}
+
+fn focus_view_host_window_with_unity_owner_guard(
+    app_handle: &AppHandle,
+    working_dir: &str,
+    window: &tauri::WebviewWindow,
+    window_label: &str,
+    unity_status: Option<&crate::unity_bridge::UnityConnectionStatus>,
+) -> Result<(), String> {
+    track_view_host_unity_owner(working_dir, window_label, unity_status);
+    let guard_unity_owner = is_independent_view_host_window_label(window_label)
+        && unity_owned_view_window_exists(window_label);
+    let sync_suspended =
+        guard_unity_owner && set_unity_owned_view_window_sync_suspended(window_label, true);
+    let detached_owner = if sync_suspended {
+        clear_view_host_unity_owner_for_focus(window_label, window)?
+    } else {
+        None
+    };
+
+    let focus_result = window
+        .set_focus()
+        .map_err(|error| format!("Failed to focus View window: {}", error));
+
+    if let Err(focus_error) = focus_result {
+        if let Some(owner_hwnd) = detached_owner {
+            if let Err(error) =
+                restore_view_host_unity_owner_after_focus(window_label, window, owner_hwnd)
+            {
+                set_unity_owned_view_window_attached_owner_hwnd(window_label, None);
+                eprintln!(
+                    "[Locus ViewHost] failed to restore Unity owner after focus error label={} error={}",
+                    window_label, error
+                );
+            }
+        }
+        if sync_suspended {
+            set_unity_owned_view_window_sync_suspended(window_label, false);
+        }
+        return Err(focus_error);
+    }
+
+    let should_sync = mark_unity_owned_view_window_revealed(working_dir, window_label);
+    if sync_suspended {
+        set_unity_owned_view_window_sync_suspended(window_label, false);
+    }
+    if let Some(owner_hwnd) = detached_owner {
+        if let Err(error) =
+            restore_view_host_unity_owner_after_focus(window_label, window, owner_hwnd)
+        {
+            set_unity_owned_view_window_attached_owner_hwnd(window_label, None);
+            eprintln!(
+                "[Locus ViewHost] failed to restore Unity owner after focus label={} error={}",
+                window_label, error
+            );
+            sync_unity_owner_after_view_host_focus(app_handle, working_dir, unity_status);
+        }
+    } else if should_sync {
+        sync_unity_owner_after_view_host_focus(app_handle, working_dir, unity_status);
+    }
+    Ok(())
+}
+
+fn focus_view_host_window(
+    app_handle: &AppHandle,
+    working_dir: &str,
+    view_id: &str,
+    window_label: &str,
+    host_url: &str,
+    package_root: &str,
+    unity_status: Option<&crate::unity_bridge::UnityConnectionStatus>,
+    _reason: &str,
+    register_missing: bool,
+) -> Result<ViewRunResult, String> {
+    let Some(window) = app_handle.get_webview_window(window_label) else {
+        return Err(format!("View host window is not open: {}", window_label));
+    };
+    if register_missing {
+        if let Err(error) = set_view_tab_host_sync(ViewSetTabHostRequest {
+            host_label: window_label.to_string(),
+            view_ids: vec![view_id.to_string()],
+            keep_existing_for_host: true,
+        }) {
+            eprintln!(
+                "[Locus ViewHost] reuse register failed view_id={} target={} error={}",
+                view_id, window_label, error
+            );
+        }
+    }
+    emit_view_host_tab_select(app_handle, window_label, view_id, false);
+    focus_view_host_window_with_unity_owner_guard(
+        app_handle,
+        working_dir,
+        &window,
+        window_label,
+        unity_status,
+    )?;
+    if let Err(error) = start_view_file_watcher(app_handle, working_dir, view_id) {
+        eprintln!(
+            "[Locus] failed to watch View package '{}' for reload: {}",
+            view_id, error
+        );
+    }
+    Ok(ViewRunResult {
+        id: view_id.to_string(),
+        window_label: window_label.to_string(),
+        host_url: host_url.to_string(),
+        package_root: package_root.to_string(),
+    })
+}
+
+fn merge_view_tab_into_host_window(
+    app_handle: &AppHandle,
+    working_dir: &str,
+    view_id: &str,
+    window_label: &str,
+    host_url: &str,
+    package_root: &str,
+    unity_status: Option<&crate::unity_bridge::UnityConnectionStatus>,
+) -> Result<ViewRunResult, String> {
+    let Some(window) = app_handle.get_webview_window(window_label) else {
+        return Err(format!("View host window is not open: {}", window_label));
+    };
+    set_view_tab_host_sync(ViewSetTabHostRequest {
+        host_label: window_label.to_string(),
+        view_ids: vec![view_id.to_string()],
+        keep_existing_for_host: true,
+    })?;
+    app_handle
+        .emit_to(
+            window_label,
+            VIEW_HOST_TABS_MERGE_EVENT,
+            serde_json::json!({
+                "sourceLabel": "",
+                "viewIds": [view_id],
+                "activeViewId": view_id,
+            }),
+        )
+        .map_err(|error| format!("Failed to merge View tab into existing window: {error}"))?;
+    focus_view_host_window_with_unity_owner_guard(
+        app_handle,
+        working_dir,
+        &window,
+        window_label,
+        unity_status,
+    )?;
+    if let Err(error) = start_view_file_watcher(app_handle, working_dir, view_id) {
+        eprintln!(
+            "[Locus] failed to watch View package '{}' for reload: {}",
+            view_id, error
+        );
+    }
+    Ok(ViewRunResult {
+        id: view_id.to_string(),
+        window_label: window_label.to_string(),
+        host_url: host_url.to_string(),
+        package_root: package_root.to_string(),
+    })
+}
+
+fn detached_view_window_label(view_id: &str) -> String {
+    let suffix = uuid::Uuid::new_v4()
+        .simple()
+        .to_string()
+        .chars()
+        .take(8)
+        .collect::<String>();
+    format!("{}{}-{}", VIEW_WINDOW_LABEL_PREFIX, view_id, suffix)
+}
+
+fn main_window_always_on_top(app_handle: &AppHandle) -> bool {
+    let Some(main_window) = app_handle.get_webview_window(MAIN_WINDOW_LABEL) else {
+        return false;
+    };
+    match main_window.is_always_on_top() {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("[Locus ViewHost] failed to read main window always-on-top: {error}");
+            false
+        }
+    }
+}
+
+fn apply_main_window_always_on_top_to_view_window(
+    app_handle: &AppHandle,
+    window: &tauri::WebviewWindow,
+    target: &str,
+) -> Result<(), String> {
+    let always_on_top = main_window_always_on_top(app_handle);
+    window
+        .set_always_on_top(always_on_top)
+        .map_err(|error| format!("Failed to set {target} always-on-top: {error}"))
+}
+
+fn build_view_window(
+    app_handle: &AppHandle,
+    label: &str,
+    host_url: &str,
+    title: &str,
+    position: Option<(f64, f64)>,
+    view_windows_above_main: bool,
+) -> Result<(), String> {
+    let build_started_at = Instant::now();
+    let inherit_always_on_top = main_window_always_on_top(app_handle);
+    let builder = tauri::WebviewWindowBuilder::new(
+        app_handle,
+        label,
+        WebviewUrl::App(host_url.to_string().into()),
+    )
+    .title(title.to_string())
+    .always_on_top(inherit_always_on_top);
+    let main_window = if view_windows_above_main {
+        app_handle.get_webview_window(MAIN_WINDOW_LABEL)
+    } else {
+        None
+    };
+    let builder = if let Some(main_window) = main_window {
+        builder
+            .parent(&main_window)
+            .map_err(|e| format!("Failed to attach View window to main window: {}", e))?
+    } else {
+        builder
+    };
+    let builder = if let Some((x, y)) = position {
+        builder.position(x, y)
+    } else {
+        builder
+    };
+
+    let result = builder
+        .inner_size(1180.0, 760.0)
+        .min_inner_size(760.0, 480.0)
+        .decorations(false)
+        .resizable(true)
+        .visible(false)
+        .disable_drag_drop_handler()
+        .build();
+    if let Err(error) = &result {
+        eprintln!(
+            "[Locus ViewHost] build-error label={} elapsed_ms={} error={}",
+            label,
+            build_started_at.elapsed().as_millis(),
+            error
+        );
+    }
+    result
+        .map(|_| ())
+        .map_err(|e| format!("Failed to open View window: {}", e))
+}
+
+fn next_view_host_pool_label(state: &mut ViewHostPoolState) -> String {
+    state.next_index = state.next_index.saturating_add(1);
+    format!("{}{}", VIEW_HOST_POOL_LABEL_PREFIX, state.next_index)
+}
+
+pub fn ensure_view_host_pool_window(
+    app_handle: &AppHandle,
+    view_windows_above_main: bool,
+) -> Result<ViewRunResult, String> {
+    {
+        let mut state = view_host_pool_state()
+            .lock()
+        .map_err(|_| "View host pool state is unavailable".to_string())?;
+        if let Some(label) = state.available_label.clone() {
+            if app_handle.get_webview_window(&label).is_some() {
+                return Ok(ViewRunResult {
+                    id: String::new(),
+                    window_label: label,
+                    host_url: VIEW_HOST_POOL_ROUTE.to_string(),
+                    package_root: String::new(),
+                });
+            }
+            state.available_label = None;
+        }
+        if let Some(label) = state.pending_label.clone() {
+            if app_handle.get_webview_window(&label).is_some() {
+                return Ok(ViewRunResult {
+                    id: String::new(),
+                    window_label: label,
+                    host_url: VIEW_HOST_POOL_ROUTE.to_string(),
+                    package_root: String::new(),
+                });
+            }
+            state.pending_label = None;
+        }
+    }
+
+    let label = {
+        let mut state = view_host_pool_state()
+            .lock()
+            .map_err(|_| "View host pool state is unavailable".to_string())?;
+        let label = next_view_host_pool_label(&mut state);
+        state.pending_label = Some(label.clone());
+        label
+    };
+
+    let result = build_view_window(
+        app_handle,
+        &label,
+        VIEW_HOST_POOL_ROUTE,
+        "Locus View",
+        Some((-32000.0, -32000.0)),
+        view_windows_above_main,
+    );
+    if let Err(error) = result {
+        if let Ok(mut state) = view_host_pool_state().lock() {
+            if state.pending_label.as_deref() == Some(&label) {
+                state.pending_label = None;
+            }
+        }
+        return Err(error);
+    }
+
+    Ok(ViewRunResult {
+        id: String::new(),
+        window_label: label,
+        host_url: VIEW_HOST_POOL_ROUTE.to_string(),
+        package_root: String::new(),
+    })
+}
+
+pub fn mark_view_host_pool_ready(app_handle: &AppHandle, host_label: &str) -> Result<(), String> {
+    let label = sanitize_view_host_label(host_label)?;
+    if !is_view_host_pool_label(&label) {
+        return Err(format!("View host is not a pool window: {}", label));
+    }
+    if app_handle.get_webview_window(&label).is_none() {
+        return Err(format!("View host pool window is not open: {}", label));
+    }
+    let mut state = view_host_pool_state()
+        .lock()
+        .map_err(|_| "View host pool state is unavailable".to_string())?;
+    if state.available_label.as_deref() == Some(&label) {
+        return Ok(());
+    }
+    if state.pending_label.as_deref() != Some(&label) {
+        return Ok(());
+    }
+    state.pending_label = None;
+    state.available_label = Some(label.clone());
+    Ok(())
+}
+
+pub async fn mark_view_host_revealed(
+    app_handle: &AppHandle,
+    working_dir: &str,
+    host_label: &str,
+) -> Result<(), String> {
+    let label = sanitize_view_host_label(host_label)?;
+    let should_sync = mark_unity_owned_view_window_revealed(working_dir, &label);
+    if !should_sync {
+        return Ok(());
+    }
+
+    let status = crate::unity_bridge::query_unity_connection_status(working_dir).await;
+    sync_unity_owned_view_windows_for_project(
+        app_handle,
+        working_dir,
+        status.editor_process_id,
+        matches!(
+            status.editor_process_state,
+            crate::unity_bridge::UnityEditorProcessState::Running
+        ),
+    );
+    Ok(())
+}
+
+fn take_view_host_pool_window(app_handle: &AppHandle) -> Option<String> {
+    let label = view_host_pool_state()
+        .lock()
+        .ok()
+        .and_then(|mut state| state.available_label.take());
+    let Some(label) = label else {
+        return None;
+    };
+    if app_handle.get_webview_window(&label).is_some() {
+        return Some(label);
+    }
+    None
+}
+
+fn configure_claimed_view_host_pool_window(
+    app_handle: &AppHandle,
+    window: &tauri::WebviewWindow,
+    title: &str,
+    position: Option<(f64, f64)>,
+) -> Result<(), String> {
+    apply_main_window_always_on_top_to_view_window(app_handle, window, "View host pool window")?;
+    window
+        .set_title(title)
+        .map_err(|error| format!("Failed to set View host pool title: {error}"))?;
+    if let Some((x, y)) = position {
+        window
+            .set_position(PhysicalPosition::new(x.round() as i32, y.round() as i32))
+            .map_err(|error| format!("Failed to position View host pool window: {error}"))?;
+    }
+    Ok(())
+}
+
+fn view_content_package_roots() -> &'static Mutex<HashMap<String, String>> {
+    static VIEW_CONTENT_PACKAGE_ROOTS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+    VIEW_CONTENT_PACKAGE_ROOTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub fn view_content_window_label(view_id: &str) -> String {
+    format!("{}{}", VIEW_CONTENT_WINDOW_LABEL_PREFIX, view_id)
+}
+
+fn view_content_host_url(view_id: &str) -> String {
+    format!("{}?id={}", VIEW_CONTENT_ROUTE, view_id)
+}
+
+fn cancel_view_content_destroy(label: &str) {
+    if let Ok(mut tokens) = view_content_destroy_tokens().lock() {
+        tokens.remove(label);
+    }
+}
+
+fn schedule_view_content_destroy(app_handle: &AppHandle, label: String) {
+    let token = Instant::now();
+    if let Ok(mut tokens) = view_content_destroy_tokens().lock() {
+        tokens.insert(label.clone(), token);
+    }
+
+    let app_for_task = app_handle.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(VIEW_CONTENT_DESTROY_DELAY).await;
+        let should_destroy = view_content_destroy_tokens()
+            .lock()
+            .map(|tokens| tokens.get(&label).copied() == Some(token))
+            .unwrap_or(false);
+        if !should_destroy {
+            return;
+        }
+
+        let app_for_main = app_for_task.clone();
+        let label_for_main = label.clone();
+        if let Err(error) = app_for_task.run_on_main_thread(move || {
+            destroy_view_content_window_on_main(&app_for_main, &label_for_main);
+        }) {
+            eprintln!("[Locus] failed to dispatch View content destroy: {error}");
+        }
+    });
+}
+
+fn destroy_view_content_window_on_main(app_handle: &AppHandle, label: &str) {
+    cancel_view_content_destroy(label);
+    let window = app_handle.get_webview_window(label);
+    if let Some(window) = window {
+        if let Err(close_error) = window.destroy().or_else(|_| window.close()) {
+            eprintln!("[Locus] failed to destroy View content window: {close_error}");
+        }
+    }
+    if let Ok(mut roots) = view_content_package_roots().lock() {
+        roots.remove(label);
+    }
+}
+
+fn set_view_content_window_visible(
+    window: &tauri::WebviewWindow,
+    visible: bool,
+) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        return set_view_content_window_visible_no_activate(window, visible);
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        if visible {
+            window
+                .show()
+                .map_err(|error| format!("Failed to show View content window: {error}"))
+        } else {
+            window
+                .hide()
+                .map_err(|error| format!("Failed to hide View content window: {error}"))
+        }
+    }
+}
+
+fn apply_view_content_overlay_geometry(
+    window: &tauri::WebviewWindow,
+    request: &ViewContentMountRequest,
+) -> Result<(), String> {
+    let x = request.x.round() as i32;
+    let y = request.y.round() as i32;
+    let width = request.width.max(1.0).round() as u32;
+    let height = request.height.max(1.0).round() as u32;
+    window
+        .set_size(PhysicalSize::new(width, height))
+        .map_err(|error| format!("Failed to resize View content window: {error}"))?;
+    window
+        .set_position(PhysicalPosition::new(x, y))
+        .map_err(|error| format!("Failed to move View content window: {error}"))?;
+    set_view_content_window_visible(window, request.visible)
+}
+
+#[cfg(target_os = "windows")]
+fn set_view_content_window_visible_no_activate(
+    window: &tauri::WebviewWindow,
+    visible: bool,
+) -> Result<(), String> {
+    use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE, SW_SHOWNOACTIVATE};
+
+    let hwnd = window
+        .hwnd()
+        .map_err(|error| format!("Failed to read View content HWND: {error}"))?;
+    unsafe {
+        let _ = ShowWindow(hwnd, if visible { SW_SHOWNOACTIVATE } else { SW_HIDE });
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn position_view_content_child_window(
+    window: &tauri::WebviewWindow,
+    host_window: &tauri::WebviewWindow,
+    request: &ViewContentMountRequest,
+) -> Result<(), String> {
+    use windows::Win32::Foundation::{HWND, POINT};
+    use windows::Win32::Graphics::Gdi::ScreenToClient;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetParent, GetWindowLongPtrW, SetParent, SetWindowLongPtrW, SetWindowPos, ShowWindow,
+        GWL_STYLE, HWND_TOP, SWP_FRAMECHANGED, SWP_NOACTIVATE, SW_HIDE, SW_SHOWNOACTIVATE,
+        WS_CAPTION, WS_CHILD, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU, WS_THICKFRAME,
+    };
+
+    let child = window
+        .hwnd()
+        .map_err(|error| format!("Failed to read View content HWND: {error}"))?;
+    let parent = host_window
+        .hwnd()
+        .map_err(|error| format!("Failed to read View host HWND: {error}"))?;
+
+    if !request.visible {
+        unsafe {
+            let _ = ShowWindow(child, SW_HIDE);
+        }
+        return Ok(());
+    }
+
+    let x = request.x.round() as i32;
+    let y = request.y.round() as i32;
+    let width = request.width.max(1.0).round() as i32;
+    let height = request.height.max(1.0).round() as i32;
+
+    unsafe {
+        let style = GetWindowLongPtrW(child, GWL_STYLE);
+        let current_style = style as u32;
+        let frame_style_mask = WS_POPUP.0
+            | WS_CAPTION.0
+            | WS_THICKFRAME.0
+            | WS_MINIMIZEBOX.0
+            | WS_MAXIMIZEBOX.0
+            | WS_SYSMENU.0;
+        let next_style = (current_style & !frame_style_mask) | WS_CHILD.0;
+        let current_parent = GetParent(child).unwrap_or(HWND(std::ptr::null_mut()));
+        let needs_style_update = next_style != current_style;
+        let needs_parent_update = current_parent != parent || (current_style & WS_CHILD.0) == 0;
+
+        if needs_style_update {
+            SetWindowLongPtrW(child, GWL_STYLE, next_style as isize);
+        }
+        if needs_parent_update {
+            SetParent(child, Some(parent))
+                .map_err(|error| format!("SetParent failed for View content window: {error}"))?;
+        }
+
+        let mut top_left = POINT { x, y };
+        if !ScreenToClient(parent, &mut top_left).as_bool() {
+            return Err("ScreenToClient failed for View content window".to_string());
+        }
+
+        let flags = if needs_style_update || needs_parent_update {
+            SWP_NOACTIVATE | SWP_FRAMECHANGED
+        } else {
+            SWP_NOACTIVATE
+        };
+        SetWindowPos(
+            child,
+            Some(HWND_TOP),
+            top_left.x,
+            top_left.y,
+            width,
+            height,
+            flags,
+        )
+        .map_err(|error| format!("SetWindowPos failed for View content window: {error}"))?;
+        let _ = ShowWindow(child, SW_SHOWNOACTIVATE);
+    }
+
+    Ok(())
+}
+
+fn apply_view_content_window_geometry(
+    app_handle: &AppHandle,
+    window: &tauri::WebviewWindow,
+    request: &ViewContentMountRequest,
+) -> Result<(), String> {
+    let host_label = sanitize_view_host_label(&request.host_label)?;
+    #[cfg(target_os = "windows")]
+    if let Some(host_window) = app_handle.get_webview_window(&host_label) {
+        return position_view_content_child_window(window, &host_window, request);
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = host_label;
+    }
+
+    apply_view_content_overlay_geometry(window, request)
+}
+
+fn build_view_content_window(
+    app_handle: &AppHandle,
+    label: &str,
+    host_url: &str,
+    title: &str,
+    request: &ViewContentMountRequest,
+) -> Result<tauri::WebviewWindow, String> {
+    let width = request.width.max(1.0);
+    let height = request.height.max(1.0);
+    tauri::WebviewWindowBuilder::new(
+        app_handle,
+        label,
+        WebviewUrl::App(host_url.to_string().into()),
+    )
+    .title(title.to_string())
+    .position(request.x, request.y)
+    .inner_size(width, height)
+    .decorations(false)
+    .resizable(false)
+    .shadow(false)
+    .skip_taskbar(true)
+    .focused(false)
+    .visible(false)
+    .disable_drag_drop_handler()
+    .build()
+    .map_err(|error| format!("Failed to create View content window: {error}"))
+}
+
+pub async fn mount_view_content_window(
+    app_handle: &AppHandle,
+    working_dir: &str,
+    request: ViewContentMountRequest,
+) -> Result<ViewRunResult, String> {
+    let id = normalize_view_id(&request.view_id)?;
+    let label = view_content_window_label(&id);
+    let host_url = view_content_host_url(&id);
+    cancel_view_content_destroy(&label);
+    let existing_window = app_handle.get_webview_window(&label);
+
+    let (window, package_root) = if let Some(window) = existing_window {
+        let package_root = view_content_package_roots()
+            .lock()
+            .ok()
+            .and_then(|roots| roots.get(&label).cloned())
+            .unwrap_or_default();
+        (window, package_root)
+    } else {
+        let detail = read_view_sync(working_dir, &id)?;
+        let _unity_status = ensure_view_open_requirements(working_dir, &detail.manifest).await?;
+        let window = build_view_content_window(
+            app_handle,
+            &label,
+            &host_url,
+            &format!("{} - Locus View", detail.summary.name),
+            &request,
+        )?;
+        if let Ok(mut roots) = view_content_package_roots().lock() {
+            roots.insert(label.clone(), detail.summary.package_root.clone());
+        }
+        if let Err(error) = start_view_file_watcher(app_handle, working_dir, &id) {
+            eprintln!(
+                "[Locus] failed to watch View package '{}' for reload: {}",
+                id, error
+            );
+        }
+        (window, detail.summary.package_root)
+    };
+
+    apply_view_content_window_geometry(app_handle, &window, &request)?;
+
+    Ok(ViewRunResult {
+        id,
+        window_label: label,
+        host_url,
+        package_root,
+    })
+}
+
+pub fn hide_view_content_window(app_handle: &AppHandle, view_id: &str) -> Result<(), String> {
+    let id = normalize_view_id(view_id)?;
+    let label = view_content_window_label(&id);
+    let window = app_handle.get_webview_window(&label);
+    if let Some(window) = window {
+        set_view_content_window_visible(&window, false)?;
+        schedule_view_content_destroy(app_handle, label);
+    }
+    Ok(())
+}
+
+pub fn destroy_view_content_window(app_handle: &AppHandle, view_id: &str) -> Result<(), String> {
+    let id = normalize_view_id(view_id)?;
+    let label = view_content_window_label(&id);
+    destroy_view_content_window_on_main(app_handle, &label);
+    Ok(())
+}
+
 pub async fn open_view_window(
+    app_handle: &AppHandle,
+    working_dir: &str,
+    view_id: &str,
+    view_windows_above_main: bool,
+    view_open_in_existing_window: bool,
+) -> Result<ViewRunResult, String> {
+    let detail = read_view_sync(working_dir, view_id)?;
+    let unity_status = ensure_view_open_requirements(working_dir, &detail.manifest).await?;
+    let id = detail.summary.id.clone();
+    let label = view_window_label(&id);
+    let host_url = format!("{}?id={}", VIEW_HOST_ROUTE, id);
+
+    if let Some(host_label) = registered_view_host_label(&id) {
+        if app_handle.get_webview_window(&host_label).is_some() {
+            let target_host_url = view_host_url_for_label(&id, &host_label);
+            return focus_view_host_window(
+                app_handle,
+                working_dir,
+                &id,
+                &host_label,
+                &target_host_url,
+                &detail.summary.package_root,
+                unity_status.as_ref(),
+                "registered-host",
+                false,
+            );
+        }
+        clear_registered_view_host(&id);
+    }
+
+    if let Some(window) = app_handle.get_webview_window(&label) {
+        emit_view_host_tab_select(app_handle, &label, &id, false);
+        focus_view_host_window_with_unity_owner_guard(
+            app_handle,
+            working_dir,
+            &window,
+            &label,
+            unity_status.as_ref(),
+        )?;
+    } else if app_handle
+        .get_webview_window(&unity_embed_view_window_label(&id))
+        .is_some()
+    {
+        let unity_label = unity_embed_view_window_label(&id);
+        let unity_host_url = view_host_url_for_label(&id, &unity_label);
+        return focus_view_host_window(
+            app_handle,
+            working_dir,
+            &id,
+            &unity_label,
+            &unity_host_url,
+            &detail.summary.package_root,
+            unity_status.as_ref(),
+            "existing-unity-embed-host",
+            true,
+        );
+    } else {
+        if view_open_in_existing_window {
+            if let Some(target_label) = reusable_view_host_window_label(app_handle, &id) {
+                let target_host_url = view_host_url_for_label(&id, &target_label);
+                return merge_view_tab_into_host_window(
+                    app_handle,
+                    working_dir,
+                    &id,
+                    &target_label,
+                    &target_host_url,
+                    &detail.summary.package_root,
+                    unity_status.as_ref(),
+                );
+            }
+        }
+        build_view_window(
+            app_handle,
+            &label,
+            &host_url,
+            &format!("{} - Locus View", detail.summary.name),
+            None,
+            view_windows_above_main,
+        )?;
+        track_view_host_unity_owner(working_dir, &label, unity_status.as_ref());
+    }
+
+    if let Err(error) = set_view_tab_host_sync(ViewSetTabHostRequest {
+        host_label: label.clone(),
+        view_ids: vec![id.clone()],
+        keep_existing_for_host: false,
+    }) {
+        eprintln!(
+            "[Locus ViewHost] open register failed view_id={} target={} error={}",
+            id, label, error
+        );
+    }
+
+    if let Err(error) = start_view_file_watcher(app_handle, working_dir, &id) {
+        eprintln!(
+            "[Locus] failed to watch View package '{}' for reload: {}",
+            id, error
+        );
+    }
+
+    Ok(ViewRunResult {
+        id,
+        window_label: label,
+        host_url,
+        package_root: detail.summary.package_root,
+    })
+}
+
+pub async fn open_view_unity_embed_window(
     app_handle: &AppHandle,
     working_dir: &str,
     view_id: &str,
 ) -> Result<ViewRunResult, String> {
     let detail = read_view_sync(working_dir, view_id)?;
-    ensure_view_open_requirements(working_dir, &detail.manifest).await?;
+    let unity_status = ensure_view_open_requirements(working_dir, &detail.manifest).await?;
     let id = detail.summary.id.clone();
-    let label = view_window_label(&id);
-    let host_url = format!("{}?id={}", VIEW_HOST_ROUTE, id);
+    let unity_label = unity_embed_view_window_label(&id);
+    let unity_host_url = crate::commands::unity_embed_host_url(&format!("view-{id}"), "view", &id);
 
-    if let Some(window) = app_handle.get_webview_window(&label) {
-        window
-            .set_focus()
-            .map_err(|e| format!("Failed to focus View window: {}", e))?;
+    if let Some(host_label) = registered_view_host_label(&id) {
+        if app_handle.get_webview_window(&host_label).is_some() {
+            let target_host_url = view_host_url_for_label(&id, &host_label);
+            return focus_view_host_window(
+                app_handle,
+                working_dir,
+                &id,
+                &host_label,
+                &target_host_url,
+                &detail.summary.package_root,
+                unity_status.as_ref(),
+                "registered-host",
+                false,
+            );
+        }
+        clear_registered_view_host(&id);
+    }
+
+    if app_handle.get_webview_window(&unity_label).is_some() {
+        return focus_view_host_window(
+            app_handle,
+            working_dir,
+            &id,
+            &unity_label,
+            &unity_host_url,
+            &detail.summary.package_root,
+            unity_status.as_ref(),
+            "existing-unity-embed-host",
+            true,
+        );
+    }
+
+    let default_label = view_window_label(&id);
+    if app_handle.get_webview_window(&default_label).is_some() {
+        let default_host_url = view_host_url_for_label(&id, &default_label);
+        return focus_view_host_window(
+            app_handle,
+            working_dir,
+            &id,
+            &default_label,
+            &default_host_url,
+            &detail.summary.package_root,
+            unity_status.as_ref(),
+            "existing-default-host",
+            true,
+        );
+    }
+
+    let result = crate::commands::open_unity_embed_frontend_window_for_request(
+        working_dir,
+        crate::commands::UnityEmbedOpenFrontendWindowRequest {
+            window_id: Some(format!("view-{id}")),
+            target_kind: "view".to_string(),
+            target_id: Some(id.clone()),
+            title: Some(detail.summary.name.clone()),
+        },
+    )
+    .await?;
+
+    if let Err(error) = set_view_tab_host_sync(ViewSetTabHostRequest {
+        host_label: result.window_label.clone(),
+        view_ids: vec![id.clone()],
+        keep_existing_for_host: false,
+    }) {
+        eprintln!(
+            "[Locus ViewHost] open-unity register failed view_id={} target={} error={}",
+            id, result.window_label, error
+        );
+    }
+
+    if let Err(error) = start_view_file_watcher(app_handle, working_dir, &id) {
+        eprintln!(
+            "[Locus] failed to watch View package '{}' for reload: {}",
+            id, error
+        );
+    }
+
+    Ok(ViewRunResult {
+        id,
+        window_label: result.window_label,
+        host_url: result.host_url,
+        package_root: detail.summary.package_root,
+    })
+}
+
+pub async fn detach_view_tab_window(
+    app_handle: &AppHandle,
+    working_dir: &str,
+    request: ViewDetachTabRequest,
+    view_windows_above_main: bool,
+) -> Result<ViewRunResult, String> {
+    let detail = read_view_sync(working_dir, &request.view_id)?;
+    let unity_status = ensure_view_open_requirements(working_dir, &detail.manifest).await?;
+    let id = detail.summary.id.clone();
+    let default_label = view_window_label(&id);
+    let source_label = request
+        .source_host_label
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_default();
+    let pool_label = take_view_host_pool_window(app_handle);
+    let using_pool = pool_label.is_some();
+    let label = pool_label.unwrap_or_else(|| {
+        if source_label == default_label {
+            detached_view_window_label(&id)
+        } else {
+            default_label
+        }
+    });
+    let host_url = if using_pool {
+        VIEW_HOST_POOL_ROUTE.to_string()
     } else {
-        tauri::WebviewWindowBuilder::new(
+        format!("{}?id={}", VIEW_HOST_ROUTE, id)
+    };
+    let position = match (request.x, request.y) {
+        (Some(x), Some(y)) => Some((x, y)),
+        _ => None,
+    };
+
+    let existing_window = app_handle.get_webview_window(&label);
+    if let Some(window) = existing_window {
+        if using_pool {
+            configure_claimed_view_host_pool_window(
+                app_handle,
+                &window,
+                &format!("{} - Locus View", detail.summary.name),
+                position,
+            )?;
+            track_view_host_unity_owner(working_dir, &label, unity_status.as_ref());
+        } else {
+            focus_view_host_window_with_unity_owner_guard(
+                app_handle,
+                working_dir,
+                &window,
+                &label,
+                unity_status.as_ref(),
+            )?;
+        }
+    } else {
+        build_view_window(
             app_handle,
             &label,
-            WebviewUrl::App(host_url.clone().into()),
-        )
-        .title(format!("{} - Locus View", detail.summary.name))
-        .inner_size(1180.0, 760.0)
-        .min_inner_size(760.0, 480.0)
-        .decorations(false)
-        .resizable(true)
-        .visible(true)
-        .disable_drag_drop_handler()
-        .build()
-        .map_err(|e| format!("Failed to open View window: {}", e))?;
+            &host_url,
+            &format!("{} - Locus View", detail.summary.name),
+            position,
+            view_windows_above_main,
+        )?;
+        track_view_host_unity_owner(working_dir, &label, unity_status.as_ref());
+    }
+
+    if let Err(error) = set_view_tab_host_sync(ViewSetTabHostRequest {
+        host_label: label.clone(),
+        view_ids: vec![id.clone()],
+        keep_existing_for_host: false,
+    }) {
+        eprintln!(
+            "[Locus ViewHost] detach register failed view_id={} target={} error={}",
+            id, label, error
+        );
+    }
+    emit_view_host_tab_select(app_handle, &label, &id, using_pool);
+
+    if using_pool {
+        if let Err(error) = ensure_view_host_pool_window(app_handle, view_windows_above_main) {
+            eprintln!("[Locus ViewHostPool] replenish failed: {}", error);
+        }
     }
 
     if let Err(error) = start_view_file_watcher(app_handle, working_dir, &id) {
@@ -2025,14 +4383,14 @@ pub async fn open_view_window(
 async fn ensure_view_open_requirements(
     working_dir: &str,
     manifest: &ViewManifest,
-) -> Result<(), String> {
+) -> Result<Option<crate::unity_bridge::UnityConnectionStatus>, String> {
     if !view_manifest_requirements(manifest).unity_connection {
-        return Ok(());
+        return Ok(None);
     }
 
     let status = crate::unity_bridge::query_unity_connection_status(working_dir).await;
     if status.connected {
-        return Ok(());
+        return Ok(Some(status));
     }
 
     Err(format!(
@@ -2052,9 +4410,24 @@ pub async fn request_view_automation(
     payload: serde_json::Value,
     timeout_ms: u64,
 ) -> Result<serde_json::Value, String> {
-    let label = view_window_label(view_id);
-    let window = app_handle
-        .get_webview_window(&label)
+    let host_label = active_view_window_label(app_handle, view_id);
+    let content_label = view_content_window_label(view_id);
+    let host_window = app_handle.get_webview_window(&host_label);
+    let content_window_open = app_handle.get_webview_window(&content_label).is_some();
+    if host_window.is_none() && !content_window_open {
+        return Err(format!(
+            "View '{}' is not open. Use view_run first.",
+            view_id
+        ));
+    }
+    if host_window.is_some() {
+        emit_view_host_tab_select(app_handle, &host_label, view_id, false);
+    } else {
+        emit_view_host_tab_select(app_handle, &content_label, view_id, false);
+    }
+    let initial_window = app_handle
+        .get_webview_window(&content_label)
+        .or_else(|| app_handle.get_webview_window(&host_label))
         .ok_or_else(|| format!("View '{}' is not open. Use view_run first.", view_id))?;
     let store = app_handle.state::<std::sync::Arc<ViewAutomationStore>>();
     let request_id = format!("view-auto-{}", uuid::Uuid::new_v4());
@@ -2071,6 +4444,7 @@ pub async fn request_view_automation(
     let retry_interval = Duration::from_millis(200);
     let started_at = Instant::now();
     let mut rx = rx;
+    let mut window = initial_window;
     let reply = loop {
         if let Err(error) = window.emit(VIEW_AUTOMATION_REQUEST_EVENT, event.clone()) {
             store.cancel(&request_id);
@@ -2093,7 +4467,15 @@ pub async fn request_view_automation(
                 store.cancel(&request_id);
                 return Err("View automation response channel closed".to_string());
             }
-            Err(_) => continue,
+            Err(_) => {
+                if let Some(next_window) = app_handle
+                    .get_webview_window(&content_label)
+                    .or_else(|| app_handle.get_webview_window(&host_label))
+                {
+                    window = next_window;
+                }
+                continue;
+            }
         }
     };
 
@@ -2137,7 +4519,29 @@ pub async fn capture_view_window(
         Microsoft::Web::WebView2::Win32::ICoreWebView2,
     };
 
-    let label = view_window_label(view_id);
+    let host_label = active_view_window_label(app_handle, view_id);
+    let content_label = view_content_window_label(view_id);
+    if app_handle.get_webview_window(&host_label).is_none()
+        && app_handle.get_webview_window(&content_label).is_none()
+    {
+        return Err(format!(
+            "View '{}' is not open. Use view_run first.",
+            view_id
+        ));
+    }
+    emit_view_host_tab_select(app_handle, &host_label, view_id, false);
+    let _ = request_view_automation(
+        app_handle,
+        view_id,
+        "wait",
+        serde_json::json!({
+            "condition": "runtimeReady",
+            "timeoutMs": 3000,
+        }),
+        3500,
+    )
+    .await;
+    let label = active_view_content_window_label(app_handle, view_id).unwrap_or(host_label);
     let window = app_handle
         .get_webview_window(&label)
         .ok_or_else(|| format!("View '{}' is not open. Use view_run first.", view_id))?;
@@ -2446,6 +4850,7 @@ pub fn append_view_frontend_log_sync(
         std::fs::create_dir_all(parent)
             .map_err(|error| format!("Failed to create {}: {}", parent.display(), error))?;
     }
+    expire_view_frontend_log_for_process(&log_path)?;
 
     let entry = serde_json::json!({
         "time": now_millis(),
@@ -2470,6 +4875,7 @@ pub fn read_view_frontend_log_sync(
     request: ViewFrontendLogReadRequest,
 ) -> Result<Vec<ViewFrontendLogEntry>, String> {
     let log_path = frontend_log_path_for_view(working_dir, &request.view_id)?;
+    expire_view_frontend_log_for_process(&log_path)?;
     if !log_path.is_file() {
         return Ok(Vec::new());
     }
@@ -2500,6 +4906,7 @@ pub fn open_view_frontend_log_sync(working_dir: &str, view_id: &str) -> Result<(
         std::fs::create_dir_all(parent)
             .map_err(|error| format!("Failed to create {}: {}", parent.display(), error))?;
     }
+    expire_view_frontend_log_for_process(&log_path)?;
     if !log_path.exists() {
         OpenOptions::new()
             .create(true)
@@ -2517,6 +4924,149 @@ fn frontend_log_path_for_view(working_dir: &str, view_id: &str) -> Result<PathBu
     }
     load_manifest_from_root(&root)?;
     package_path(&root, VIEW_FRONTEND_LOG_REL_PATH)
+}
+
+fn current_process_frontend_log_paths() -> &'static Mutex<BTreeSet<PathBuf>> {
+    static CURRENT_PROCESS_FRONTEND_LOG_PATHS: OnceLock<Mutex<BTreeSet<PathBuf>>> = OnceLock::new();
+    CURRENT_PROCESS_FRONTEND_LOG_PATHS.get_or_init(|| Mutex::new(BTreeSet::new()))
+}
+
+fn expire_view_frontend_log_for_process(log_path: &Path) -> Result<(), String> {
+    let key = dunce::canonicalize(log_path).unwrap_or_else(|_| log_path.to_path_buf());
+    let mut paths = current_process_frontend_log_paths()
+        .lock()
+        .map_err(|_| "View frontend log expiration is unavailable.".to_string())?;
+    if paths.contains(&key) {
+        return Ok(());
+    }
+    if log_path.is_file() {
+        OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(log_path)
+            .map_err(|error| format!("Failed to expire {}: {}", log_path.display(), error))?;
+    }
+    paths.insert(key);
+    Ok(())
+}
+
+fn view_storage_lock() -> &'static Mutex<()> {
+    static VIEW_STORAGE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    VIEW_STORAGE_LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn normalize_view_storage_key(key: &str) -> Result<String, String> {
+    let normalized = key.trim();
+    if normalized.is_empty() {
+        return Err("View storage key cannot be empty.".to_string());
+    }
+    if normalized.len() > 256 {
+        return Err("View storage key is too long.".to_string());
+    }
+    if normalized.chars().any(|ch| ch.is_control()) {
+        return Err("View storage key contains an invalid character.".to_string());
+    }
+    Ok(normalized.to_string())
+}
+
+fn storage_path_for_view(working_dir: &str, view_id: &str) -> Result<PathBuf, String> {
+    let normalized_id = normalize_view_id(view_id)?;
+    let root = resolve_view_package_root(working_dir, &normalized_id)?;
+    if !root.is_dir() || !manifest_path(&root).is_file() {
+        return Err(format!("View package not found: {}", view_id));
+    }
+    let manifest = load_manifest_from_root(&root)?;
+    if manifest.id != normalized_id {
+        return Err(format!(
+            "View id mismatch: requested {}, manifest has {}",
+            view_id, manifest.id
+        ));
+    }
+    package_path(&root, VIEW_STORAGE_REL_PATH)
+}
+
+fn read_view_storage_file(
+    path: &Path,
+) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+    if !path.is_file() {
+        return Ok(serde_json::Map::new());
+    }
+    let raw = std::fs::read_to_string(path)
+        .map_err(|error| format!("Failed to read {}: {}", path.display(), error))?;
+    if raw.trim().is_empty() {
+        return Ok(serde_json::Map::new());
+    }
+    let value: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|error| format!("Invalid View storage file {}: {}", path.display(), error))?;
+    value.as_object().cloned().ok_or_else(|| {
+        format!(
+            "Invalid View storage file {}: expected a JSON object",
+            path.display()
+        )
+    })
+}
+
+fn write_view_storage_file(
+    path: &Path,
+    storage: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), String> {
+    if storage.is_empty() {
+        if path.exists() {
+            std::fs::remove_file(path)
+                .map_err(|error| format!("Failed to remove {}: {}", path.display(), error))?;
+        }
+        return Ok(());
+    }
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("Failed to create {}: {}", parent.display(), error))?;
+    }
+    let json = serde_json::to_string_pretty(storage)
+        .map_err(|error| format!("Failed to serialize View storage: {}", error))?;
+    std::fs::write(path, json + "\n")
+        .map_err(|error| format!("Failed to write {}: {}", path.display(), error))
+}
+
+pub fn view_storage_get_sync(
+    working_dir: &str,
+    request: ViewStorageGetRequest,
+) -> Result<Option<serde_json::Value>, String> {
+    let key = normalize_view_storage_key(&request.key)?;
+    let path = storage_path_for_view(working_dir, &request.view_id)?;
+    let _guard = view_storage_lock()
+        .lock()
+        .map_err(|_| "View storage is unavailable.".to_string())?;
+    let storage = read_view_storage_file(&path)?;
+    Ok(storage.get(&key).cloned())
+}
+
+pub fn view_storage_set_sync(
+    working_dir: &str,
+    request: ViewStorageSetRequest,
+) -> Result<(), String> {
+    let key = normalize_view_storage_key(&request.key)?;
+    let path = storage_path_for_view(working_dir, &request.view_id)?;
+    let _guard = view_storage_lock()
+        .lock()
+        .map_err(|_| "View storage is unavailable.".to_string())?;
+    let mut storage = read_view_storage_file(&path)?;
+    storage.insert(key, request.value);
+    write_view_storage_file(&path, &storage)
+}
+
+pub fn view_storage_remove_sync(
+    working_dir: &str,
+    request: ViewStorageRemoveRequest,
+) -> Result<(), String> {
+    let key = normalize_view_storage_key(&request.key)?;
+    let path = storage_path_for_view(working_dir, &request.view_id)?;
+    let _guard = view_storage_lock()
+        .lock()
+        .map_err(|_| "View storage is unavailable.".to_string())?;
+    let mut storage = read_view_storage_file(&path)?;
+    storage.remove(&key);
+    write_view_storage_file(&path, &storage)
 }
 
 pub async fn view_binding_read(
@@ -2979,14 +5529,17 @@ mod tests {
         export_view_package_sync, import_view_package_sync, is_valid_view_id,
         is_view_frontend_log_workspace_path, list_view_tree_sync, list_views_sync,
         move_view_entry_sync, normalize_package_rel_path, parse_view_create_request,
-        read_view_frontend_log_sync, read_view_sync, resolve_view_binding_target,
-        resolve_view_script_sync, should_reload_for_view_event, supported_view_templates,
+        read_view_frontend_log_sync, read_view_sync, registered_view_host_label,
+        rename_view_entry_sync, resolve_view_binding_target, resolve_view_script_sync,
+        set_view_tab_host_sync, should_reload_for_view_event, supported_view_templates,
         validate_view_binding_object_target, validate_view_binding_target, validate_view_manifest,
         view_file_watch_roots, view_manifest_requirements, view_package_root,
-        view_script_bridge_payload, view_script_cached_invoke_payload, ViewBindingDiscoverResult,
+        view_script_bridge_payload, view_script_cached_invoke_payload, view_storage_get_sync,
+        view_storage_remove_sync, view_storage_set_sync, view_tab_hosts, ViewBindingDiscoverResult,
         ViewBindingTarget, ViewBindingWriteResult, ViewExportPackageRequest,
         ViewFrontendLogReadRequest, ViewFrontendLogRequest, ViewImportPackageRequest, ViewManifest,
-        VIEW_BINDINGS_SCHEMA, VIEW_ROOT_RELATIVE, VIEW_SCHEMA,
+        ViewSetTabHostRequest, ViewStorageGetRequest, ViewStorageRemoveRequest,
+        ViewStorageSetRequest, VIEW_BINDINGS_SCHEMA, VIEW_ROOT_RELATIVE, VIEW_SCHEMA,
     };
     use notify::{
         event::{DataChange, ModifyKind},
@@ -3059,6 +5612,50 @@ mod tests {
     }
 
     #[test]
+    fn tab_host_registration_can_add_moved_tabs_without_clearing_target_tabs() {
+        view_tab_hosts().lock().unwrap().clear();
+
+        set_view_tab_host_sync(ViewSetTabHostRequest {
+            host_label: "view-target-panel".to_string(),
+            view_ids: vec!["target-panel".to_string()],
+            keep_existing_for_host: false,
+        })
+        .expect("register target host");
+        set_view_tab_host_sync(ViewSetTabHostRequest {
+            host_label: "view-source-panel".to_string(),
+            view_ids: vec!["moved-panel".to_string()],
+            keep_existing_for_host: false,
+        })
+        .expect("register source host");
+        set_view_tab_host_sync(ViewSetTabHostRequest {
+            host_label: "view-target-panel".to_string(),
+            view_ids: vec!["moved-panel".to_string()],
+            keep_existing_for_host: true,
+        })
+        .expect("move tab to target host");
+
+        assert_eq!(
+            registered_view_host_label("target-panel").as_deref(),
+            Some("view-target-panel")
+        );
+        assert_eq!(
+            registered_view_host_label("moved-panel").as_deref(),
+            Some("view-target-panel")
+        );
+
+        view_tab_hosts().lock().unwrap().clear();
+    }
+
+    #[test]
+    fn view_host_label_accepts_unity_embed_view_hosts() {
+        assert_eq!(
+            super::sanitize_view_host_label("unity-embed-view-attack-config-table").as_deref(),
+            Ok("unity-embed-view-attack-config-table")
+        );
+        assert!(super::sanitize_view_host_label("view-content-attack-config-table").is_err());
+    }
+
+    #[test]
     fn view_create_request_parses_temporary_flag() {
         let (request, temporary) = parse_view_create_request(json!({
             "id": "scratch-panel",
@@ -3091,6 +5688,7 @@ mod tests {
             name: "Material Inspector".to_string(),
             version: "0.1.0".to_string(),
             template: "blank".to_string(),
+            display_path: None,
             icon: None,
             entry: "src/main.ts".to_string(),
             style: "src/style.css".to_string(),
@@ -3117,6 +5715,7 @@ mod tests {
                 name: Some("Material Inspector".to_string()),
                 template: Some("blank".to_string()),
                 icon: None,
+                display_path: None,
             },
         )
         .expect("create view");
@@ -3145,6 +5744,7 @@ mod tests {
                 name: Some("Material Inspector".to_string()),
                 template: Some("blank".to_string()),
                 icon: None,
+                display_path: None,
             },
         )
         .expect("create view");
@@ -3184,6 +5784,7 @@ mod tests {
                 name: Some("Material Inspector".to_string()),
                 template: Some("blank".to_string()),
                 icon: None,
+                display_path: None,
             },
         )
         .expect("create view");
@@ -3214,6 +5815,7 @@ mod tests {
                 name: Some("Material Inspector".to_string()),
                 template: Some("blank".to_string()),
                 icon: None,
+                display_path: None,
             },
         )
         .expect("create first view");
@@ -3225,6 +5827,7 @@ mod tests {
                 name: Some("Stat Table".to_string()),
                 template: Some("serialized-table".to_string()),
                 icon: None,
+                display_path: None,
             },
         )
         .expect("create second view");
@@ -3265,6 +5868,7 @@ mod tests {
                 name: Some("Material Inspector".to_string()),
                 template: Some("blank".to_string()),
                 icon: None,
+                display_path: None,
             },
         )
         .expect("create first view");
@@ -3277,6 +5881,7 @@ mod tests {
                 name: Some("Material Inspector".to_string()),
                 template: Some("blank".to_string()),
                 icon: None,
+                display_path: None,
             },
         )
         .expect_err("duplicate view id should fail");
@@ -3296,6 +5901,7 @@ mod tests {
                 name: Some("Material Inspector".to_string()),
                 template: Some("blank".to_string()),
                 icon: None,
+                display_path: None,
             },
         )
         .expect("create view");
@@ -3343,6 +5949,7 @@ mod tests {
                 name: Some("Material Inspector".to_string()),
                 template: Some("blank".to_string()),
                 icon: None,
+                display_path: None,
             },
         )
         .expect("create view");
@@ -3415,6 +6022,7 @@ mod tests {
                 name: Some("Material Inspector".to_string()),
                 template: Some("blank".to_string()),
                 icon: None,
+                display_path: None,
             },
         )
         .expect("create view");
@@ -3453,6 +6061,7 @@ mod tests {
                 name: Some("Material Inspector".to_string()),
                 template: Some("blank".to_string()),
                 icon: None,
+                display_path: None,
             },
         )
         .expect("create view");
@@ -3489,6 +6098,73 @@ mod tests {
     }
 
     #[test]
+    fn frontend_log_expires_once_per_locus_process() {
+        let temp = tempdir().unwrap();
+        let working_dir = temp.path().to_string_lossy().to_string();
+        for id in ["startup-log-read", "startup-log-append"] {
+            create_view_sync(
+                &working_dir,
+                super::ViewCreateRequest {
+                    id: id.to_string(),
+                    package_name: None,
+                    name: Some(id.to_string()),
+                    template: Some("blank".to_string()),
+                    icon: None,
+                    display_path: None,
+                },
+            )
+            .expect("create view");
+        }
+
+        let package_root = default_test_view_package_root(&working_dir);
+        let read_log_path = package_root.join("startup-log-read/.locus/logs/frontend.log");
+        std::fs::create_dir_all(read_log_path.parent().expect("read log parent"))
+            .expect("create read log parent");
+        std::fs::write(
+            &read_log_path,
+            "{\"time\":1,\"level\":\"error\",\"message\":\"previous run\"}\n",
+        )
+        .expect("write stale read log");
+
+        let entries = read_view_frontend_log_sync(
+            &working_dir,
+            ViewFrontendLogReadRequest {
+                view_id: "startup-log-read".to_string(),
+                limit: Some(10),
+            },
+        )
+        .expect("read frontend log");
+        assert!(entries.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(&read_log_path).expect("read expired log"),
+            ""
+        );
+
+        let append_log_path = package_root.join("startup-log-append/.locus/logs/frontend.log");
+        std::fs::create_dir_all(append_log_path.parent().expect("append log parent"))
+            .expect("create append log parent");
+        std::fs::write(
+            &append_log_path,
+            "{\"time\":1,\"level\":\"error\",\"message\":\"previous run\"}\n",
+        )
+        .expect("write stale append log");
+
+        append_view_frontend_log_sync(
+            &working_dir,
+            ViewFrontendLogRequest {
+                view_id: "startup-log-append".to_string(),
+                level: "warn".to_string(),
+                message: "current run".to_string(),
+            },
+        )
+        .expect("append current log");
+
+        let raw = std::fs::read_to_string(&append_log_path).expect("read append log");
+        assert!(!raw.contains("previous run"));
+        assert!(raw.contains("current run"));
+    }
+
+    #[test]
     fn list_and_resolve_nested_view_packages() {
         let temp = tempdir().unwrap();
         let working_dir = temp.path().to_string_lossy().to_string();
@@ -3501,6 +6177,7 @@ mod tests {
             name: "Material Inspector".to_string(),
             version: "0.1.0".to_string(),
             template: "blank".to_string(),
+            display_path: None,
             icon: None,
             entry: "src/main.ts".to_string(),
             style: "src/style.css".to_string(),
@@ -3538,7 +6215,7 @@ mod tests {
     }
 
     #[test]
-    fn view_tree_folders_create_delete_and_move_disk_entries() {
+    fn view_tree_folders_create_delete_and_move_display_paths() {
         let temp = tempdir().unwrap();
         let working_dir = temp.path().to_string_lossy().to_string();
 
@@ -3551,7 +6228,7 @@ mod tests {
         )
         .expect("create root folder");
         assert_eq!(folder.rel_path, "Tools");
-        assert!(temp.path().join("Locus/View/Tools").is_dir());
+        assert!(!temp.path().join("Locus/View/Tools").exists());
 
         create_view_sync(
             &working_dir,
@@ -3561,6 +6238,7 @@ mod tests {
                 name: Some("Material Inspector".to_string()),
                 template: Some("blank".to_string()),
                 icon: None,
+                display_path: None,
             },
         )
         .expect("create view");
@@ -3568,30 +6246,29 @@ mod tests {
         let tree = list_view_tree_sync(&working_dir).expect("list tree");
         assert!(tree.folders.iter().any(|item| item.rel_path == "Tools"));
         let default_package = default_view_package_name(&working_dir).expect("default package");
-        assert!(tree
-            .views
-            .iter()
-            .any(|item| item.package_rel_path == format!("{default_package}/material-inspector")));
+        assert!(tree.views.iter().any(|item| item.display_path
+            == format!("{default_package}/material-inspector")
+            && item.package_rel_path == format!("{default_package}/material-inspector")));
 
         let moved = move_view_entry_sync(
             &working_dir,
             super::ViewMoveEntryRequest {
                 source_rel_path: format!("{default_package}/material-inspector"),
                 target_dir_rel_path: Some("Tools".to_string()),
+                insert_before_rel_path: None,
+                insert_after_rel_path: None,
             },
         )
-        .expect("move view into folder");
-        assert!(temp
-            .path()
-            .join("Locus/View/Tools/material-inspector")
-            .is_dir());
-        assert!(!default_test_view_package_root(&working_dir)
+        .expect("move view display path into folder");
+        assert!(default_test_view_package_root(&working_dir)
             .join("material-inspector")
-            .exists());
+            .is_dir());
+        assert!(!temp.path().join("Locus/View/Tools").exists());
         assert!(moved
             .views
             .iter()
-            .any(|item| item.package_rel_path == "Tools/material-inspector"));
+            .any(|item| item.display_path == "Tools/material-inspector"
+                && item.package_rel_path == format!("{default_package}/material-inspector")));
 
         let deleted = delete_view_entry_sync(
             &working_dir,
@@ -3601,11 +6278,162 @@ mod tests {
         )
         .expect("delete folder");
         assert!(!temp.path().join("Locus/View/Tools").exists());
+        assert!(!default_test_view_package_root(&working_dir)
+            .join("material-inspector")
+            .exists());
         assert!(deleted.views.is_empty());
-        assert!(deleted
+        assert!(!deleted.folders.iter().any(|item| item.rel_path == "Tools"));
+    }
+
+    #[test]
+    fn view_tree_move_entry_persists_manual_order() {
+        let temp = tempdir().unwrap();
+        let working_dir = temp.path().to_string_lossy().to_string();
+
+        for (id, name) in [
+            ("alpha-view", "Alpha View"),
+            ("bravo-view", "Bravo View"),
+            ("charlie-view", "Charlie View"),
+        ] {
+            create_view_sync(
+                &working_dir,
+                super::ViewCreateRequest {
+                    id: id.to_string(),
+                    package_name: None,
+                    name: Some(name.to_string()),
+                    template: Some("blank".to_string()),
+                    icon: None,
+                    display_path: None,
+                },
+            )
+            .expect("create view");
+        }
+
+        let default_package = default_view_package_name(&working_dir).expect("default package");
+        let alpha = format!("{default_package}/alpha-view");
+        let bravo = format!("{default_package}/bravo-view");
+        let charlie = format!("{default_package}/charlie-view");
+
+        let reordered = move_view_entry_sync(
+            &working_dir,
+            super::ViewMoveEntryRequest {
+                source_rel_path: charlie.clone(),
+                target_dir_rel_path: Some(default_package.clone()),
+                insert_before_rel_path: Some(bravo.clone()),
+                insert_after_rel_path: None,
+            },
+        )
+        .expect("reorder view before sibling");
+        assert_eq!(
+            reordered.order,
+            vec![alpha.clone(), charlie.clone(), bravo.clone()]
+        );
+
+        create_view_folder_sync(
+            &working_dir,
+            super::ViewCreateFolderRequest {
+                parent_rel_path: None,
+                name: "Tools".to_string(),
+            },
+        )
+        .expect("create folder");
+        move_view_entry_sync(
+            &working_dir,
+            super::ViewMoveEntryRequest {
+                source_rel_path: alpha.clone(),
+                target_dir_rel_path: Some("Tools".to_string()),
+                insert_before_rel_path: None,
+                insert_after_rel_path: None,
+            },
+        )
+        .expect("move alpha into folder");
+
+        let moved_into_folder = move_view_entry_sync(
+            &working_dir,
+            super::ViewMoveEntryRequest {
+                source_rel_path: bravo.clone(),
+                target_dir_rel_path: Some("Tools".to_string()),
+                insert_before_rel_path: Some("Tools/alpha-view".to_string()),
+                insert_after_rel_path: None,
+            },
+        )
+        .expect("move bravo into folder before alpha");
+        assert_eq!(
+            moved_into_folder.order,
+            vec![
+                charlie,
+                "Tools/bravo-view".to_string(),
+                "Tools/alpha-view".to_string(),
+            ]
+        );
+        assert!(moved_into_folder
+            .views
+            .iter()
+            .any(|view| view.display_path == "Tools/bravo-view"));
+    }
+
+    #[test]
+    fn view_tree_rename_entry_updates_view_name_and_folder_paths() {
+        let temp = tempdir().unwrap();
+        let working_dir = temp.path().to_string_lossy().to_string();
+
+        create_view_folder_sync(
+            &working_dir,
+            super::ViewCreateFolderRequest {
+                parent_rel_path: None,
+                name: "Tools".to_string(),
+            },
+        )
+        .expect("create folder");
+
+        create_view_sync(
+            &working_dir,
+            super::ViewCreateRequest {
+                id: "material-inspector".to_string(),
+                package_name: None,
+                name: Some("Material Inspector".to_string()),
+                template: Some("blank".to_string()),
+                icon: None,
+                display_path: Some("Tools/material-inspector".to_string()),
+            },
+        )
+        .expect("create view");
+
+        let renamed_view = rename_view_entry_sync(
+            &working_dir,
+            super::ViewRenameEntryRequest {
+                rel_path: "Tools/material-inspector".to_string(),
+                name: "Material Browser".to_string(),
+            },
+        )
+        .expect("rename view");
+        assert!(renamed_view.views.iter().any(|view| {
+            view.id == "material-inspector"
+                && view.name == "Material Browser"
+                && view.display_path == "Tools/material-inspector"
+        }));
+
+        let renamed_folder = rename_view_entry_sync(
+            &working_dir,
+            super::ViewRenameEntryRequest {
+                rel_path: "Tools".to_string(),
+                name: "Editors".to_string(),
+            },
+        )
+        .expect("rename folder");
+        assert!(renamed_folder
             .folders
             .iter()
-            .any(|item| item.rel_path == default_package));
+            .any(|folder| folder.rel_path == "Editors"));
+        assert!(!renamed_folder
+            .folders
+            .iter()
+            .any(|folder| folder.rel_path == "Tools"));
+        assert!(renamed_folder.views.iter().any(|view| {
+            view.id == "material-inspector"
+                && view.name == "Material Browser"
+                && view.display_path == "Editors/material-inspector"
+        }));
     }
 
     #[test]
@@ -3634,6 +6462,7 @@ mod tests {
                 name: Some("Flow Editor".to_string()),
                 template: Some("node-graph".to_string()),
                 icon: None,
+                display_path: None,
             },
         )
         .expect("create view");
@@ -3681,6 +6510,7 @@ mod tests {
                 name: Some("Canvas Board".to_string()),
                 template: Some("canvas-board".to_string()),
                 icon: None,
+                display_path: None,
             },
         )
         .expect("create view");
@@ -3717,6 +6547,7 @@ mod tests {
                 name: Some("Field Blocks".to_string()),
                 template: Some("field-blocks".to_string()),
                 icon: None,
+                display_path: None,
             },
         )
         .expect("create view");
@@ -3752,6 +6583,7 @@ mod tests {
                 name: Some("Serialized Browser".to_string()),
                 template: Some("serialized-table".to_string()),
                 icon: None,
+                display_path: None,
             },
         )
         .expect("create view");
@@ -3781,7 +6613,7 @@ mod tests {
         assert!(!app.content.contains("Add Row"));
         assert!(!app.content.contains("Add Column"));
         assert!(!app.content.contains("config-pane"));
-        assert!(app.content.contains("localStorage"));
+        assert!(app.content.contains("view.storage"));
         assert!(app.content.contains("persistColumnWidths"));
         assert!(!app.content.contains("cache hit"));
 
@@ -3829,6 +6661,7 @@ mod tests {
                 name: Some("Material Inspector".to_string()),
                 template: Some("inspector-form".to_string()),
                 icon: None,
+                display_path: None,
             },
         )
         .expect("create view");
@@ -3862,6 +6695,7 @@ mod tests {
                 name: Some("Material Inspector".to_string()),
                 template: Some("inspector-form".to_string()),
                 icon: None,
+                display_path: None,
             },
         )
         .expect("create view");
@@ -3894,6 +6728,7 @@ mod tests {
                 name: Some("Material Inspector".to_string()),
                 template: Some("blank".to_string()),
                 icon: None,
+                display_path: None,
             },
         )
         .expect("create view");
@@ -3953,6 +6788,7 @@ mod tests {
                 name: Some("Material Inspector".to_string()),
                 template: Some("blank".to_string()),
                 icon: None,
+                display_path: None,
             },
         )
         .expect("create view");

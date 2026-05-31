@@ -1,3 +1,4 @@
+mod background_hook;
 mod capture;
 mod focus;
 pub mod lua_gc_monitor;
@@ -8,7 +9,7 @@ mod transport;
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
-    sync::{Arc, OnceLock},
+    sync::{Arc, Mutex as StdMutex, OnceLock},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -16,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
 use tokio::sync::Mutex;
 
+pub use background_hook::{UnityBackgroundHookState, UnityBackgroundHookStatus};
 pub use capture::{capture_viewport, UnityViewportCapture};
 pub use plugin::{
     check_plugin_status, emit_plugin_status, find_plugin_source_dir, install_or_update_plugin,
@@ -34,6 +36,22 @@ pub use process::{
 pub use transport::{
     send_message, send_message_with_timeout, send_message_without_timeout, set_event_app_handle,
 };
+
+pub fn initialize_background_hook(enabled: bool) {
+    background_hook::initialize(enabled);
+}
+
+pub fn set_background_hook_enabled(value: bool) -> Result<UnityBackgroundHookStatus, String> {
+    background_hook::set_enabled(value)
+}
+
+pub fn background_hook_status() -> UnityBackgroundHookStatus {
+    background_hook::status()
+}
+
+pub fn restore_background_hook_runtime() -> Result<(), String> {
+    background_hook::restore_runtime_patches()
+}
 
 pub type UnityMonitorHandle = Arc<tokio::sync::Mutex<Option<tauri::async_runtime::JoinHandle<()>>>>;
 
@@ -90,6 +108,7 @@ pub struct UnityConnectionStatus {
     pub reconnect_attempts: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+    pub background_hook: UnityBackgroundHookStatus,
     pub checked_at_ms: u64,
 }
 
@@ -130,8 +149,53 @@ fn unity_operation_locks() -> &'static Mutex<HashMap<String, ProjectUnityOpLock>
     LOCKS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn unity_recompile_waits() -> &'static StdMutex<HashMap<String, u32>> {
+    static WAITS: OnceLock<StdMutex<HashMap<String, u32>>> = OnceLock::new();
+    WAITS.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+fn project_runtime_key(project_path: &str) -> String {
+    strip_extended_path_prefix(project_path).trim().to_string()
+}
+
+struct UnityRecompileWaitGuard {
+    key: String,
+}
+
+impl UnityRecompileWaitGuard {
+    fn new(project_path: &str) -> Self {
+        let key = project_runtime_key(project_path);
+        if let Ok(mut waits) = unity_recompile_waits().lock() {
+            let count = waits.entry(key.clone()).or_insert(0);
+            *count = count.saturating_add(1);
+        }
+        Self { key }
+    }
+}
+
+impl Drop for UnityRecompileWaitGuard {
+    fn drop(&mut self) {
+        if let Ok(mut waits) = unity_recompile_waits().lock() {
+            if let Some(count) = waits.get_mut(&self.key) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    waits.remove(&self.key);
+                }
+            }
+        }
+    }
+}
+
+fn unity_recompile_waiting(project_path: &str) -> bool {
+    let key = project_runtime_key(project_path);
+    unity_recompile_waits()
+        .lock()
+        .map(|waits| waits.get(&key).copied().unwrap_or(0) > 0)
+        .unwrap_or(false)
+}
+
 async fn project_unity_op_lock(project_path: &str) -> ProjectUnityOpLock {
-    let key = strip_extended_path_prefix(project_path).to_string();
+    let key = project_runtime_key(project_path);
     let mut locks = unity_operation_locks().lock().await;
     locks
         .entry(key)
@@ -504,6 +568,75 @@ fn apply_unity_process_info(
     status.process_last_error = process_info.last_error;
 }
 
+fn unity_process_info_from_status(
+    status: &UnityConnectionStatus,
+) -> Option<UnityEditorProcessInfo> {
+    let process_id = status.editor_process_id?;
+    Some(UnityEditorProcessInfo {
+        state: status.editor_process_state.clone(),
+        process_id: Some(process_id),
+        executable_path: status.editor_process_path.clone(),
+        project_path: status.editor_project_path.clone(),
+        checked_at_ms: status.process_checked_at_ms.unwrap_or(status.checked_at_ms),
+        last_error: status.process_last_error.clone(),
+    })
+}
+
+async fn sync_background_hook_for_status(status: &mut UnityConnectionStatus) {
+    let Some(process_id) = status.editor_process_id else {
+        status.background_hook = if background_hook::enabled() {
+            UnityBackgroundHookStatus {
+                enabled: true,
+                supported: cfg!(target_os = "windows"),
+                state: UnityBackgroundHookState::Inactive,
+                patched: false,
+                process_id: None,
+                editor_process_path: None,
+                symbol_count: 0,
+                error: None,
+                updated_at_ms: unix_now_ms(),
+            }
+        } else {
+            background_hook::status()
+        };
+        return;
+    };
+
+    let Some(editor_process_path) = status.editor_process_path.clone() else {
+        status.background_hook = UnityBackgroundHookStatus {
+            enabled: background_hook::enabled(),
+            supported: cfg!(target_os = "windows"),
+            state: UnityBackgroundHookState::Failed,
+            patched: false,
+            process_id: Some(process_id),
+            editor_process_path: None,
+            symbol_count: 0,
+            error: Some("Unity process path is unavailable".to_string()),
+            updated_at_ms: unix_now_ms(),
+        };
+        return;
+    };
+
+    let hook_status = tauri::async_runtime::spawn_blocking(move || {
+        background_hook::sync_for_process(process_id, &editor_process_path)
+    })
+    .await
+    .map_err(|error| format!("Unity background hook task failed: {error}"))
+    .and_then(|result| result)
+    .unwrap_or_else(|error| UnityBackgroundHookStatus {
+        enabled: background_hook::enabled(),
+        supported: cfg!(target_os = "windows"),
+        state: UnityBackgroundHookState::Failed,
+        patched: false,
+        process_id: Some(process_id),
+        editor_process_path: status.editor_process_path.clone(),
+        symbol_count: 0,
+        error: Some(error),
+        updated_at_ms: unix_now_ms(),
+    });
+    status.background_hook = hook_status;
+}
+
 pub async fn query_unity_connection_status(project_path: &str) -> UnityConnectionStatus {
     let pipe_name = get_pipe_name(project_path);
     let checked_at_ms = unix_now_ms();
@@ -514,7 +647,7 @@ pub async fn query_unity_connection_status(project_path: &str) -> UnityConnectio
             let latency_ms = started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
             let message = resp.message.unwrap_or_default();
             let (editor_status, scene_path) = parse_unity_status_message(&message);
-            UnityConnectionStatus {
+            let mut status = UnityConnectionStatus {
                 connected: true,
                 editor_status: editor_status.to_string(),
                 scene_path,
@@ -528,8 +661,13 @@ pub async fn query_unity_connection_status(project_path: &str) -> UnityConnectio
                 latency_ms: Some(latency_ms),
                 reconnect_attempts: 0,
                 last_error: None,
+                background_hook: background_hook::status(),
                 checked_at_ms,
-            }
+            };
+            let process_info = query_current_project_editor_process(project_path).await;
+            apply_unity_process_info(&mut status, process_info);
+            sync_background_hook_for_status(&mut status).await;
+            status
         }
         Ok(resp) => {
             let latency_ms = started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
@@ -550,10 +688,12 @@ pub async fn query_unity_connection_status(project_path: &str) -> UnityConnectio
                     resp.error
                         .unwrap_or_else(|| "Unity status returned ok=false".to_string()),
                 ),
+                background_hook: background_hook::status(),
                 checked_at_ms,
             };
             let process_info = query_current_project_editor_process(project_path).await;
             apply_unity_process_info(&mut status, process_info);
+            sync_background_hook_for_status(&mut status).await;
             status
         }
         Err(error) => {
@@ -571,11 +711,45 @@ pub async fn query_unity_connection_status(project_path: &str) -> UnityConnectio
                 latency_ms: None,
                 reconnect_attempts: 0,
                 last_error: Some(error),
+                background_hook: background_hook::status(),
                 checked_at_ms,
             };
             let process_info = query_current_project_editor_process(project_path).await;
             apply_unity_process_info(&mut status, process_info);
+            sync_background_hook_for_status(&mut status).await;
             status
+        }
+    }
+}
+
+pub async fn ensure_background_hook_for_project(
+    project_path: &str,
+) -> Result<UnityBackgroundHookStatus, String> {
+    if !background_hook::enabled() {
+        return Ok(background_hook::status());
+    }
+    let process_info = query_current_project_editor_process(project_path).await;
+    let process_id = process_info.process_id.ok_or_else(|| {
+        process_info
+            .last_error
+            .unwrap_or_else(|| "Unity Editor process was not found".to_string())
+    })?;
+    let editor_process_path = process_info
+        .executable_path
+        .ok_or_else(|| "Unity process path is unavailable".to_string())?;
+    tauri::async_runtime::spawn_blocking(move || {
+        background_hook::sync_for_process(process_id, &editor_process_path)
+    })
+    .await
+    .map_err(|error| format!("Unity background hook task failed: {error}"))?
+}
+
+pub async fn background_hook_effective_for_project(project_path: &str) -> bool {
+    match ensure_background_hook_for_project(project_path).await {
+        Ok(status) => status.enabled && status.patched,
+        Err(error) => {
+            eprintln!("[Locus] Unity background hook unavailable: {error}");
+            false
         }
     }
 }
@@ -671,6 +845,45 @@ pub async fn open_scene_object_inspector(
         Err(resp
             .error
             .unwrap_or_else(|| "open_scene_object_inspector failed".to_string()))
+    }
+}
+
+pub async fn start_asset_drag(project_path: &str, payload: &str) -> Result<(), String> {
+    let op_lock = project_unity_op_lock(project_path).await;
+    let _guard = op_lock.lock().await;
+    let resp = send_message(project_path, "start_asset_drag", payload).await?;
+    if resp.ok {
+        Ok(())
+    } else {
+        Err(resp
+            .error
+            .unwrap_or_else(|| "start_asset_drag failed".to_string()))
+    }
+}
+
+pub async fn cancel_asset_drag(project_path: &str) -> Result<(), String> {
+    let op_lock = project_unity_op_lock(project_path).await;
+    let _guard = op_lock.lock().await;
+    let resp = send_message(project_path, "cancel_asset_drag", "").await?;
+    if resp.ok {
+        Ok(())
+    } else {
+        Err(resp
+            .error
+            .unwrap_or_else(|| "cancel_asset_drag failed".to_string()))
+    }
+}
+
+pub async fn open_frontend_window(project_path: &str, payload: &str) -> Result<(), String> {
+    let op_lock = project_unity_op_lock(project_path).await;
+    let _guard = op_lock.lock().await;
+    let resp = send_message(project_path, "open_frontend_window", payload).await?;
+    if resp.ok {
+        Ok(())
+    } else {
+        Err(resp
+            .error
+            .unwrap_or_else(|| "open_frontend_window failed".to_string()))
     }
 }
 
@@ -1958,7 +2171,13 @@ async fn refresh_unity_type_index_after_recompile(project_path: &str) -> Result<
 pub async fn recompile_and_wait(project_path: &str) -> Result<String, String> {
     let op_lock = project_unity_op_lock(project_path).await;
     let _guard = op_lock.lock().await;
-    let prev_foreground = focus::bring_unity_to_foreground();
+    let _recompile_wait_guard = UnityRecompileWaitGuard::new(project_path);
+    let hook_effective = background_hook_effective_for_project(project_path).await;
+    let prev_foreground = if hook_effective {
+        None
+    } else {
+        focus::bring_unity_to_foreground()
+    };
 
     let finish = |result: Result<String, String>| -> Result<String, String> {
         if let Some(hwnd) = prev_foreground {
@@ -2085,11 +2304,13 @@ pub async fn start_unity_monitor(
 
     let handle = tauri::async_runtime::spawn(async move {
         let mut last_status: Option<bool> = None;
+        let mut last_detected_editor_process: Option<UnityEditorProcessInfo> = None;
         let mut disconnected_attempts: u32 = 0;
 
         loop {
             let mut status = query_unity_connection_status(&project_path).await;
             let connected = status.connected;
+            let disconnected_transition = last_status == Some(true) && !connected;
 
             if connected {
                 if last_status != Some(true) {
@@ -2130,9 +2351,36 @@ pub async fn start_unity_monitor(
                 }
             }
 
+            if disconnected_transition && !unity_recompile_waiting(&project_path) {
+                if let Some(process_info) = process::refresh_known_project_editor_process_liveness(
+                    &project_path,
+                    last_detected_editor_process.clone(),
+                )
+                .await
+                {
+                    let process_not_running =
+                        matches!(process_info.state, UnityEditorProcessState::NotRunning);
+                    apply_unity_process_info(&mut status, process_info);
+                    if process_not_running {
+                        sync_background_hook_for_status(&mut status).await;
+                    }
+                }
+            }
+
             if connected {
                 status.reconnect_attempts = 0;
             }
+
+            last_detected_editor_process = unity_process_info_from_status(&status);
+            crate::view::sync_unity_owned_view_windows_for_project(
+                &app_handle,
+                &project_path,
+                status.editor_process_id,
+                matches!(
+                    status.editor_process_state,
+                    UnityEditorProcessState::Running
+                ),
+            );
 
             let _ = app_handle.emit("unity-connection-status-detail", status.clone());
 

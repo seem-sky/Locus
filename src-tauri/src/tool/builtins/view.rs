@@ -1,4 +1,6 @@
 use super::{make_exec, ToolDef, ToolExecutionContext, ToolResult};
+use std::sync::Arc;
+use tauri::Manager;
 
 fn working_dir_or_error(ctx: &ToolExecutionContext, tool_name: &str) -> Result<String, ToolResult> {
     match ctx.working_dir.as_deref().map(str::trim) {
@@ -205,7 +207,23 @@ pub(super) fn view_run() -> ToolDef {
                     };
                 };
                 let app_handle = app_handle.clone();
-                match crate::view::open_view_window(&app_handle, &working_dir, &view_id).await {
+                let view_windows_above_main = app_handle
+                    .try_state::<Arc<crate::config::AppConfig>>()
+                    .map(|config| config.view_windows_above_main_enabled())
+                    .unwrap_or(false);
+                let view_open_in_existing_window = app_handle
+                    .try_state::<Arc<crate::config::AppConfig>>()
+                    .map(|config| config.view_open_in_existing_window_enabled())
+                    .unwrap_or(true);
+                match crate::view::open_view_window(
+                    &app_handle,
+                    &working_dir,
+                    &view_id,
+                    view_windows_above_main,
+                    view_open_in_existing_window,
+                )
+                .await
+                {
                     Ok(result) => json_output(&result),
                     Err(error) => ToolResult {
                         output: error,

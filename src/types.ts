@@ -86,6 +86,25 @@ export interface AssetRefAttachment {
 
 export type UnityEditorProcessState = "running" | "not_running" | "unknown";
 
+export type UnityBackgroundHookState =
+  | "disabled"
+  | "inactive"
+  | "patched"
+  | "failed"
+  | "unsupported";
+
+export interface UnityBackgroundHookStatus {
+  enabled: boolean;
+  supported: boolean;
+  state: UnityBackgroundHookState;
+  patched: boolean;
+  processId?: number | null;
+  editorProcessPath?: string | null;
+  symbolCount: number;
+  error?: string | null;
+  updatedAtMs: number;
+}
+
 export interface UnityConnectionStatus {
   connected: boolean;
   editorStatus: string;
@@ -100,6 +119,7 @@ export interface UnityConnectionStatus {
   latencyMs?: number | null;
   reconnectAttempts: number;
   lastError?: string | null;
+  backgroundHook: UnityBackgroundHookStatus;
   checkedAtMs: number;
 }
 
@@ -243,6 +263,18 @@ export interface SessionEventRecord {
 export interface ActiveSessionSelectionChanged {
   workspaceKey: string;
   sessionId: string | null;
+}
+
+export interface SessionContentChangedEvent {
+  workingDir: string;
+  sessionId: string;
+  source:
+    | "undo_perform"
+    | "undo_perform_to_message"
+    | "undo_latest_conversation_turn"
+    | "rollback_session_to_message"
+    | string;
+  changedAt: number;
 }
 
 export interface SaveRawContextRequest {
@@ -1045,6 +1077,7 @@ export interface KnowledgeSearchResult {
   snippet: string;
   matchKind: KnowledgeSearchMatchKind;
   matchedSection?: KnowledgeSearchMatchSection | null;
+  matchedTerms?: string[];
   score: number;
   semanticScore?: number | null;
   semanticConfidence?: number | null;

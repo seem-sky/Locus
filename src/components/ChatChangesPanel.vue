@@ -6,7 +6,7 @@ import { useProjectStore } from "../stores/project";
 import { useUiStore } from "../stores/ui";
 import { diffSingleFile, createRequestToken, isTokenStale } from "../services/diff";
 import { normalizeAppError } from "../services/errors";
-import { findUndoRestoreUserText } from "../services/chatUndo";
+import { findUndoRestoreUserMessage } from "../services/chatUndo";
 import { selectUnityAsset, openFileExternal } from "../services/unity";
 import { openChatDiffReviewWindow } from "../services/chatDiffReviewWindow";
 import { t } from "../i18n";
@@ -14,6 +14,7 @@ import { useNotificationStore } from "../stores/notification";
 import FileDiffPopover from "./diff/FileDiffPopover.vue";
 import type { GitFileChange, FileDiffPayload, UndoConflictInfo } from "../types";
 import type { ChatMergedFileItem } from "../services/chatChanges";
+import { buildUserMessageDraft } from "../composables/chatMessageDraft";
 import { useHideMeta, isMetaFile, canOpenInEditor } from "../composables/useHideMeta";
 import { buildStagingTreeRows, collectStagingFolderPaths } from "./collab/stagingTree";
 import type { StagingTreeRow } from "./collab/stagingTree";
@@ -52,20 +53,53 @@ watch(() => chatStore.activeSessionId, () => {
 const hoverAnchor = ref<HTMLElement | null>(null);
 const showPopover = ref(false);
 const previewPayload = ref<FileDiffPayload | null>(null);
+const previewItem = ref<DisplayItem | null>(null);
 let hoverTimer: ReturnType<typeof setTimeout> | null = null;
+let hoverCloseTimer: ReturnType<typeof setTimeout> | null = null;
+let hoverSeq = 0;
+const HOVER_CLOSE_DELAY_MS = 140;
 
 function clearHover() {
   if (hoverTimer) {
     clearTimeout(hoverTimer);
     hoverTimer = null;
   }
+  if (hoverCloseTimer) {
+    clearTimeout(hoverCloseTimer);
+    hoverCloseTimer = null;
+  }
+  hoverSeq++;
   createRequestToken(); // bump to stale any in-flight
   showPopover.value = false;
   previewPayload.value = null;
   hoverAnchor.value = null;
+  previewItem.value = null;
 }
 
-onUnmounted(() => { if (hoverTimer) clearTimeout(hoverTimer); });
+watch(() => displaySettings.fileChangePopoverEnabled, (enabled) => {
+  if (!enabled) clearHover();
+});
+
+function cancelHoverClose() {
+  if (hoverCloseTimer) {
+    clearTimeout(hoverCloseTimer);
+    hoverCloseTimer = null;
+  }
+}
+
+function scheduleHoverClose() {
+  if (hoverTimer) {
+    clearTimeout(hoverTimer);
+    hoverTimer = null;
+  }
+  cancelHoverClose();
+  hoverCloseTimer = setTimeout(clearHover, HOVER_CLOSE_DELAY_MS);
+}
+
+onUnmounted(() => {
+  if (hoverTimer) clearTimeout(hoverTimer);
+  if (hoverCloseTimer) clearTimeout(hoverCloseTimer);
+});
 
 // ── Data ──
 
@@ -227,21 +261,44 @@ function pruneCollapsedFolders(validPaths: Set<string>) {
 // ── Hover ──
 
 function onItemMouseEnter(ev: MouseEvent, item: DisplayItem) {
+  if (!displaySettings.fileChangePopoverEnabled) return;
   const el = ev.currentTarget as HTMLElement;
+  cancelHoverClose();
+  if (showPopover.value && previewPayload.value && previewItem.value?.key === item.key) return;
+  if (hoverTimer) {
+    clearTimeout(hoverTimer);
+    hoverTimer = null;
+  }
+  const seq = ++hoverSeq;
   hoverTimer = setTimeout(async () => {
     const token = createRequestToken();
     try {
       const payload = await diffSingleFile(buildRequest(item, "preview"));
-      if (isTokenStale(token)) return;
+      if (seq !== hoverSeq || isTokenStale(token)) return;
       previewPayload.value = payload;
       hoverAnchor.value = el;
+      previewItem.value = item;
       showPopover.value = true;
     } catch { /* silently ignore */ }
   }, 150);
 }
 
 function onItemMouseLeave() {
-  clearHover();
+  scheduleHoverClose();
+}
+
+function onPopoverMouseEnter() {
+  cancelHoverClose();
+}
+
+function onPopoverMouseLeave() {
+  scheduleHoverClose();
+}
+
+function onPopoverOpen() {
+  const item = previewItem.value;
+  if (!item) return;
+  void onItemClick(item);
 }
 
 // ── Click → inline diff ──
@@ -299,9 +356,10 @@ const undoTargetId = computed(() => {
   return rounds.length > 0 ? rounds[0].assistantMessageId : null;
 });
 
-const undoRestoreText = computed(() => {
+const undoRestoreDraft = computed(() => {
   if (mode.value !== "current" || !undoTargetId.value) return null;
-  return findUndoRestoreUserText(chatStore.messages, undoTargetId.value);
+  const message = findUndoRestoreUserMessage(chatStore.messages, undoTargetId.value);
+  return message ? buildUserMessageDraft(message) : null;
 });
 
 const undoButtonBusy = computed(() => checkingUndoConflicts.value || isUndoing.value);
@@ -343,13 +401,13 @@ async function onUndoClick() {
 async function confirmUndo(force = false) {
   const targetId = undoTargetId.value;
   if (!targetId || isUndoing.value) return;
-  const restoreText = undoRestoreText.value;
+  const restoreDraft = undoRestoreDraft.value;
   isUndoing.value = true;
   changesStore.closeInlineDiff();
   try {
     const undone = await chatStore.performUndo(targetId, { force });
-    if (undone && restoreText) {
-      uiStore.stageChatPrefill(restoreText);
+    if (undone && restoreDraft) {
+      uiStore.stageChatDraftPrefill(restoreDraft);
     }
   } finally {
     isUndoing.value = false;
@@ -606,6 +664,9 @@ function onOpenInEditor(ev: MouseEvent, path: string) {
       :payload="previewPayload"
       :anchor="hoverAnchor"
       @close="clearHover"
+      @enter="onPopoverMouseEnter"
+      @leave="onPopoverMouseLeave"
+      @open="onPopoverOpen"
     />
   </aside>
 </template>

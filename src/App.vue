@@ -36,8 +36,7 @@ import { isUnityReferenceImportWindowLocation } from "./services/unityReferenceI
 import { isReferenceExternalImportWindowLocation } from "./services/referenceExternalImportWindow";
 import { isCollabSearchWindowLocation } from "./services/collabSearchWindow";
 import { isChatDiffReviewWindowLocation } from "./services/chatDiffReviewWindow";
-import { isUnityHostLocation } from "./services/locusRuntime";
-import { isViewHostWindowLocation } from "./services/view";
+import { isViewContentWindowLocation, isViewHostWindowLocation } from "./services/view";
 import { isAgentGraphToolWindowLocation } from "./services/agentGraphTool";
 import {
   canStartWindowDragFromTarget,
@@ -47,8 +46,11 @@ import {
 } from "./services/tauriRuntime";
 import { markStartupPhase } from "./services/startupPerf";
 const isUnityEmbedTestWindow = window.location.pathname === "/unity-embed-test";
-const isUnityEmbedWindow = !isUnityEmbedTestWindow
-  && (window.location.pathname === "/unity-embed" || isUnityHostLocation());
+const isUnityEmbedWindow = !isUnityEmbedTestWindow && window.location.pathname === "/unity-embed";
+const unityEmbedParams = new URLSearchParams(window.location.search);
+const unityEmbedTarget = unityEmbedParams.get("target") || "session";
+const unityEmbedTargetId = unityEmbedParams.get("id") || "";
+const isUnityEmbedViewWindow = isUnityEmbedWindow && unityEmbedTarget === "view";
 const isKnowledgeDownloadWindow = isKnowledgeDownloadWindowLocation();
 const isKnowledgeLexicalProgressWindow = isKnowledgeLexicalProgressWindowLocation();
 const isFeishuReferenceImportWindow = isFeishuReferenceImportWindowLocation();
@@ -57,6 +59,7 @@ const isReferenceExternalImportWindow = isReferenceExternalImportWindowLocation(
 const isCollabSearchWindow = isCollabSearchWindowLocation();
 const isChatDiffReviewWindow = isChatDiffReviewWindowLocation();
 const isViewHostWindow = isViewHostWindowLocation();
+const isViewContentWindow = isViewContentWindowLocation();
 const isAgentGraphToolWindow = isAgentGraphToolWindowLocation();
 const isStandaloneWindow = isUnityEmbedWindow
   || isUnityEmbedTestWindow
@@ -68,6 +71,7 @@ const isStandaloneWindow = isUnityEmbedWindow
   || isCollabSearchWindow
   || isChatDiffReviewWindow
   || isViewHostWindow
+  || isViewContentWindow
   || isAgentGraphToolWindow;
 
 const KnowledgeDownloadProgressWindow = defineAsyncComponent(() => import("./components/KnowledgeDownloadProgressWindow.vue"));
@@ -747,10 +751,16 @@ watch(() => projectStore.workingDir, () => {
 </script>
 
 <template>
+  <template v-if="isUnityEmbedViewWindow">
+    <div v-if="unityEmbedBootstrapError" class="app-startup-state">{{ unityEmbedBootstrapError }}</div>
+    <div v-else-if="!unityEmbedBootstrapped" class="app-startup-state">{{ t("common.loading") }}</div>
+    <ViewHostWindow v-else embedded />
+  </template>
   <UnityEmbeddedSessionView
-    v-if="isUnityEmbedWindow"
+    v-else-if="isUnityEmbedWindow"
     :bootstrapped="unityEmbedBootstrapped"
     :bootstrap-error="unityEmbedBootstrapError"
+    :initial-session-id="unityEmbedTargetId"
   />
   <UnityEmbedTestView v-else-if="isUnityEmbedTestWindow" />
   <KnowledgeDownloadProgressWindow v-else-if="isKnowledgeDownloadWindow" />
@@ -760,6 +770,7 @@ watch(() => projectStore.workingDir, () => {
   <ReferenceExternalImportWindow v-else-if="isReferenceExternalImportWindow" />
   <CollabSearchWindow v-else-if="isCollabSearchWindow" />
   <ChatDiffReviewWindow v-else-if="isChatDiffReviewWindow" />
+  <ViewHostWindow v-else-if="isViewContentWindow" embedded />
   <ViewHostWindow v-else-if="isViewHostWindow" />
   <AgentGraphToolWindow v-else-if="isAgentGraphToolWindow" />
   <div v-else-if="!authStore.authChecked" class="app-startup-state">

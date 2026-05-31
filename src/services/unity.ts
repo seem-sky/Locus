@@ -43,7 +43,7 @@ export function selectUnityAsset(
   assetPath: string,
   options: SelectUnityAssetOptions = {},
 ): Promise<void> {
-  const focusProjectWindow = options.focusProjectWindow ?? getLocusRuntime().kind !== "unity";
+  const focusProjectWindow = options.focusProjectWindow ?? true;
   return ipcInvoke("select_unity_asset", { assetPath, focusProjectWindow });
 }
 
@@ -65,22 +65,129 @@ export function openUnitySceneObjectInspector(
   return ipcInvoke("open_unity_scene_object_inspector", { scenePath, objectPath });
 }
 
+export type UnityEmbeddedFrontendTarget = "session" | "view";
+
+export interface UnityEmbeddedFrontendWindowRequest {
+  windowId?: string | null;
+  targetKind: UnityEmbeddedFrontendTarget;
+  targetId?: string | null;
+  title?: string | null;
+}
+
+export interface UnityEmbeddedFrontendWindowResult {
+  windowId: string;
+  windowLabel: string;
+  targetKind: UnityEmbeddedFrontendTarget;
+  targetId: string;
+  title: string;
+  hostUrl: string;
+}
+
+export function currentUnityEmbedWindowId(): string | null {
+  try {
+    return new URLSearchParams(window.location.search).get("windowId");
+  } catch {
+    return null;
+  }
+}
+
+export function openUnityEmbeddedFrontendWindow(
+  request: UnityEmbeddedFrontendWindowRequest,
+): Promise<UnityEmbeddedFrontendWindowResult> {
+  return ipcInvoke<UnityEmbeddedFrontendWindowResult>("unity_embed_open_frontend_window", { request });
+}
+
+export function openUnityEmbeddedSessionWindow(request: {
+  sessionId?: string | null;
+  title?: string | null;
+} = {}): Promise<UnityEmbeddedFrontendWindowResult> {
+  const sessionId = request.sessionId?.trim() || null;
+  return openUnityEmbeddedFrontendWindow({
+    targetKind: "session",
+    targetId: sessionId,
+    title: request.title?.trim()
+      ? `Locus Session - ${request.title.trim()}${sessionId ? ` (${sessionId.slice(0, 8)})` : ""}`
+      : sessionId
+        ? `Locus Session (${sessionId.slice(0, 8)})`
+        : "Locus Session",
+  });
+}
+
 export function setUnityEmbedMouseActivationSuppressed(suppressed: boolean): Promise<void> {
   const runtime = getLocusRuntime();
   if (runtime.kind !== "tauri") return Promise.resolve();
-  return runtime.invoke("unity_embed_set_mouse_activation_suppressed", { suppressed });
+  return runtime.invoke("unity_embed_set_mouse_activation_suppressed", {
+    windowId: currentUnityEmbedWindowId(),
+    suppressed,
+  });
 }
 
 export function activateUnityEmbedForInput(): Promise<void> {
   const runtime = getLocusRuntime();
   if (runtime.kind !== "tauri") return Promise.resolve();
-  return runtime.invoke("unity_embed_activate_for_input");
+  return runtime.invoke("unity_embed_activate_for_input", {
+    windowId: currentUnityEmbedWindowId(),
+  });
+}
+
+export function setUnityEmbedDragPassthrough(active: boolean): Promise<void> {
+  const runtime = getLocusRuntime();
+  if (runtime.kind !== "tauri") return Promise.resolve();
+  return runtime.invoke("unity_embed_set_drag_passthrough", {
+    windowId: currentUnityEmbedWindowId(),
+    active,
+  });
 }
 
 export function commitUnityEmbedAssetDrop(): Promise<void> {
   const runtime = getLocusRuntime();
   if (runtime.kind !== "tauri") return Promise.resolve();
   return runtime.invoke("unity_embed_commit_asset_drop");
+}
+
+export function startUnityEmbedAssetDrag(refs: AssetRefAttachment[]): Promise<void> {
+  const runtime = getLocusRuntime();
+  if (runtime.kind !== "tauri" || refs.length === 0) return Promise.resolve();
+  return runtime.invoke("unity_embed_start_asset_drag", {
+    request: {
+      refs,
+    },
+  });
+}
+
+export function cancelUnityEmbedAssetDrag(): Promise<void> {
+  const runtime = getLocusRuntime();
+  if (runtime.kind !== "tauri") return Promise.resolve();
+  return runtime.invoke("unity_embed_cancel_asset_drag");
+}
+
+export function startUnityNativeAssetFileDrag(refs: AssetRefAttachment[]): Promise<void> {
+  const runtime = getLocusRuntime();
+  if (runtime.kind !== "tauri" || refs.length === 0) return Promise.resolve();
+  return runtime.invoke("unity_embed_start_native_asset_file_drag", {
+    request: {
+      refs,
+    },
+  });
+}
+
+export function startLocusNativeFileDrag(files: LocusFileDropRef[]): Promise<void> {
+  const runtime = getLocusRuntime();
+  if (runtime.kind !== "tauri" || files.length === 0) return Promise.resolve();
+  return runtime.invoke("locus_start_native_file_drag", { request: { files } });
+}
+
+export function startLocusDragPreview(label: string): Promise<void> {
+  const runtime = getLocusRuntime();
+  const normalized = label.trim();
+  if (runtime.kind !== "tauri" || !normalized) return Promise.resolve();
+  return runtime.invoke("locus_start_drag_preview", { label: normalized });
+}
+
+export function stopLocusDragPreview(): Promise<void> {
+  const runtime = getLocusRuntime();
+  if (runtime.kind !== "tauri") return Promise.resolve();
+  return runtime.invoke("locus_stop_drag_preview");
 }
 
 export interface UnityEmbedAssetDropPayload {
@@ -120,6 +227,14 @@ export interface LocusFileDropPayload {
   files: LocusFileDropRef[];
 }
 
+export interface LocusFileDragStatePayload {
+  phase: "enter" | "over" | "drop" | "leave";
+  active: boolean;
+  fileCount: number;
+  x: number;
+  y: number;
+}
+
 export interface UnityEmbedAssetDragStatePayload {
   hasRefs: boolean;
   refs: AssetRefAttachment[];
@@ -151,6 +266,14 @@ export function subscribeLocusFileDrop(
   const runtime = getLocusRuntime();
   if (runtime.kind !== "tauri") return Promise.resolve(() => {});
   return runtime.subscribe<LocusFileDropPayload>("locus-file-drop", handler);
+}
+
+export function subscribeLocusFileDragState(
+  handler: (payload: LocusFileDragStatePayload) => void,
+): Promise<() => void> {
+  const runtime = getLocusRuntime();
+  if (runtime.kind !== "tauri") return Promise.resolve(() => {});
+  return runtime.subscribe<LocusFileDragStatePayload>("locus-file-drag-state", handler);
 }
 
 export function subscribeUnityEmbedAssetDragState(
@@ -190,7 +313,9 @@ export interface UnityEmbedFocusDebugSnapshot {
 export function getUnityEmbedFocusDebugSnapshot(): Promise<UnityEmbedFocusDebugSnapshot | null> {
   const runtime = getLocusRuntime();
   if (runtime.kind !== "tauri") return Promise.resolve(null);
-  return runtime.invoke<UnityEmbedFocusDebugSnapshot>("unity_embed_focus_debug_snapshot");
+  return runtime.invoke<UnityEmbedFocusDebugSnapshot>("unity_embed_focus_debug_snapshot", {
+    windowId: currentUnityEmbedWindowId(),
+  });
 }
 
 export type UnitySceneObjectErrorKind = "sceneNotLoaded" | "objectMissing" | "unknown";

@@ -1,10 +1,10 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from "vue";
+import { computed, nextTick, onMounted, onUnmounted, ref } from "vue";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { ExternalLink, X } from "lucide";
 import type { FileDiffPayload, FileDiffRequest } from "../types";
-import { diffSingleFile, refetchDiffByKey } from "../services/diff";
+import { diffSingleFile, invalidateDiffCache, parseDiffRequestKey } from "../services/diff";
 import { openFileExternal } from "../services/unity";
 import { normalizeAppError } from "../services/errors";
 import {
@@ -26,6 +26,8 @@ const loading = ref(false);
 const error = ref<string | null>(null);
 const fileDiffViewerRef = ref<InstanceType<typeof FileDiffViewer> | null>(null);
 const requestSeq = ref(0);
+const currentRequest = ref<FileDiffRequest | null>(null);
+const fullContext = ref(false);
 
 let unlistenPayload: UnlistenFn | null = null;
 
@@ -50,19 +52,63 @@ const statsLabel = computed(() => {
   };
 });
 
-async function loadRequest(request: FileDiffRequest) {
+const canToggleFullTextCompare = computed(() =>
+  !!payload.value
+  && !!currentRequest.value
+  && !payload.value.isBinary
+  && payload.value.contentState.type !== "lfsNotFetched",
+);
+
+function normalizeReviewRequest(
+  request: FileDiffRequest,
+): FileDiffRequest {
+  return {
+    ...request,
+    detail: "full",
+    fullContext: Boolean(request.fullContext),
+  };
+}
+
+function applyCurrentRequest(request: FileDiffRequest | null) {
+  currentRequest.value = request ? normalizeReviewRequest(request) : null;
+  fullContext.value = Boolean(currentRequest.value?.fullContext);
+}
+
+async function selectTextTabIfAvailable() {
+  await nextTick();
+  const viewer = fileDiffViewerRef.value;
+  if (!viewer) return;
+  if (viewer.hasSemanticAndText) {
+    viewer.activeTab = "text";
+  }
+}
+
+async function loadRequest(
+  request: FileDiffRequest,
+  options?: { invalidateKey?: string; preferTextTab?: boolean },
+): Promise<boolean> {
+  const normalizedRequest = normalizeReviewRequest(request);
   const seq = ++requestSeq.value;
+  applyCurrentRequest(normalizedRequest);
   loading.value = true;
   error.value = null;
   payload.value = null;
   diffProgress.reset();
+  if (options?.invalidateKey) {
+    invalidateDiffCache(options.invalidateKey);
+  }
   try {
-    const nextPayload = await diffSingleFile(request);
-    if (seq !== requestSeq.value) return;
+    const nextPayload = await diffSingleFile(normalizedRequest);
+    if (seq !== requestSeq.value) return false;
     payload.value = nextPayload;
+    if (options?.preferTextTab) {
+      await selectTextTabIfAvailable();
+    }
+    return true;
   } catch (cause) {
-    if (seq !== requestSeq.value) return;
+    if (seq !== requestSeq.value) return false;
     error.value = normalizeAppError(cause).message;
+    return false;
   } finally {
     if (seq === requestSeq.value) {
       loading.value = false;
@@ -70,32 +116,26 @@ async function loadRequest(request: FileDiffRequest) {
   }
 }
 
-async function loadDiffKey(diffKey: string) {
-  const seq = ++requestSeq.value;
-  loading.value = true;
-  error.value = null;
-  payload.value = null;
-  diffProgress.reset();
-  try {
-    const nextPayload = await refetchDiffByKey(diffKey);
-    if (seq !== requestSeq.value) return;
-    payload.value = nextPayload;
-    if (!nextPayload) {
-      error.value = t("chat.changes.reviewMissing");
-    }
-  } catch (cause) {
-    if (seq !== requestSeq.value) return;
-    error.value = normalizeAppError(cause).message;
-  } finally {
-    if (seq === requestSeq.value) {
-      loading.value = false;
-    }
+async function loadDiffKey(diffKey: string): Promise<boolean> {
+  const request = parseDiffRequestKey(diffKey);
+  if (!request) {
+    requestSeq.value += 1;
+    applyCurrentRequest(null);
+    payload.value = null;
+    loading.value = false;
+    error.value = t("chat.changes.reviewMissing");
+    return false;
   }
+  return loadRequest(request, {
+    invalidateKey: diffKey,
+  });
 }
 
 function applyWindowPayload(next: ChatDiffReviewWindowPayload) {
   if (next.payload) {
+    const request = parseDiffRequestKey(next.payload.key);
     requestSeq.value += 1;
+    applyCurrentRequest(request);
     payload.value = next.payload;
     error.value = null;
     loading.value = false;
@@ -115,6 +155,15 @@ function applyWindowPayload(next: ChatDiffReviewWindowPayload) {
 async function onLfsPulled() {
   if (!payload.value) return;
   await loadDiffKey(payload.value.key);
+}
+
+async function toggleFullTextCompare() {
+  if (!currentRequest.value || loading.value) return;
+  const nextFullContext = !fullContext.value;
+  await loadRequest({
+    ...currentRequest.value,
+    fullContext: nextFullContext,
+  }, { preferTextTab: true });
 }
 
 async function closeWindow() {
@@ -188,6 +237,17 @@ onUnmounted(() => {
         >
           <LucideIcon :icon="ExternalLink" :size="13" />
           <span>{{ t("common.openInEditor") }}</span>
+        </button>
+        <button
+          v-if="canToggleFullTextCompare"
+          type="button"
+          class="chat-diff-review-action"
+          :class="{ active: fullContext }"
+          :disabled="loading"
+          :title="t('diff.mode.fullTextCompare')"
+          @click="toggleFullTextCompare"
+        >
+          <span>{{ t("diff.mode.fullTextCompare") }}</span>
         </button>
         <button
           v-if="fileDiffViewerRef?.hasTextDisplayModeControl"
@@ -402,6 +462,11 @@ onUnmounted(() => {
   border-color: var(--border-strong);
   color: var(--text-color);
   outline: none;
+}
+
+.chat-diff-review-action:disabled {
+  opacity: 0.6;
+  cursor: default;
 }
 
 .chat-diff-review-action.active {

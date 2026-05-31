@@ -31,8 +31,10 @@ import {
   viewExportPackage,
   viewImportPackage,
   viewMoveEntry,
+  viewRenameEntry,
   viewRequiresUnityConnection,
   viewRun,
+  viewRunInUnity,
   viewTree,
   type ViewFolderSummary,
   type ViewPackageSummary,
@@ -72,6 +74,15 @@ interface ViewCreateFolderDraft {
   name: string;
 }
 
+interface ViewRenameDraft {
+  relPath: string;
+  kind: "folder" | "view";
+  anchorKey: string;
+  depth: number;
+  currentName: string;
+  name: string;
+}
+
 type ViewContextMenuState =
   | { x: number; y: number; kind: "root" }
   | { x: number; y: number; kind: "folder" | "view"; node: ViewTreeNode };
@@ -86,7 +97,10 @@ interface ViewPointerDragState {
 
 interface ViewDropTarget {
   key: string;
-  relPath: string;
+  targetDirRelPath: string;
+  position: "inside" | "before" | "after";
+  insertBeforeRelPath?: string;
+  insertAfterRelPath?: string;
 }
 
 const props = defineProps<{
@@ -101,6 +115,7 @@ const VIEW_TREE_INDENT_STEP_PX = 20;
 const notificationStore = useNotificationStore();
 const views = ref<ViewPackageSummary[]>([]);
 const folders = ref<ViewFolderSummary[]>([]);
+const treeOrder = ref<string[]>([]);
 const selectedViewId = ref("");
 const loading = ref(false);
 const running = ref(false);
@@ -112,8 +127,11 @@ const contextMenu = ref<ViewContextMenuState | null>(null);
 const deleteConfirm = ref<ViewTreeNode | null>(null);
 const createFolderDraft = ref<ViewCreateFolderDraft | null>(null);
 const createFolderInputRef = ref<HTMLInputElement | null>(null);
+const renameDraft = ref<ViewRenameDraft | null>(null);
+const renameInputRef = ref<HTMLInputElement | null>(null);
 const draggingNode = ref<ViewTreeNode | null>(null);
 const dragTargetKey = ref("");
+const dragTargetPosition = ref<ViewDropTarget["position"] | "">("");
 let unsubscribeViewReload: RuntimeUnsubscribe | null = null;
 let unsubscribeViewTreeChanged: RuntimeUnsubscribe | null = null;
 let pointerDragState: ViewPointerDragState | null = null;
@@ -129,6 +147,10 @@ const selectedView = computed(() =>
 );
 const selectedViewExporting = computed(() =>
   !!selectedView.value && exportingViewId.value === selectedView.value.id,
+);
+const canSubmitRename = computed(() => !!renameDraft.value?.name.trim());
+const selectedViewDisplayPath = computed(() =>
+  selectedView.value ? viewDisplayPath(selectedView.value) : "",
 );
 const selectedViewPath = computed(() => selectedView.value?.packageRoot || "");
 const selectedViewUpdatedAt = computed(() =>
@@ -151,7 +173,7 @@ const selectedViewUnityRequirementText = computed(() => {
     ? t("view.metadata.unityConnectionRequired")
     : t("view.metadata.unityConnectionOptional");
 });
-const viewTreeNodes = computed(() => buildViewTree(views.value, folders.value));
+const viewTreeNodes = computed(() => buildViewTree(views.value, folders.value, treeOrder.value));
 const visibleViewEntries = computed<VisibleViewEntry[]>(() => {
   const entries: VisibleViewEntry[] = [];
   if (createFolderDraft.value?.anchorKey === ROOT_ANCHOR_KEY) {
@@ -227,7 +249,7 @@ function normalizeViewPath(value: string): string {
   return value.replace(/\\/g, "/").replace(/\/+/g, "/").replace(/\/$/, "");
 }
 
-function packageRelPath(view: ViewPackageSummary): string {
+function physicalPackageRelPath(view: ViewPackageSummary): string {
   const explicitRelPath = view.packageRelPath?.trim();
   if (explicitRelPath) return normalizeViewPath(explicitRelPath);
 
@@ -244,6 +266,12 @@ function packageRelPath(view: ViewPackageSummary): string {
 
   const parts = packageRoot.split("/").filter(Boolean);
   return parts.length > 0 ? parts[parts.length - 1] : view.id;
+}
+
+function viewDisplayPath(view: ViewPackageSummary): string {
+  const explicitDisplayPath = view.displayPath?.trim();
+  if (explicitDisplayPath) return normalizeViewPath(explicitDisplayPath);
+  return physicalPackageRelPath(view);
 }
 
 function makeFolderNode(
@@ -278,9 +306,13 @@ function expandViewPathAncestors(relPath: string) {
 function buildViewTree(
   viewSummaries: ViewPackageSummary[],
   viewFolders: ViewFolderSummary[],
+  order: string[],
 ): ViewTreeNode[] {
   const root = makeFolderNode("", "views");
   const folderMap = new Map<string, ViewTreeNode>([["", root]]);
+  const orderMap = new Map(
+    order.map((relPath, index) => [normalizeViewPath(relPath), index] as const),
+  );
   const ensureFolder = (relPath: string, folder?: ViewFolderSummary) => {
     const normalized = normalizeViewPath(relPath);
     if (!normalized) return root;
@@ -317,7 +349,7 @@ function buildViewTree(
 
   const sortedViews = [...viewSummaries].sort(
     (left, right) =>
-      packageRelPath(left).localeCompare(packageRelPath(right), undefined, {
+      viewDisplayPath(left).localeCompare(viewDisplayPath(right), undefined, {
         sensitivity: "base",
       }) ||
       left.name.localeCompare(right.name, undefined, { sensitivity: "base" }) ||
@@ -325,7 +357,7 @@ function buildViewTree(
   );
 
   for (const view of sortedViews) {
-    const relPath = packageRelPath(view);
+    const relPath = viewDisplayPath(view);
     const parent = ensureFolder(viewPathDirname(relPath));
     parent.children.push({
       kind: "view",
@@ -339,6 +371,13 @@ function buildViewTree(
 
   const sortChildren = (node: ViewTreeNode) => {
     node.children.sort((left, right) => {
+      const leftOrder = orderMap.get(normalizeViewPath(left.relPath));
+      const rightOrder = orderMap.get(normalizeViewPath(right.relPath));
+      if (leftOrder !== undefined && rightOrder !== undefined) {
+        return leftOrder - rightOrder;
+      }
+      if (leftOrder !== undefined) return -1;
+      if (rightOrder !== undefined) return 1;
       if (left.kind !== right.kind) return left.kind === "folder" ? -1 : 1;
       return left.label.localeCompare(right.label, undefined, { sensitivity: "base" });
     });
@@ -351,6 +390,7 @@ function buildViewTree(
 function applyTreeSnapshot(snapshot: ViewTreeSnapshot) {
   views.value = snapshot.views;
   folders.value = snapshot.folders;
+  treeOrder.value = snapshot.order ?? [];
   if (!views.value.some((view) => view.id === selectedViewId.value)) {
     selectedViewId.value = views.value[0]?.id ?? "";
   }
@@ -366,6 +406,7 @@ async function loadViews() {
     const err = normalizeViewError(error);
     views.value = [];
     folders.value = [];
+    treeOrder.value = [];
     loadError.value = err.message;
     notificationStore.addNotice("error", err.message, {
       code: err.code,
@@ -421,8 +462,16 @@ function closeCreateFolder() {
   createFolderDraft.value = null;
 }
 
+function closeRename() {
+  renameDraft.value = null;
+}
+
 function setCreateFolderInputRef(element: Element | ComponentPublicInstance | null) {
   createFolderInputRef.value = element instanceof HTMLInputElement ? element : null;
+}
+
+function setRenameInputRef(element: Element | ComponentPublicInstance | null) {
+  renameInputRef.value = element instanceof HTMLInputElement ? element : null;
 }
 
 function onTreeContextMenu(event: MouseEvent) {
@@ -436,6 +485,7 @@ function onTreeContextMenu(event: MouseEvent) {
   event.preventDefault();
   event.stopPropagation();
   closeCreateFolder();
+  closeRename();
   deleteConfirm.value = null;
   contextMenu.value = { x: event.clientX, y: event.clientY, kind: "root" };
 }
@@ -444,6 +494,7 @@ function openTreeContextMenu(event: MouseEvent, row: VisibleViewRow) {
   event.preventDefault();
   event.stopPropagation();
   closeCreateFolder();
+  closeRename();
   deleteConfirm.value = null;
   contextMenu.value = {
     x: event.clientX,
@@ -465,6 +516,7 @@ function createDepthForNode(node: ViewTreeNode | null): number {
 async function startCreateFolder(parentNode: ViewTreeNode | null) {
   deleteConfirm.value = null;
   closeCreateFolder();
+  closeRename();
   if (parentNode?.kind === "view") return;
   if (parentNode && !isNodeExpanded(parentNode)) {
     setNodeExpanded(parentNode.key, true);
@@ -506,6 +558,58 @@ async function submitCreateFolder() {
   }
 }
 
+async function beginRenameFromContext() {
+  const menu = contextMenu.value;
+  if (!menu || menu.kind === "root") return;
+  closeCreateFolder();
+  deleteConfirm.value = null;
+  renameDraft.value = {
+    relPath: menu.node.relPath,
+    kind: menu.node.kind,
+    anchorKey: menu.node.key,
+    depth: createDepthForNode(menu.node) - 1,
+    currentName: menu.node.label,
+    name: menu.node.label,
+  };
+  closeContextMenu();
+  await nextTick();
+  renameInputRef.value?.focus();
+  renameInputRef.value?.select();
+}
+
+function isRenamingNode(node: ViewTreeNode): boolean {
+  return renameDraft.value?.anchorKey === node.key;
+}
+
+function updateRenameName(event: Event) {
+  const target = event.target;
+  if (target instanceof HTMLInputElement && renameDraft.value) {
+    renameDraft.value.name = target.value;
+  }
+}
+
+async function submitRename() {
+  const draft = renameDraft.value;
+  const name = draft?.name.trim();
+  if (!draft || !name) return;
+  if (name === draft.currentName) {
+    closeRename();
+    return;
+  }
+  try {
+    applyTreeSnapshot(await viewRenameEntry({ relPath: draft.relPath, name }));
+    closeRename();
+  } catch (error) {
+    const err = normalizeAppError(error);
+    loadError.value = err.message;
+    notificationStore.addNotice("error", err.message, {
+      code: err.code,
+      operation: "viewRenameEntry",
+      replaceOperation: true,
+    });
+  }
+}
+
 function requestDeleteEntry() {
   const menu = contextMenu.value;
   if (!menu || menu.kind === "root") return;
@@ -537,6 +641,7 @@ async function confirmDeleteEntry() {
 function clearDragState() {
   draggingNode.value = null;
   dragTargetKey.value = "";
+  dragTargetPosition.value = "";
 }
 
 function viewNodeParentRelPath(node: ViewTreeNode): string {
@@ -547,14 +652,23 @@ function canDragNode(node: ViewTreeNode): boolean {
   return !!node.relPath.trim();
 }
 
-function canDropNodeOnDir(node: ViewTreeNode | null, targetDirRelPath: string): boolean {
+function canPlaceNodeInDir(node: ViewTreeNode | null, targetDirRelPath: string): boolean {
   if (!node) return false;
   const targetDir = normalizeViewPath(targetDirRelPath);
-  if (targetDir === viewNodeParentRelPath(node)) return false;
   if (node.kind === "folder") {
     return targetDir !== node.relPath && !targetDir.startsWith(`${node.relPath}/`);
   }
   return true;
+}
+
+function canDropNodeInsideDir(node: ViewTreeNode | null, targetDirRelPath: string): boolean {
+  if (!canPlaceNodeInDir(node, targetDirRelPath) || !node) return false;
+  return normalizeViewPath(targetDirRelPath) !== viewNodeParentRelPath(node);
+}
+
+function canDropNodeNearRow(node: ViewTreeNode | null, row: VisibleViewRow): boolean {
+  if (!node || row.node.relPath === node.relPath) return false;
+  return canPlaceNodeInDir(node, viewNodeParentRelPath(row.node));
 }
 
 function visibleRowByNodeKey(key: string): VisibleViewRow | null {
@@ -621,21 +735,42 @@ function resolveDropTargetFromPoint(
 
   const rowElement = target.closest<HTMLElement>(".view-tree-row-shell");
   if (rowElement) {
-    if (rowElement.dataset.viewNodeKind !== "folder") return null;
     const row = visibleRowByNodeKey(rowElement.dataset.viewNodeKey ?? "");
-    if (!row || row.node.kind !== "folder") return null;
-    if (!canDropNodeOnDir(node, row.node.relPath)) return null;
+    if (!row) return null;
+    const rect = rowElement.getBoundingClientRect();
+    const offsetRatio = rect.height > 0 ? (y - rect.top) / rect.height : 0.5;
+    if (row.node.kind === "folder" && offsetRatio >= 0.25 && offsetRatio <= 0.75) {
+      if (!canDropNodeInsideDir(node, row.node.relPath)) return null;
+      return {
+        key: row.node.key,
+        targetDirRelPath: row.node.relPath,
+        position: "inside",
+      };
+    }
+    if (!canDropNodeNearRow(node, row)) return null;
+    const targetDirRelPath = viewNodeParentRelPath(row.node);
+    if (offsetRatio < 0.5) {
+      return {
+        key: row.node.key,
+        targetDirRelPath,
+        position: "before",
+        insertBeforeRelPath: row.node.relPath,
+      };
+    }
     return {
       key: row.node.key,
-      relPath: row.node.relPath,
+      targetDirRelPath,
+      position: "after",
+      insertAfterRelPath: row.node.relPath,
     };
   }
 
   const listElement = target.closest<HTMLElement>(".view-list");
-  if (listElement && canDropNodeOnDir(node, "")) {
+  if (listElement && canDropNodeInsideDir(node, "")) {
     return {
       key: ROOT_ANCHOR_KEY,
-      relPath: "",
+      targetDirRelPath: "",
+      position: "inside",
     };
   }
 
@@ -647,12 +782,14 @@ function updatePointerDropTarget(event: PointerEvent) {
   if (!state?.active) return;
   const target = resolveDropTargetFromPoint(event.clientX, event.clientY, state.node);
   dragTargetKey.value = target?.key ?? "";
+  dragTargetPosition.value = target?.position ?? "";
 }
 
 function onTreePointerDown(row: VisibleViewRow, event: PointerEvent) {
   if (
     event.button !== 0 ||
     createFolderDraft.value ||
+    renameDraft.value ||
     !canDragNode(row.node) ||
     shouldIgnorePointerDrag(event)
   ) {
@@ -721,7 +858,7 @@ async function finishPointerDrag(event: PointerEvent) {
     return;
   }
 
-  await moveNodeToDir(state.node, target.relPath, target.key);
+  await moveNodeToTarget(state.node, target);
 }
 
 function onTreeDragStart(row: VisibleViewRow, event: DragEvent) {
@@ -732,6 +869,7 @@ function onTreeDragStart(row: VisibleViewRow, event: DragEvent) {
   closeContextMenu();
   draggingNode.value = row.node;
   dragTargetKey.value = "";
+  dragTargetPosition.value = "";
   if (event.dataTransfer) {
     event.dataTransfer.effectAllowed = "move";
     event.dataTransfer.setData("text/plain", row.node.relPath);
@@ -743,31 +881,38 @@ function onTreeDragEnd() {
 }
 
 function onTreeFolderDragOver(row: VisibleViewRow, event: DragEvent) {
-  if (row.node.kind !== "folder" || !draggingNode.value) return;
-  if (!canDropNodeOnDir(draggingNode.value, row.node.relPath)) return;
+  if (!draggingNode.value) return;
+  const target = resolveDropTargetFromPoint(event.clientX, event.clientY, draggingNode.value);
+  if (!target || target.key !== row.node.key) return;
   event.preventDefault();
   if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
-  dragTargetKey.value = row.node.key;
+  dragTargetKey.value = target.key;
+  dragTargetPosition.value = target.position;
 }
 
-async function moveNodeToDir(
+async function moveNodeToTarget(
   node: ViewTreeNode,
-  targetDirRelPath: string,
-  targetKey = targetDirRelPath ? viewFolderKeyForRelPath(targetDirRelPath) : ROOT_ANCHOR_KEY,
+  target: ViewDropTarget,
 ) {
-  if (!node || !canDropNodeOnDir(node, targetDirRelPath)) {
+  const canDrop =
+    target.position === "inside"
+      ? canDropNodeInsideDir(node, target.targetDirRelPath)
+      : canPlaceNodeInDir(node, target.targetDirRelPath);
+  if (!node || !canDrop) {
     clearDragState();
     return;
   }
   clearDragState();
-  if (targetKey !== ROOT_ANCHOR_KEY) {
-    setNodeExpanded(targetKey, true);
+  if (target.position === "inside" && target.key !== ROOT_ANCHOR_KEY) {
+    setNodeExpanded(target.key, true);
   }
   try {
     applyTreeSnapshot(
       await viewMoveEntry({
         sourceRelPath: node.relPath,
-        targetDirRelPath,
+        targetDirRelPath: target.targetDirRelPath,
+        insertBeforeRelPath: target.insertBeforeRelPath,
+        insertAfterRelPath: target.insertAfterRelPath,
       }),
     );
     if (node.kind === "view" && node.view) {
@@ -784,6 +929,18 @@ async function moveNodeToDir(
   }
 }
 
+async function moveNodeToDir(
+  node: ViewTreeNode,
+  targetDirRelPath: string,
+  targetKey = targetDirRelPath ? viewFolderKeyForRelPath(targetDirRelPath) : ROOT_ANCHOR_KEY,
+) {
+  await moveNodeToTarget(node, {
+    key: targetKey,
+    targetDirRelPath,
+    position: "inside",
+  });
+}
+
 async function moveDraggingNode(targetDirRelPath: string, targetKey?: string) {
   const node = draggingNode.value;
   if (!node) {
@@ -794,14 +951,15 @@ async function moveDraggingNode(targetDirRelPath: string, targetKey?: string) {
 }
 
 function onTreeFolderDrop(row: VisibleViewRow, event: DragEvent) {
-  if (row.node.kind !== "folder" || !draggingNode.value) return;
-  if (!canDropNodeOnDir(draggingNode.value, row.node.relPath)) {
+  if (!draggingNode.value) return;
+  const target = resolveDropTargetFromPoint(event.clientX, event.clientY, draggingNode.value);
+  if (!target || target.key !== row.node.key) {
     clearDragState();
     return;
   }
   event.preventDefault();
   event.stopPropagation();
-  void moveDraggingNode(row.node.relPath, row.node.key);
+  void moveNodeToTarget(draggingNode.value, target);
 }
 
 function onTreeRootDragOver(event: DragEvent) {
@@ -812,10 +970,11 @@ function onTreeRootDragOver(event: DragEvent) {
   ) {
     return;
   }
-  if (!canDropNodeOnDir(draggingNode.value, "")) return;
+  if (!canDropNodeInsideDir(draggingNode.value, "")) return;
   event.preventDefault();
   if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
   dragTargetKey.value = ROOT_ANCHOR_KEY;
+  dragTargetPosition.value = "inside";
 }
 
 function onTreeRootDrop(event: DragEvent) {
@@ -826,7 +985,7 @@ function onTreeRootDrop(event: DragEvent) {
   ) {
     return;
   }
-  if (!canDropNodeOnDir(draggingNode.value, "")) {
+  if (!canDropNodeInsideDir(draggingNode.value, "")) {
     clearDragState();
     return;
   }
@@ -838,6 +997,7 @@ async function importViewPackage(targetDirRelPath = "") {
   if (importing.value) return;
   closeContextMenu();
   closeCreateFolder();
+  closeRename();
   deleteConfirm.value = null;
   importing.value = true;
   try {
@@ -854,7 +1014,9 @@ async function importViewPackage(targetDirRelPath = "") {
     });
     applyTreeSnapshot(result.snapshot);
     selectedViewId.value = result.summary.id;
-    expandViewPathAncestors(result.summary.packageRelPath || result.summary.id);
+    expandViewPathAncestors(
+      result.summary.displayPath || result.summary.packageRelPath || result.summary.id,
+    );
     notificationStore.addNotice(
       "success",
       t("view.import.imported", result.summary.name),
@@ -947,10 +1109,43 @@ async function openViewPackage(view: ViewPackageSummary) {
   }
 }
 
+async function openViewPackageInUnity(view: ViewPackageSummary) {
+  if (!view || running.value) return;
+  selectedViewId.value = view.id;
+  running.value = true;
+  try {
+    const requirementError = await checkViewOpenRequirements(view);
+    if (requirementError) {
+      notificationStore.addNotice("error", requirementError.message, {
+        code: requirementError.code,
+        operation: "viewRunInUnity",
+        replaceOperation: true,
+      });
+      return;
+    }
+    await viewRunInUnity(view.id);
+  } catch (runError) {
+    const err = normalizeViewError(runError, { viewName: view.name });
+    notificationStore.addNotice("error", err.message, {
+      code: err.code,
+      operation: "viewRunInUnity",
+      replaceOperation: true,
+    });
+  } finally {
+    running.value = false;
+  }
+}
+
 async function openSelectedView() {
   const view = selectedView.value;
   if (!view) return;
   await openViewPackage(view);
+}
+
+async function openSelectedViewInUnity() {
+  const view = selectedView.value;
+  if (!view) return;
+  await openViewPackageInUnity(view);
 }
 
 async function openTreeView(row: VisibleViewRow) {
@@ -958,10 +1153,19 @@ async function openTreeView(row: VisibleViewRow) {
   await openViewPackage(row.node.view);
 }
 
+async function openContextViewInUnity() {
+  const menu = contextMenu.value;
+  if (!menu || menu.kind !== "view" || !menu.node.view) return;
+  const view = menu.node.view;
+  closeContextMenu();
+  await openViewPackageInUnity(view);
+}
+
 watch(() => props.workingDir, () => {
   selectedViewId.value = "";
   closeContextMenu();
   closeCreateFolder();
+  closeRename();
   deleteConfirm.value = null;
   clearDragState();
   clearPointerDragState();
@@ -1039,7 +1243,15 @@ onUnmounted(() => {
                     entry.row.node.kind === 'view' &&
                     entry.row.node.view?.id === selectedViewId,
                   dragging: draggingNode?.key === entry.row.node.key,
-                  'drop-target': dragTargetKey === entry.row.node.key,
+                  'drop-target':
+                    dragTargetKey === entry.row.node.key &&
+                    dragTargetPosition === 'inside',
+                  'drop-before':
+                    dragTargetKey === entry.row.node.key &&
+                    dragTargetPosition === 'before',
+                  'drop-after':
+                    dragTargetKey === entry.row.node.key &&
+                    dragTargetPosition === 'after',
                 }"
                 draggable="false"
                 :data-view-node-key="entry.row.node.key"
@@ -1056,7 +1268,73 @@ onUnmounted(() => {
                 @dragover="onTreeFolderDragOver(entry.row, $event)"
                 @drop="onTreeFolderDrop(entry.row, $event)"
               >
+                <div
+                  v-if="isRenamingNode(entry.row.node)"
+                  class="view-tree-rename-row"
+                  :style="{ paddingLeft: `${treeIndentPx(entry.row.depth)}px` }"
+                  @click.stop
+                  @pointerdown.stop
+                >
+                  <span
+                    v-if="entry.row.node.kind === 'folder' || entry.row.depth > 0"
+                    class="view-tree-branch-spacer"
+                    aria-hidden="true"
+                  ></span>
+                  <span
+                    v-if="entry.row.node.kind === 'folder'"
+                    class="view-tree-kind-icon folder"
+                    :class="{ open: entry.row.expanded }"
+                    aria-hidden="true"
+                  >
+                    <LucideIcon
+                      :icon="entry.row.expanded ? FolderOpen : Folder"
+                      :size="13"
+                      :stroke-width="2"
+                    />
+                  </span>
+                  <span v-else class="view-tree-kind-icon view" aria-hidden="true">
+                    <LucideIcon
+                      :icon="resolveLocusViewIcon(entry.row.node.view?.icon)"
+                      :size="13"
+                      :stroke-width="2"
+                    />
+                  </span>
+                  <div class="view-tree-rename-body">
+                    <input
+                      :ref="setRenameInputRef"
+                      :value="renameDraft?.name ?? ''"
+                      class="view-tree-rename-input"
+                      :placeholder="t('view.tree.renamePlaceholder')"
+                      :aria-label="t('view.tree.rename')"
+                      @input="updateRenameName"
+                      @keydown.enter.prevent="submitRename"
+                      @keydown.esc.prevent="closeRename"
+                    />
+                    <div class="view-tree-rename-actions">
+                      <BaseButton
+                        class="view-tree-rename-action"
+                        type="button"
+                        :title="t('common.confirm')"
+                        :disabled="!canSubmitRename"
+                        @pointerdown.prevent
+                        @click="submitRename"
+                      >
+                        <LucideIcon :icon="Check" :size="12" :stroke-width="2.4" />
+                      </BaseButton>
+                      <BaseButton
+                        class="view-tree-rename-action"
+                        type="button"
+                        :title="t('common.cancel')"
+                        @pointerdown.prevent
+                        @click="closeRename"
+                      >
+                        <LucideIcon :icon="X" :size="12" :stroke-width="2.4" />
+                      </BaseButton>
+                    </div>
+                  </div>
+                </div>
                 <button
+                  v-else
                   type="button"
                   class="view-tree-row"
                   :style="{ paddingLeft: `${treeIndentPx(entry.row.depth)}px` }"
@@ -1102,7 +1380,7 @@ onUnmounted(() => {
                   <span class="view-tree-label">{{ entry.row.node.label }}</span>
                 </button>
                 <div
-                  v-if="entry.row.node.kind === 'view'"
+                  v-if="entry.row.node.kind === 'view' && !isRenamingNode(entry.row.node)"
                   class="view-tree-row-actions"
                 >
                   <button
@@ -1187,6 +1465,9 @@ onUnmounted(() => {
               <BaseButton :disabled="!selectedViewId || running" @click="openSelectedView">
                 {{ running ? t("view.action.opening") : t("view.action.open") }}
               </BaseButton>
+              <BaseButton :disabled="!selectedViewId || running" @click="openSelectedViewInUnity">
+                {{ t("view.action.openInUnity") }}
+              </BaseButton>
             </div>
           </div>
 
@@ -1223,6 +1504,10 @@ onUnmounted(() => {
                 <dd>{{ selectedViewUpdatedAt }}</dd>
               </div>
               <div class="view-metadata-row">
+                <dt>{{ t("view.metadata.displayPath") }}</dt>
+                <dd class="mono path">{{ selectedViewDisplayPath }}</dd>
+              </div>
+              <div class="view-metadata-row">
                 <dt>{{ t("view.metadata.location") }}</dt>
                 <dd class="mono path">{{ selectedViewPath }}</dd>
               </div>
@@ -1248,6 +1533,23 @@ onUnmounted(() => {
               </button>
               <div class="view-ctx-sep"></div>
             </template>
+            <button
+              v-if="contextMenu.kind === 'folder' || contextMenu.kind === 'view'"
+              type="button"
+              class="view-ctx-item"
+              @click.stop="beginRenameFromContext"
+            >
+              {{ t("view.tree.rename") }}
+            </button>
+            <div v-if="contextMenu.kind === 'folder' || contextMenu.kind === 'view'" class="view-ctx-sep"></div>
+            <button
+              v-if="contextMenu.kind === 'view'"
+              type="button"
+              class="view-ctx-item"
+              @click.stop="openContextViewInUnity"
+            >
+              {{ t("view.action.openInUnity") }}
+            </button>
             <button
               v-if="contextMenu.kind === 'view'"
               type="button"
@@ -1410,6 +1712,27 @@ onUnmounted(() => {
   background: color-mix(in srgb, var(--active-bg) 62%, transparent);
   box-shadow: inset 0 0 0 1px
     color-mix(in srgb, var(--accent-color) 32%, var(--border-color));
+}
+
+.view-tree-row-shell.drop-before::before,
+.view-tree-row-shell.drop-after::after {
+  content: "";
+  position: absolute;
+  left: 8px;
+  right: 8px;
+  height: 2px;
+  border-radius: 2px;
+  background: var(--accent-color);
+  pointer-events: none;
+  z-index: 1;
+}
+
+.view-tree-row-shell.drop-before::before {
+  top: 0;
+}
+
+.view-tree-row-shell.drop-after::after {
+  bottom: 0;
 }
 
 .view-tree-row {
@@ -1638,6 +1961,58 @@ onUnmounted(() => {
 }
 
 .view-tree-create-action {
+  width: 24px;
+  min-width: 24px;
+  height: 24px;
+  padding: 0;
+}
+
+.view-tree-rename-row {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 30px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 8px 2px 16px;
+  background: color-mix(in srgb, var(--active-bg) 78%, transparent);
+}
+
+.view-tree-rename-body {
+  min-width: 0;
+  flex: 1 1 auto;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.view-tree-rename-input {
+  min-width: 0;
+  flex: 1 1 auto;
+  height: 24px;
+  padding: 0 8px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--panel-bg) 82%, var(--bg-color));
+  color: var(--text-color);
+  font: inherit;
+  font-size: 12px;
+}
+
+.view-tree-rename-input:focus {
+  outline: none;
+  border-color: var(--accent-color);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent-color) 24%, transparent);
+}
+
+.view-tree-rename-actions {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.view-tree-rename-action {
   width: 24px;
   min-width: 24px;
   height: 24px;

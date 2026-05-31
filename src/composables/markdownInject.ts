@@ -1,4 +1,9 @@
 import {
+  PanelTopOpen,
+  View as ViewIcon,
+  type IconNode,
+} from "lucide";
+import {
   UNITY_ASSET_ICON_FILE_EXTENSIONS,
   type UnityAssetIconKind,
   unityAssetIconClassForKind,
@@ -63,6 +68,11 @@ const QUOTED_LOCAL_FILE_REF_RE = /(["'])((?:[A-Za-z]:[\\/]|\\\\|\/\/)(?:(?!\1).)
 // POSIX absolute paths are still rendered when they appear inside inline code.
 const ABSOLUTE_LOCAL_FILE_REF_RE = /(?<![@`\w])((?:[A-Za-z]:[\\/]\S*|\\\\[^\s\\/]+[\\/][^\s\\/]+(?:[\\/]\S*)?|\/\/[^\s/]+\/[^\s/]+(?:\/\S*)?))/g;
 const TRAILING_FILE_REF_PUNCT_RE = /[.,;，。；、？！\])}）】》」』]+$/;
+const VIEW_REF_VALUE_SOURCE = "([A-Za-z0-9][A-Za-z0-9._/-]{0,127}|\\{[^<>{}\\r\\n]{1,160}\\})";
+const VIEW_REF_PARAGRAPH_RE = new RegExp(
+  `<p>\\s*(?:<code>)?view:${VIEW_REF_VALUE_SOURCE}(?:</code>)?\\s*</p>`,
+  "gi",
+);
 
 function escapeAttr(source: string): string {
   return source
@@ -180,14 +190,18 @@ function renderSvgAttrs(attrs: Record<string, string | number | undefined>): str
     .join("");
 }
 
-function renderLucideRefIcon(kind: UnityAssetIconKind, classes = ""): string {
-  const iconNode = unityAssetIconNodeForKind(kind);
-  const sharedClasses = kind === "folder" ? unityFolderIconClass(false) : unityAssetIconClassForKind(kind);
-  const className = ["md-ref-icon", "md-ref-icon-lucide", sharedClasses, classes].filter(Boolean).join(" ");
-  const children = iconNode
+function renderIconNode(icon: IconNode, classes = ""): string {
+  const className = ["md-ref-icon", "md-ref-icon-lucide", classes].filter(Boolean).join(" ");
+  const children = icon
     .map(([tag, attrs]) => `<${tag}${renderSvgAttrs(attrs)} />`)
     .join("");
   return `<svg class="${className}" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">${children}</svg>`;
+}
+
+function renderLucideRefIcon(kind: UnityAssetIconKind, classes = ""): string {
+  const iconNode = unityAssetIconNodeForKind(kind);
+  const sharedClasses = kind === "folder" ? unityFolderIconClass(false) : unityAssetIconClassForKind(kind);
+  return renderIconNode(iconNode, [sharedClasses, classes].filter(Boolean).join(" "));
 }
 
 function renderRefIcon(kind: UnityAssetIconKind = "file", classes = ""): string {
@@ -223,7 +237,7 @@ function renderLocalFileRef(filePath: string, line = ""): string {
   const icon = isDir
     ? renderRefIcon("folder", "md-workspace-ref-icon")
     : renderRefIcon();
-  return renderFileRef(cleanPath, line, classes, ` data-entry-kind="${entryKind}"`, icon);
+  return renderFileRef(cleanPath, line, classes, ` data-entry-kind="${entryKind}" draggable="true"`, icon);
 }
 
 function renderUnityAssetRef(filePath: string, line = ""): string {
@@ -234,7 +248,7 @@ function renderUnityAssetRef(filePath: string, line = ""): string {
     normalizedPath,
     line,
     "md-unity-asset-ref",
-    ` data-asset-path="${escaped}" data-asset-kind="${kind}"`,
+    ` data-asset-path="${escaped}" data-asset-kind="${kind}" draggable="true"`,
     renderUnityAssetIcon(kind),
   );
 }
@@ -254,6 +268,60 @@ function renderInlineCommandRef(source: string): string {
   const escapedDisplay = escapeAttr(display);
   const escapedCommand = escapeAttr(command);
   return `<code class="md-command-ref" data-command-trigger="${escapedCommand}" title="${escapedDisplay}" aria-label="${escapedDisplay}">${escapedDisplay}</code>`;
+}
+
+export interface ViewRefInjectOptions {
+  openLabel?: string;
+  viewLabel?: string;
+  resolveViewRef?: (viewId: string) => {
+    id?: string | null;
+    icon?: IconNode | null;
+    iconName?: string | null;
+  } | null;
+}
+
+function normalizeViewRefValue(source: string): string {
+  const decoded = decodeCodeText(source).trim();
+  const unwrapped = decoded.startsWith("{") && decoded.endsWith("}")
+    ? decoded.slice(1, -1).trim()
+    : decoded;
+  return unwrapped.replace(/\\/g, "/").replace(/\/+/g, "/").replace(/^\/+|\/+$/g, "");
+}
+
+function renderViewRefBlock(source: string, options: ViewRefInjectOptions = {}): string {
+  const viewId = normalizeViewRefValue(source);
+  if (!viewId || /[\r\n<>]/.test(viewId)) return escapeAttr(`view:${source}`);
+
+  const resolved = options.resolveViewRef?.(viewId) ?? null;
+  const resolvedViewId = normalizeViewRefValue(resolved?.id ?? "") || viewId;
+  const openLabel = options.openLabel?.trim() || "Open View";
+  const viewLabel = options.viewLabel?.trim() || "View";
+  const escapedViewId = escapeAttr(viewId);
+  const escapedRunViewId = escapeAttr(resolvedViewId);
+  const escapedOpenLabel = escapeAttr(openLabel);
+  const escapedViewLabel = escapeAttr(viewLabel);
+  const title = `${escapedViewLabel}: ${escapedViewId}`;
+  const viewIcon = renderIconNode(resolved?.icon ?? ViewIcon, "md-view-ref-kind-icon");
+  const openIcon = renderIconNode(PanelTopOpen, "md-view-open-icon");
+  const iconAttr = resolved?.iconName?.trim()
+    ? ` data-view-icon="${escapeAttr(resolved.iconName.trim())}"`
+    : "";
+  const sourceAttr = resolvedViewId !== viewId
+    ? ` data-view-ref="${escapedViewId}"`
+    : "";
+
+  return [
+    `<div class="md-view-ref-block ui-select-text" data-view-id="${escapedRunViewId}"${sourceAttr}${iconAttr} title="${title}" aria-label="${title}">`,
+    `<div class="md-view-ref-main">${viewIcon}<span class="md-view-ref-type">${escapedViewLabel}</span><span class="md-view-ref-id">${escapedViewId}</span></div>`,
+    `<button type="button" class="md-view-open-button ui-select-none" data-view-id="${escapedRunViewId}" title="${escapedOpenLabel}" aria-label="${escapedOpenLabel}: ${escapedViewId}">${openIcon}<span>${escapedOpenLabel}</span></button>`,
+    "</div>",
+  ].join("");
+}
+
+export function injectViewRefs(html: string, options: ViewRefInjectOptions = {}): string {
+  return html.replace(VIEW_REF_PARAGRAPH_RE, (_match, value) =>
+    renderViewRefBlock(value, options),
+  );
 }
 
 function renderWorkspaceMention(path: string, match: string): string {
@@ -286,7 +354,7 @@ function renderWorkspaceMention(path: string, match: string): string {
     ? renderRefIcon("folder", "md-workspace-ref-icon")
     : renderLucideRefIcon("file", "md-workspace-ref-icon md-workspace-file-icon");
 
-  return `<span class="${classes} ui-select-text" data-workspace-path="${escapedPath}" data-entry-kind="${isDir ? "folder" : "file"}"${fileAttr} title="${title}" aria-label="${title}">${icon}<span class="md-workspace-ref-prefix">@</span>${escapeAttr(name)}${isDir ? "/" : ""}</span>`;
+  return `<span class="${classes} ui-select-text" data-workspace-path="${escapedPath}" data-entry-kind="${isDir ? "folder" : "file"}"${fileAttr} draggable="true" title="${title}" aria-label="${title}">${icon}<span class="md-workspace-ref-prefix">@</span>${escapeAttr(name)}${isDir ? "/" : ""}</span>`;
 }
 
 interface SceneObjectRefParts {
@@ -313,7 +381,7 @@ function renderUnitySceneObjectRef(filePath: string): string {
   const escapedObjectPath = escapeAttr(ref.objectPath);
   const escapedLabel = escapeAttr(displaySceneObjectRef(ref.objectPath));
   const icon = renderRefIcon("gameobject", "md-unity-gameobject-icon");
-  return `<span class="md-file-ref md-unity-scene-object-ref ui-select-text" data-file-path="${escapedFullPath}" data-scene-path="${escapedScenePath}" data-scene-object-path="${escapedObjectPath}" title="${escapedFullPath}" aria-label="${escapedFullPath}">${icon}<span class="md-ref-label">${escapedLabel}</span></span>`;
+  return `<span class="md-file-ref md-unity-scene-object-ref ui-select-text" data-file-path="${escapedFullPath}" data-scene-path="${escapedScenePath}" data-scene-object-path="${escapedObjectPath}" draggable="true" title="${escapedFullPath}" aria-label="${escapedFullPath}">${icon}<span class="md-ref-label">${escapedLabel}</span></span>`;
 }
 
 function isSceneObjectRefTerminator(ch: string): boolean {

@@ -2952,7 +2952,7 @@ dependencies = [
 
 [[package]]
 name = "locus"
-version = "0.2.15"
+version = "0.3.0"
 dependencies = [
  "aisdk",
  "anyhow",
@@ -3013,6 +3013,7 @@ dependencies = [
  "walkdir",
  "webview2-com",
  "windows",
+ "windows-core 0.61.2",
  "winreg",
  "zip",
 ]

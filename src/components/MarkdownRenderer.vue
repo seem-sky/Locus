@@ -12,11 +12,23 @@ import {
 } from "../composables/markdownImages";
 import { renderHighlightedCodeLines } from "../composables/markdownCodeLines";
 import { normalizeExternalMarkdownHref } from "../composables/markdownExternalLinks";
-import { injectAssetRefs, injectFileRefs, injectWorkspaceMentions } from "../composables/markdownInject";
+import { injectAssetRefs, injectFileRefs, injectViewRefs, injectWorkspaceMentions } from "../composables/markdownInject";
 import { normalizeMarkdownForRender } from "../composables/markdownRender";
 import { wrapMarkdownTables } from "../composables/markdownTableHtml";
+import {
+  armLocusFilePointerDrag,
+  armUnityReferencePointerDrag,
+  startLocusFileHtmlDrag,
+  startUnityReferenceHtmlDrag,
+} from "../composables/useUnityReferenceDragSource";
 import { resolveMarkdownImage } from "../services/markdownImage";
 import { hasTauriWindowRuntime } from "../services/tauriRuntime";
+import { normalizeViewError, viewRun, viewTree, type ViewPackageSummary } from "../services/view";
+import { useNotificationStore } from "../stores/notification";
+import { t } from "../i18n";
+import { resolveLocusViewIcon } from "./icons/locusViewIcons";
+import type { LocusFileDropRef } from "../services/unity";
+import type { AssetRefAttachment } from "../types";
 
 const props = defineProps<{
   content: string;
@@ -30,6 +42,9 @@ const emit = defineEmits<{
 }>();
 
 const rootRef = ref<HTMLElement | null>(null);
+const notificationStore = useNotificationStore();
+const viewRefSummaries = ref<ViewPackageSummary[]>([]);
+let markdownViewRefLoadRun = 0;
 
 function escapeHtml(source: string): string {
   return source
@@ -157,6 +172,18 @@ const renderedHtml = computed(() => {
     html = prepareMarkdownImages(html);
     html = injectAssetRefs(html);
     html = injectWorkspaceMentions(html);
+    html = injectViewRefs(html, {
+      openLabel: t("tool.view.open"),
+      resolveViewRef(viewRef) {
+        const view = resolveViewRefSummary(viewRef);
+        if (!view) return null;
+        return {
+          id: view.id,
+          icon: resolveLocusViewIcon(view.icon),
+          iconName: view.icon,
+        };
+      },
+    });
     if (props.enableFileRefs) {
       html = injectFileRefs(html);
     }
@@ -283,9 +310,108 @@ async function openMarkdownHref(href: string): Promise<void> {
   }
 }
 
+function normalizeViewRefKey(value: string): string {
+  return value.trim().replace(/\\/g, "/").replace(/\/+/g, "/").replace(/^\/+|\/+$/g, "").toLowerCase();
+}
+
+function viewMatchesRef(view: ViewPackageSummary, refKey: string): boolean {
+  const candidates = [
+    view.id,
+    view.displayPath,
+    view.packageRelPath,
+    view.name,
+  ];
+  return candidates.some((candidate) => candidate && normalizeViewRefKey(candidate) === refKey);
+}
+
+function contentMayContainViewRef(content: string): boolean {
+  return /(?:^|\n)\s*`?view:/i.test(content);
+}
+
+function resolveViewRefSummary(rawViewId: string): ViewPackageSummary | null {
+  const refKey = normalizeViewRefKey(rawViewId);
+  if (!refKey) return null;
+  return viewRefSummaries.value.find((view) => viewMatchesRef(view, refKey)) ?? null;
+}
+
+async function loadMarkdownViewRefs() {
+  const run = ++markdownViewRefLoadRun;
+  try {
+    const snapshot = await viewTree();
+    if (run === markdownViewRefLoadRun) {
+      viewRefSummaries.value = snapshot.views;
+    }
+  } catch {
+    if (run === markdownViewRefLoadRun) {
+      viewRefSummaries.value = [];
+    }
+  }
+}
+
+watch(
+  () => props.content,
+  (content) => {
+    if (!contentMayContainViewRef(content)) {
+      markdownViewRefLoadRun++;
+      viewRefSummaries.value = [];
+      return;
+    }
+    void loadMarkdownViewRefs();
+  },
+  { immediate: true },
+);
+
+async function resolveMarkdownViewId(rawViewId: string): Promise<string> {
+  const refKey = normalizeViewRefKey(rawViewId);
+  if (!refKey) return rawViewId.trim();
+
+  const cachedView = resolveViewRefSummary(rawViewId);
+  if (cachedView) return cachedView.id;
+
+  try {
+    const snapshot = await viewTree();
+    return snapshot.views.find((view) => viewMatchesRef(view, refKey))?.id ?? rawViewId.trim();
+  } catch {
+    return rawViewId.trim();
+  }
+}
+
+async function openMarkdownViewRef(button: HTMLButtonElement) {
+  if (button.disabled) return;
+  const rawViewId = button.dataset.viewId?.trim();
+  if (!rawViewId) return;
+
+  const block = button.closest<HTMLElement>(".md-view-ref-block");
+  button.disabled = true;
+  if (block) block.dataset.mdViewOpening = "true";
+  try {
+    const viewId = await resolveMarkdownViewId(rawViewId);
+    await viewRun(viewId);
+  } catch (error) {
+    const err = normalizeViewError(error);
+    notificationStore.addNotice("error", err.message, {
+      code: err.code,
+      operation: "openViewFromMarkdownRef",
+      replaceOperation: true,
+    });
+  } finally {
+    button.disabled = false;
+    if (block) delete block.dataset.mdViewOpening;
+  }
+}
+
 function handleMarkdownContentActivation(event: MouseEvent) {
   if (event.defaultPrevented || !isHandledMarkdownMouseButton(event)) return;
   if (!(event.target instanceof Element)) return;
+
+  const viewOpenButton = event.target.closest(".md-view-open-button[data-view-id]") as HTMLButtonElement | null;
+  if (viewOpenButton) {
+    if (event.type !== "click" || event.button !== 0) return;
+    event.preventDefault();
+    event.stopPropagation();
+    void openMarkdownViewRef(viewOpenButton);
+    return;
+  }
 
   const anchor = event.target.closest("a[href]") as HTMLAnchorElement | null;
   if (anchor) {
@@ -307,6 +433,91 @@ function handleMarkdownContentActivation(event: MouseEvent) {
   event.stopPropagation();
   emit("openImage", image.currentSrc || image.src);
 }
+
+function normalizeUnityRefDatasetPath(value?: string): string {
+  return (value ?? "").trim().replace(/\\/g, "/").replace(/\/+$/g, "");
+}
+
+function unityRefFromMarkdownDragTarget(target: Element): AssetRefAttachment | null {
+  const sceneRef = target.closest(".md-unity-scene-object-ref") as HTMLElement | null;
+  if (sceneRef) {
+    const scenePath = normalizeUnityRefDatasetPath(sceneRef.dataset.scenePath);
+    const objectPath = normalizeUnityRefDatasetPath(sceneRef.dataset.sceneObjectPath);
+    if (scenePath && objectPath) {
+      return {
+        kind: "sceneObject",
+        path: `${scenePath}/${objectPath}`,
+        source: "manual",
+      };
+    }
+  }
+
+  const assetRef = target.closest(".md-unity-asset-ref, .md-file-ref[data-asset-path]") as HTMLElement | null;
+  if (assetRef) {
+    const assetPath = normalizeUnityRefDatasetPath(assetRef.dataset.assetPath || assetRef.dataset.filePath);
+    if (/^(Assets|Packages)\//i.test(assetPath)) {
+      return {
+        kind: "asset",
+        path: assetPath,
+        source: "manual",
+      };
+    }
+  }
+
+  return null;
+}
+
+function localFileFromMarkdownDragTarget(target: Element): LocusFileDropRef | null {
+  const workspaceRef = target.closest(".md-workspace-ref[data-workspace-path]") as HTMLElement | null;
+  if (workspaceRef) {
+    const path = normalizeUnityRefDatasetPath(workspaceRef.dataset.workspacePath);
+    if (path) {
+      return {
+        path,
+        isDir: workspaceRef.dataset.entryKind === "folder",
+        source: "locus",
+      };
+    }
+  }
+
+  const fileRef = target.closest(".md-file-ref[data-file-path]") as HTMLElement | null;
+  if (!fileRef || fileRef.classList.contains("md-knowledge-ref")) return null;
+  if (fileRef.classList.contains("md-unity-asset-ref") || fileRef.classList.contains("md-unity-scene-object-ref")) {
+    return null;
+  }
+
+  const path = normalizeUnityRefDatasetPath(fileRef.dataset.filePath);
+  if (!path) return null;
+  return {
+    path,
+    isDir: fileRef.dataset.entryKind === "folder",
+    source: "locus",
+  };
+}
+
+function handleMarkdownDragStart(event: DragEvent) {
+  if (!(event.target instanceof Element)) return;
+  const ref = unityRefFromMarkdownDragTarget(event.target);
+  if (ref) {
+    startUnityReferenceHtmlDrag(event, [ref]);
+    return;
+  }
+  const file = localFileFromMarkdownDragTarget(event.target);
+  if (!file) return;
+  startLocusFileHtmlDrag(event, [file]);
+}
+
+function handleMarkdownPointerDown(event: PointerEvent) {
+  if (!(event.target instanceof Element)) return;
+  const ref = unityRefFromMarkdownDragTarget(event.target);
+  if (ref) {
+    armUnityReferencePointerDrag(event, [ref]);
+    return;
+  }
+  const file = localFileFromMarkdownDragTarget(event.target);
+  if (!file) return;
+  armLocusFilePointerDrag(event, [file]);
+}
 </script>
 
 <template>
@@ -315,6 +526,8 @@ function handleMarkdownContentActivation(event: MouseEvent) {
     class="markdown-body ui-select-text"
     @click="handleMarkdownContentActivation"
     @auxclick="handleMarkdownContentActivation"
+    @pointerdown="handleMarkdownPointerDown"
+    @dragstart="handleMarkdownDragStart"
     v-html="renderedHtml"
   />
 </template>
@@ -635,6 +848,101 @@ function handleMarkdownContentActivation(event: MouseEvent) {
   text-decoration: none;
 }
 
+.markdown-body .md-view-ref-block {
+  width: fit-content;
+  max-width: 100%;
+  min-width: min(340px, 100%);
+  min-height: 38px;
+  margin: 4px 0 12px;
+  padding: 6px 7px 6px 9px;
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border: 1px solid color-mix(in srgb, var(--border-color) 84%, transparent);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--panel-bg) 88%, var(--sidebar-bg) 12%);
+  color: var(--text-color);
+}
+
+.markdown-body .md-view-ref-block[data-md-view-opening="true"] {
+  border-color: color-mix(in srgb, var(--accent-color) 22%, var(--border-color));
+  background: color-mix(in srgb, var(--accent-color) 5%, var(--panel-bg) 95%);
+}
+
+.markdown-body .md-view-ref-main {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.markdown-body .md-view-ref-kind-icon {
+  color: color-mix(in srgb, var(--accent-color) 74%, var(--text-color) 26%);
+}
+
+.markdown-body .md-view-ref-type {
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  user-select: none;
+}
+
+.markdown-body .md-view-ref-id {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--font-mono-inline);
+  font-size: 13px;
+  line-height: 1.35;
+  color: var(--text-color);
+}
+
+.markdown-body .md-view-open-button {
+  appearance: none;
+  min-width: max-content;
+  min-height: 24px;
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  padding: 0 8px;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+  transition: background 0.12s ease, border-color 0.12s ease, color 0.12s ease, opacity 0.12s ease;
+}
+
+.markdown-body .md-view-open-button:hover:not(:disabled),
+.markdown-body .md-view-open-button:focus-visible {
+  background: color-mix(in srgb, var(--hover-bg) 76%, transparent);
+  border-color: var(--border-color);
+  color: var(--text-color);
+  outline: none;
+}
+
+.markdown-body .md-view-open-button:disabled {
+  cursor: wait;
+  opacity: 0.58;
+}
+
+.markdown-body .md-view-open-icon {
+  width: 13px;
+  min-width: 13px;
+  height: 13px;
+}
+
 .md-asset-chip {
   display: inline-flex;
   align-items: center;
@@ -649,6 +957,8 @@ function handleMarkdownContentActivation(event: MouseEvent) {
   vertical-align: baseline;
   font-weight: 500;
   color: var(--text-secondary);
+  user-select: none;
+  -webkit-user-select: none;
 }
 
 .md-asset-chip:hover {
@@ -679,6 +989,8 @@ function handleMarkdownContentActivation(event: MouseEvent) {
   vertical-align: -2px;
   font-weight: 400;
   color: color-mix(in srgb, var(--text-color) 90%, var(--text-secondary) 10%);
+  user-select: none;
+  -webkit-user-select: none;
 }
 
 .md-unity-asset-ref,
@@ -705,6 +1017,13 @@ function handleMarkdownContentActivation(event: MouseEvent) {
   vertical-align: -2px;
   font-weight: 400;
   color: color-mix(in srgb, var(--text-color) 86%, var(--text-secondary) 14%);
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.markdown-body :is(.md-asset-chip, .md-file-ref, .md-workspace-ref) {
+  user-select: none;
+  -webkit-user-select: none;
 }
 
 .md-file-ref:hover,
