@@ -16,7 +16,7 @@ import { useDisplaySettings } from "../composables/useDisplaySettings";
 import { useKnowledgeAccessMode } from "../composables/useKnowledgeAccessMode";
 import { useChatInputSettings } from "../composables/useChatInputSettings";
 import { resolveChatResponseLocale } from "../composables/useAgentResponseSettings";
-import { logToolCollapseTrace, previewTraceText } from "../services/toolCollapseTrace";
+import { isToolCollapseTraceEnabled, logToolCollapseTrace, previewTraceText } from "../services/toolCollapseTrace";
 import type {
   SessionSummary, SessionDetail, ChatMessage, TokenUsage,
   TodoItem, StreamEvent, ImageAttachment, AssetRefAttachment, ToolCallDisplay,
@@ -404,7 +404,13 @@ export const useChatStore = defineStore("chat", () => {
     }));
   }
 
-  function traceStoreOrder(event: string, detail: Record<string, unknown> = {}) {
+  function traceChatStore(event: string, detail: () => Record<string, unknown>) {
+    if (!isToolCollapseTraceEnabled(event)) return;
+    logToolCollapseTrace("chat-store", event, detail());
+  }
+
+  function traceStoreOrder(event: string, detail: () => Record<string, unknown> = () => ({})) {
+    if (!isToolCollapseTraceEnabled(event)) return;
     logToolCollapseTrace("chat-store:order", event, {
       activeSessionId: activeSessionId.value,
       currentRunId: currentRunId.value,
@@ -413,7 +419,7 @@ export const useChatStore = defineStore("chat", () => {
       messages: traceMessageOrder(messages.value),
       activeToolCalls: traceToolCallOrder(activeToolCalls.value),
       deferredUserMessages: deferredUserMessagesTraceState(),
-      ...detail,
+      ...detail(),
     });
   }
 
@@ -645,11 +651,11 @@ export const useChatStore = defineStore("chat", () => {
     const key = runScopedKey(event.sessionId, event.runId);
     const messagesForRun = deferredUserMessagesByRun.get(key) ?? [];
     deferredUserMessagesByRun.set(key, mergeUserMessage(messagesForRun, event.message));
-    traceStoreOrder("deferUserMessageDuringToolRound", {
+    traceStoreOrder("deferUserMessageDuringToolRound", () => ({
       key,
       event: traceStreamEvent(event),
       deferredForRun: traceMessageOrder(deferredUserMessagesByRun.get(key) ?? []),
-    });
+    }));
   }
 
   function flushDeferredUserMessages(sessionId: string, runId: string) {
@@ -657,21 +663,22 @@ export const useChatStore = defineStore("chat", () => {
     const deferredMessages = deferredUserMessagesByRun.get(key);
     if (!deferredMessages || deferredMessages.length === 0) return;
 
-    const beforeMessages = traceMessageOrder(messages.value);
+    const traceFlushDeferredUserMessages = isToolCollapseTraceEnabled("flushDeferredUserMessages");
+    const beforeMessages = traceFlushDeferredUserMessages ? traceMessageOrder(messages.value) : null;
     if (activeSessionId.value === sessionId) {
       for (const message of deferredMessages) {
         messages.value = mergeUserMessage(messages.value, message);
       }
     }
     deferredUserMessagesByRun.delete(key);
-    traceStoreOrder("flushDeferredUserMessages", {
+    traceStoreOrder("flushDeferredUserMessages", () => ({
       key,
       sessionId,
       runId,
       flushedMessages: traceMessageOrder(deferredMessages),
       messagesBeforeFlush: beforeMessages,
       messagesAfterFlush: traceMessageOrder(messages.value),
-    });
+    }));
   }
 
   function localQueuedInputsForRun(
@@ -1145,8 +1152,9 @@ export const useChatStore = defineStore("chat", () => {
   }
 
   function applyMutation(m: StreamMutation) {
-    const messagesBeforeMutation = traceMessageOrder(messages.value);
-    const activeToolCallsBeforeMutation = traceToolCallOrder(activeToolCalls.value);
+    const traceApplyStreamMutation = isToolCollapseTraceEnabled("applyStreamMutation");
+    const messagesBeforeMutation = traceApplyStreamMutation ? traceMessageOrder(messages.value) : null;
+    const activeToolCallsBeforeMutation = traceApplyStreamMutation ? traceToolCallOrder(activeToolCalls.value) : null;
     switch (m.type) {
       case "appendRawText":
         {
@@ -1154,7 +1162,7 @@ export const useChatStore = defineStore("chat", () => {
           const streamingLenBefore = streamingText.value.length;
           rawStreamText.value += m.text;
           if (!streamingText.value) streamingText.value = rawStreamText.value.charAt(0);
-          logToolCollapseTrace("chat-store", "appendRawText", {
+          traceChatStore("appendRawText", () => ({
             deltaLen: m.text.length,
             deltaPreview: previewTraceText(m.text, 48),
             rawLenBefore,
@@ -1162,7 +1170,7 @@ export const useChatStore = defineStore("chat", () => {
             streamingLenBefore,
             streamingLenAfter: streamingText.value.length,
             injectedFirstVisibleChar: streamingLenBefore === 0 && streamingText.value.length > 0,
-          });
+          }));
           startStreamAnim();
         }
         break;
@@ -1259,12 +1267,12 @@ export const useChatStore = defineStore("chat", () => {
       case "pushMessage":
         messages.value = replaceMessageById(messages.value, m.message);
         if (m.message.role === "assistant") {
-          logToolCollapseTrace("chat-store", "pushMessage", {
+          traceChatStore("pushMessage", () => ({
             messageId: m.message.id,
             contentLen: m.message.content.length,
             toolCallCount: m.message.toolCalls?.length ?? 0,
             thinkingLen: m.message.thinkingContent?.length ?? 0,
-          });
+          }));
         }
         break;
       case "upsertMessage":
@@ -1277,11 +1285,11 @@ export const useChatStore = defineStore("chat", () => {
         messages.value = hydrateMessages(m.messages);
         break;
       case "pushToolResults":
-        logToolCollapseTrace("chat-store", "pushToolResults", {
+        traceChatStore("pushToolResults", () => ({
           toolCallCount: activeToolCalls.value.length,
           toolCallIds: activeToolCalls.value.map((toolCall) => toolCall.id),
           targetToolCallIds: m.toolCallIds ?? null,
-        });
+        }));
         {
           const targetIds = m.toolCallIds ? new Set(m.toolCallIds) : null;
           const sourceToolCalls = targetIds
@@ -1293,13 +1301,13 @@ export const useChatStore = defineStore("chat", () => {
         }
         break;
       case "resetRound":
-        logToolCollapseTrace("chat-store", "resetRound", {
+        traceChatStore("resetRound", () => ({
           rawStreamLen: rawStreamText.value.length,
           streamingLen: streamingText.value.length,
           thinkingLen: streamingThinking.value.length,
           activeToolCallCount: activeToolCalls.value.length,
           activeToolCallIds: activeToolCalls.value.map((toolCall) => toolCall.id),
-        });
+        }));
         resetStreamAnim();
         streamingThinking.value = "";
         streamingTextOrder.value = 0;
@@ -1311,13 +1319,13 @@ export const useChatStore = defineStore("chat", () => {
         activeToolCalls.value = [];
         break;
       case "resetRoundKeepToolCalls":
-        logToolCollapseTrace("chat-store", "resetRoundKeepToolCalls", {
+        traceChatStore("resetRoundKeepToolCalls", () => ({
           rawStreamLen: rawStreamText.value.length,
           streamingLen: streamingText.value.length,
           thinkingLen: streamingThinking.value.length,
           activeToolCallCount: activeToolCalls.value.length,
           activeToolCallIds: activeToolCalls.value.map((toolCall) => toolCall.id),
-        });
+        }));
         resetStreamAnim();
         streamingThinking.value = "";
         streamingTextOrder.value = 0;
@@ -1368,10 +1376,10 @@ export const useChatStore = defineStore("chat", () => {
         break;
       case "setStreaming":
         if (isStreaming.value !== m.value) {
-          logToolCollapseTrace("chat-store", "setStreaming", {
+          traceChatStore("setStreaming", () => ({
             previous: isStreaming.value,
             next: m.value,
-          });
+          }));
         }
         isStreaming.value = m.value;
         break;
@@ -1379,19 +1387,19 @@ export const useChatStore = defineStore("chat", () => {
         isCompacting.value = m.value;
         break;
     }
-    traceStoreOrder("applyStreamMutation", {
+    traceStoreOrder("applyStreamMutation", () => ({
       mutation: traceStreamMutation(m),
       messagesBeforeMutation,
       messagesAfterMutation: traceMessageOrder(messages.value),
       activeToolCallsBeforeMutation,
       activeToolCallsAfterMutation: traceToolCallOrder(activeToolCalls.value),
       streamReplayDepth,
-    });
+    }));
   }
 
   // -- Stream event handler --
   function handleStreamEvent(event: StreamEvent): boolean {
-    traceStoreOrder("streamEventReceived", {
+    traceStoreOrder("streamEventReceived", () => ({
       event: traceStreamEvent(event),
       expectedRunId: sessionRunIds.value.get(event.sessionId)
         ?? (event.sessionId === activeSessionId.value ? currentRunId.value : null),
@@ -1406,7 +1414,7 @@ export const useChatStore = defineStore("chat", () => {
         displayTextLen: (input.displayText || input.text).length,
         displayTextPreview: previewTraceText(input.displayText || input.text, 48),
       })),
-    });
+    }));
 
     if (event.type === "runStart") {
       const closedRunId = closedRunIds.get(event.sessionId);
@@ -1662,27 +1670,27 @@ export const useChatStore = defineStore("chat", () => {
 
     switch (event.type) {
       case "textDelta":
-        logToolCollapseTrace("chat-store", "handleStreamEvent:textDelta", {
+        traceChatStore("handleStreamEvent:textDelta", () => ({
           sessionId: event.sessionId,
           runId: event.runId,
           textLen: event.text.length,
           textPreview: previewTraceText(event.text, 48),
           activeToolCallCount: activeToolCalls.value.length,
           isStreaming: isStreaming.value,
-        });
+        }));
         break;
       case "toolCallRoundDone":
-        logToolCollapseTrace("chat-store", "handleStreamEvent:toolCallRoundDone", {
+        traceChatStore("handleStreamEvent:toolCallRoundDone", () => ({
           sessionId: event.sessionId,
           runId: event.runId,
           messageId: event.messageId,
           fullTextLen: event.fullText.length,
           toolCallCount: event.toolCalls.length,
           activeToolCallCount: activeToolCalls.value.length,
-        });
+        }));
         break;
       case "done":
-        logToolCollapseTrace("chat-store", "handleStreamEvent:done", {
+        traceChatStore("handleStreamEvent:done", () => ({
           sessionId: event.sessionId,
           runId: event.runId,
           messageId: event.messageId,
@@ -1690,17 +1698,17 @@ export const useChatStore = defineStore("chat", () => {
           rawStreamLen: rawStreamText.value.length,
           streamingLen: streamingText.value.length,
           activeToolCallCount: activeToolCalls.value.length,
-        });
+        }));
         break;
     }
 
     const mutations = reduceStreamEvent(state, event);
-    traceStoreOrder("streamEventMutationBatch", {
+    traceStoreOrder("streamEventMutationBatch", () => ({
       event: traceStreamEvent(event),
       mutationCount: mutations.length,
       mutations: mutations.map(traceStreamMutation),
       streamReplayDepth,
-    });
+    }));
     for (const m of mutations) {
       applyMutation(m);
     }
