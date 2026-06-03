@@ -1,6 +1,6 @@
 ## CodeGraph Strategy
 
-**NOTE (build mode):** CodeGraph is **mandatory for complex code edits** and **optional for simple tasks**. Simple READ may complete with `read`/`grep`/`list` alone (`exploration_gate`). Complex edits require `codegraph_gate` before `task(implementer)`, `task(optimizer)`, or `task(reviewer)` — runtime blocks implementer dispatch when the prompt indicates complex scope without CodeGraph.
+**NOTE (build mode):** CodeGraph is the **primary** structural search tool. **Prefer `codegraph_*` over `grep`** whenever the question is about code structure, symbols, calls, or cross-file relationships. `grep` is a **secondary fallback** for literal text only (string contents, log messages, comments, regex over content). For simple tasks `read`/`grep`/`list` may still satisfy `exploration_gate`, but always reach for CodeGraph first when the question is structural.
 
 CodeGraph indexes the workspace as an AST-level knowledge graph (symbols, call edges, files). Use it for **structure** — definitions, callers, callees, blast radius — not for literal strings (use `grep`) or Unity assets (use `unity_*` tools).
 
@@ -8,7 +8,7 @@ CodeGraph indexes the workspace as an AST-level knowledge graph (symbols, call e
 
 ### Simple vs complex
 
-**Simple (CodeGraph optional):** 1–2 files, single directory, localized change (copy, config, comment, typo, obvious local fix), no exported/named API contract change. Explore with `read`/`grep`/`list`, then proceed.
+**Simple (CodeGraph preferred, gate optional):** 1–2 files, single directory, localized change (copy, config, comment, typo, obvious local fix), no exported/named API contract change. Even here, reach for `codegraph_search` / `codegraph_context` first; use `read`/`grep`/`list` only when CodeGraph is not applicable (literal text, file not in index).
 
 **Complex (CodeGraph mandatory):** ≥3 source files or ≥2 top-level directories; refactor, new feature, architecture change; editing named functions/methods/classes/exported composables/stores; uncertain blast radius; structural or cross-file questions. Run CodeGraph before implement/review.
 
@@ -55,10 +55,11 @@ CodeGraph indexes the workspace as an AST-level knowledge graph (symbols, call e
 
 ### Rules
 
-- **Complex tasks:** prefer CodeGraph over `grep` for symbol names; prefer `grep` for literals.
-- **Simple tasks:** `read`/`grep` is enough; do not require CodeGraph for gate satisfaction.
-- Trust CodeGraph locations (file + line). Do not re-verify symbol placement with `grep`.
-- Do not spawn a subagent or run a grep→read loop when `codegraph_context` or `codegraph_impact` already answers the question.
+- **Default to CodeGraph first.** For any structural question (where is X, who calls Y, what does Z call, trace, blast radius), call `codegraph_*` before `grep`. `grep` is reserved for literal text — log messages, comments, string contents, regex over content.
+- **Simple tasks:** `read`/`grep` may still satisfy `exploration_gate`, but prefer CodeGraph when the question is about code structure; do not require CodeGraph for purely literal searches.
+- **Don't grep first** for symbol lookups — `codegraph_search` is faster and returns kind + location + signature in one call.
+- **Don't re-verify CodeGraph with grep** — the AST parse is authoritative; running `grep` to confirm a CodeGraph answer wastes context.
+- **Don't loop `codegraph_search` + `codegraph_node`** — use `codegraph_context` / `codegraph_explore` for breadth; do not spawn a subagent or run a grep→read loop when `codegraph_context` or `codegraph_impact` already answers the question.
 - After you **edit** source in the same turn, do not immediately re-run CodeGraph — the index debounces (~500ms); use `read` for the file you just changed.
 - If `codegraph_status` shows a missing or stale index, ask the user whether to run `codegraph init` / `codegraph sync`.
 

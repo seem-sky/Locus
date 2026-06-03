@@ -10,7 +10,7 @@ pub(super) fn grep() -> ToolDef {
         name: "grep".to_string(),
         description: prompt.description,
         parameters: prompt.parameters,
-        execute: make_exec(|args, _ctx| {
+        execute: make_exec(|args, ctx| {
             Box::pin(async move {
                 let pattern = match args.get("pattern").and_then(|v| v.as_str()) {
                     Some(p) => p.to_string(),
@@ -40,6 +40,29 @@ pub(super) fn grep() -> ToolDef {
                     .get("include")
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string());
+
+                let workspace_root = ctx
+                    .working_dir
+                    .as_deref()
+                    .map(std::path::Path::new)
+                    .filter(|root| !root.as_os_str().is_empty());
+                let (search_path, remap_prefix) = {
+                    let meta = crate::commands::resolve_workspace_file_path_with_meta(
+                        workspace_root,
+                        &search_path,
+                    );
+                    let resolved = meta.resolved.to_string_lossy().to_string();
+                    let prefix =
+                        crate::commands::assets_lua_remap_notice_from_tool_args(&args, &resolved);
+                    let prefix = if prefix.is_empty() && meta.assets_lua_remapped {
+                        crate::commands::format_assets_lua_path_remap_notice(
+                            &search_path, &resolved,
+                        )
+                    } else {
+                        prefix
+                    };
+                    (resolved, prefix)
+                };
 
                 let regex = match regex::Regex::new(&pattern) {
                     Ok(r) => r,
@@ -175,7 +198,7 @@ pub(super) fn grep() -> ToolDef {
 
                 if matches.is_empty() {
                     return ToolResult {
-                        output: "No matches found".to_string(),
+                        output: format!("{remap_prefix}No matches found"),
                         is_error: false,
                     };
                 }
@@ -221,7 +244,7 @@ pub(super) fn grep() -> ToolDef {
                 }
 
                 ToolResult {
-                    output: out.join("\n"),
+                    output: format!("{remap_prefix}{}", out.join("\n")),
                     is_error: false,
                 }
             })
@@ -339,5 +362,40 @@ mod tests {
 
         assert!(!result.is_error);
         assert!(result.output.contains("CachedBindings.cs"));
+    }
+
+    #[test]
+    fn grep_remaps_assets_lua_directory_root_and_reports_notice() {
+        let root = tempdir().expect("temp dir");
+        let workspace = root.path().join("project");
+        let lua_file = workspace
+            .join("Assets.Lua")
+            .join("Core")
+            .join("sample.lua");
+        std::fs::create_dir_all(lua_file.parent().expect("parent")).expect("create dirs");
+        std::fs::write(&lua_file, "coroutine.start(function() end)\n").expect("write lua");
+
+        let wrong_path = workspace.join("Assets").join("Lua");
+        let result = tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(async {
+                (grep().execute)(
+                    json!({
+                        "pattern": "coroutine\\.start",
+                        "path": wrong_path.to_string_lossy().to_string(),
+                        "include": "*.lua"
+                    }),
+                    ToolExecutionContext {
+                        working_dir: Some(workspace.to_string_lossy().to_string()),
+                        ..ToolExecutionContext::default()
+                    },
+                )
+                .await
+            });
+
+        assert!(!result.is_error, "{}", result.output);
+        assert!(result.output.contains("Assets.Lua"));
+        assert!(result.output.contains("Assets/Lua"));
+        assert!(result.output.contains("coroutine.start"));
     }
 }

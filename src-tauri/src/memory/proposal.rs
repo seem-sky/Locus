@@ -173,10 +173,19 @@ pub fn apply_memory_entry(
 
     let saved = store.create(working_dir, app_storage_dir, entry, embedding)?;
     if saved.scope == MemoryScope::Project {
-        if let Some(linked) = sync_entry_to_markdown(working_dir, &saved)? {
-            let mut updated = saved.clone();
-            updated.linked_doc_path = Some(linked);
-            return Ok(updated);
+        match sync_entry_to_markdown(working_dir, &saved) {
+            Ok(Some(linked)) => {
+                let mut updated = saved.clone();
+                updated.linked_doc_path = Some(linked);
+                return Ok(updated);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                eprintln!(
+                    "[Locus] memory saved to agentmemory but markdown sync failed: {}",
+                    error
+                );
+            }
         }
     }
     Ok(saved)

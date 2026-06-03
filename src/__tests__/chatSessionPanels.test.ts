@@ -42,6 +42,7 @@ const displaySettingsState = vi.hoisted(() => ({
   changesAutoClose: true,
   fileChangePopoverEnabled: true,
   thinkingAutoOpen: false,
+  showThinkingProcess: false,
   thinkingAutoExpand: true,
   chatDiffReviewTarget: "inline",
   gitDiffReviewTarget: "inline",
@@ -341,7 +342,7 @@ describe("chat session panel state", () => {
 
   it("auto-opens thinking panel when thinking starts and the setting is enabled", async () => {
     const chatStore = useChatStore();
-    displaySettingsState.thinkingAutoOpen = true;
+    displaySettingsState.showThinkingProcess = true;
 
     await chatStore.selectSession("s1");
     chatStore.handleStreamEvent({
@@ -362,7 +363,7 @@ describe("chat session panel state", () => {
 
   it("does not auto-open thinking panel when the setting is disabled", async () => {
     const chatStore = useChatStore();
-    displaySettingsState.thinkingAutoOpen = false;
+    displaySettingsState.showThinkingProcess = false;
 
     await chatStore.selectSession("s1");
     chatStore.handleStreamEvent({

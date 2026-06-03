@@ -5,7 +5,7 @@
 ### 1. Read and analyze carefully
 
 - Read **relevant source in full** before drawing conclusions — do not skim, guess from filenames, or rely on stale memory.
-- Use `read`/`grep`/`list` to understand the change scope; for **complex** edits add CodeGraph (`codegraph_context`, then `codegraph_impact` / `codegraph_trace` / callers / callees as needed) — see `codegraph` rule.
+- **Prefer CodeGraph** for any structural question (where is X, who calls Y, blast radius, trace): `codegraph_search` / `codegraph_context` / `codegraph_impact` / `codegraph_trace` / `codegraph_callers` / `codegraph_callees`. Use `read`/`grep`/`list` only for literal text (logs, comments, string contents) and files not in the index.
 - **Build mode:** simple tasks satisfy READ with exploration alone; **complex** edits require `codegraph_gate` before implement/review. `task(explorer)` does not replace CodeGraph on complex scope.
 - For structural or cross-file questions, consult CodeGraph **before** editing (complex tasks only).
 - When dispatching subagents, pass **concrete file paths and analysis findings** in the prompt — not vague instructions.
@@ -40,4 +40,4 @@ Do not proceed to edits until you can explain *how the code runs today* and *wha
 | **Complex task** | Each plan batch still obeys Read → Implement → Optimize → Review with this discipline |
 | **Review retry** | Re-analyze from scratch — do not patch blindly from reviewer bullets alone |
 
-Superficial analysis, grep-only understanding, or speculative edits are **not acceptable** at any stage.
+Superficial analysis, grep-only understanding, or speculative edits are **not acceptable** at any stage. When the question is structural, use CodeGraph — `grep` alone is never enough.

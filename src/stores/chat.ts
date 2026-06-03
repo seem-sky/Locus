@@ -1224,7 +1224,7 @@ export const useChatStore = defineStore("chat", () => {
       case "setThinking":
         isThinking.value = m.value;
         if (m.startTime !== undefined) thinkingStartTime.value = m.startTime;
-        if (m.value && useDisplaySettings().state.thinkingAutoOpen) {
+        if (m.value && useDisplaySettings().state.showThinkingProcess) {
           thinkingPanelContent.value = "";
           showThinkingPanel.value = true;
         }

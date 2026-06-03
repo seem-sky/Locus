@@ -16,7 +16,7 @@ import BaseSegmented from "../ui/BaseSegmented.vue";
 import BaseSwitch from "../ui/BaseSwitch.vue";
 
 const { mainPreference, unityEmbedPreference, setThemePreference } = useTheme();
-const { state: display, set: setDisplay, setFont } = useDisplaySettings();
+const { state: display, set: setDisplay, setFont, setShowThinkingProcess } = useDisplaySettings();
 const notificationStore = useNotificationStore();
 const viewOpenInExistingWindow = ref(true);
 const viewOpenInExistingWindowReady = ref(false);
@@ -200,24 +200,6 @@ async function updateViewWindowsAboveMain(value: boolean) {
 
     <div class="toggle-row">
       <BaseSwitch
-        :model-value="display.thinkingAutoOpen"
-        :aria-label="t('settings.display.thinkingAutoOpen')"
-        @update:model-value="setDisplay('thinkingAutoOpen', $event)"
-      />
-      <span>{{ t("settings.display.thinkingAutoOpen") }}</span>
-    </div>
-
-    <div class="toggle-row">
-      <BaseSwitch
-        :model-value="display.thinkingAutoExpand"
-        :aria-label="t('settings.display.thinkingAutoExpand')"
-        @update:model-value="setDisplay('thinkingAutoExpand', $event)"
-      />
-      <span>{{ t("settings.display.thinkingAutoExpand") }}</span>
-    </div>
-
-    <div class="toggle-row">
-      <BaseSwitch
         :model-value="display.rightAlignUserMessages"
         :aria-label="t('settings.display.rightAlignUserMessages')"
         @update:model-value="setDisplay('rightAlignUserMessages', $event)"
@@ -232,15 +214,6 @@ async function updateViewWindowsAboveMain(value: boolean) {
         @update:model-value="setDisplay('compactToolCalls', $event)"
       />
       <span>{{ t("settings.display.compactToolCalls") }}</span>
-    </div>
-
-    <div class="toggle-row">
-      <BaseSwitch
-        :model-value="display.hideThinkingBlocks"
-        :aria-label="t('settings.display.hideThinkingBlocks')"
-        @update:model-value="setDisplay('hideThinkingBlocks', $event)"
-      />
-      <span>{{ t("settings.display.hideThinkingBlocks") }}</span>
     </div>
 
     <div class="toggle-row" :class="{ disabled: !viewOpenInExistingWindowReady || viewOpenInExistingWindowBusy }">
@@ -261,6 +234,30 @@ async function updateViewWindowsAboveMain(value: boolean) {
         @update:model-value="updateViewWindowsAboveMain"
       />
       <span>{{ t("settings.display.viewWindowsAboveMain") }}</span>
+    </div>
+  </div>
+
+  <div class="settings-section">
+    <div class="section-label">{{ t("settings.display.thinkingTitle") }}</div>
+    <p class="section-desc">{{ t("settings.display.thinkingDesc") }}</p>
+
+    <div class="toggle-row">
+      <BaseSwitch
+        :model-value="display.showThinkingProcess"
+        :aria-label="t('settings.display.showThinkingProcess')"
+        @update:model-value="setShowThinkingProcess"
+      />
+      <span>{{ t("settings.display.showThinkingProcess") }}</span>
+    </div>
+
+    <div class="toggle-row" :class="{ disabled: !display.showThinkingProcess }">
+      <BaseSwitch
+        :model-value="display.thinkingAutoExpand"
+        :disabled="!display.showThinkingProcess"
+        :aria-label="t('settings.display.thinkingAutoExpand')"
+        @update:model-value="setDisplay('thinkingAutoExpand', $event)"
+      />
+      <span>{{ t("settings.display.thinkingAutoExpand") }}</span>
     </div>
   </div>
 

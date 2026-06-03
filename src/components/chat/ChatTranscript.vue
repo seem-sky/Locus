@@ -923,7 +923,7 @@ function toolCallsFromInfos(toolCalls: ToolCallInfo[] | undefined) {
 }
 
 function shouldHideThinkingBlocks() {
-  return displaySettings.hideThinkingBlocks !== false;
+  return displaySettings.showThinkingProcess !== true;
 }
 
 function shouldRenderHistoryThinkingBlock(item: Pick<MessageRenderItem, "message">) {

@@ -18,6 +18,8 @@ export interface DisplaySettings {
   changesAutoClose: boolean;
   /** Enable hover preview popovers for file changes */
   fileChangePopoverEnabled: boolean;
+  /** Auto-show thinking process in chat (transcript + side panel) */
+  showThinkingProcess: boolean;
   /** Auto-open thinking panel when thinking starts */
   thinkingAutoOpen: boolean;
   /** Auto-expand inline thinking content in the chat transcript */
@@ -87,6 +89,7 @@ const defaults: DisplaySettings = {
   changesAutoOpen: true,
   changesAutoClose: true,
   fileChangePopoverEnabled: true,
+  showThinkingProcess: false,
   thinkingAutoOpen: false,
   thinkingAutoExpand: true,
   chatDiffReviewTarget: "window",
@@ -120,7 +123,14 @@ function load(): DisplaySettings {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (raw) {
       const parsed = JSON.parse(raw);
-      return { ...defaults, ...parsed, fonts: { ...defaultFonts, ...parsed.fonts } };
+      const merged = { ...defaults, ...parsed, fonts: { ...defaultFonts, ...parsed.fonts } };
+      if (parsed.showThinkingProcess === undefined) {
+        merged.showThinkingProcess =
+          parsed.hideThinkingBlocks === false || parsed.thinkingAutoOpen === true;
+      }
+      merged.hideThinkingBlocks = !merged.showThinkingProcess;
+      merged.thinkingAutoOpen = merged.showThinkingProcess;
+      return merged;
     }
   } catch { /* ignore */ }
   return { ...defaults, fonts: { ...defaultFonts } };
@@ -144,7 +154,14 @@ export function useDisplaySettings() {
     applyFonts(state.fonts);
   }
 
-  return { state, set, setFont };
+  function setShowThinkingProcess(value: boolean) {
+    state.showThinkingProcess = value;
+    state.hideThinkingBlocks = !value;
+    state.thinkingAutoOpen = value;
+    save({ ...state });
+  }
+
+  return { state, set, setFont, setShowThinkingProcess };
 }
 
 /* ---- Font CSS-variable application ---- */

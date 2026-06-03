@@ -352,6 +352,16 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
+        .plugin(
+            tauri_plugin_window_state::Builder::new()
+                .with_state_flags(
+                    tauri_plugin_window_state::StateFlags::SIZE
+                        | tauri_plugin_window_state::StateFlags::POSITION
+                        | tauri_plugin_window_state::StateFlags::MAXIMIZED,
+                )
+                .with_filter(|label| label == MAIN_WINDOW_LABEL)
+                .build(),
+        )
         .on_webview_event(|webview, event| {
             commands::handle_unity_embed_webview_event(webview, event);
         })
@@ -885,20 +895,11 @@ pub fn run() {
             app.manage(log_store_for_setup.clone());
             startup_for_setup.mark("setup_state_managed");
 
-            tauri::async_runtime::spawn(async move {
-                let result = tauri::async_runtime::spawn_blocking(move || {
-                    memory_store_for_startup.ensure_ready()
-                })
-                .await;
-
-                match result {
-                    Ok(Ok(())) => eprintln!("[Locus] agentmemory service ready"),
-                    Ok(Err(error)) => eprintln!(
-                        "[Locus] warning: agentmemory autostart skipped or failed: {}",
-                        error
-                    ),
+            tauri::async_runtime::spawn_blocking(move || {
+                match memory_store_for_startup.ensure_ready() {
+                    Ok(()) => eprintln!("[Locus] agentmemory service ready"),
                     Err(error) => eprintln!(
-                        "[Locus] warning: agentmemory autostart task failed: {}",
+                        "[Locus] warning: agentmemory autostart skipped or failed: {}",
                         error
                     ),
                 }

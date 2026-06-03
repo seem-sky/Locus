@@ -17,7 +17,7 @@ describe("chatMessageDraft", () => {
       "使用图片向我展示 store",
       "",
       "<locus-references>",
-      "Use Unity refs as exact asset anchors. Use project knowledge refs as exact knowledge_read paths.",
+      "The user attached these workspace references via drag-and-drop. Read every attached target before planning or editing: use `read` for text/code files, `list` for folders, `unity_yaml_read` / `unity_yaml_list` for Unity YAML assets and scene objects, and `knowledge_read` for project knowledge paths.",
       "- asset: {@Assets/UI/Store.prefab}",
       "- project knowledge: `skill/ui.md` (use `knowledge_read`)",
       "</locus-references>",

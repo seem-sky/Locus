@@ -88,6 +88,22 @@ pub fn rewrite_with_meta(command: &str) -> RtkRewriteMeta {
     }
 }
 
+/// Remap xLua paths, rewrite through RTK, then remap again so rewritten commands
+/// (e.g. `rtk grep`) still target `Assets.Lua/...`.
+pub fn rewrite_bash_with_meta(command: &str, workdir: Option<&Path>) -> RtkRewriteMeta {
+    let prepped = crate::commands::remap_assets_lua_mispath_in_text(command, workdir);
+    let mut meta = rewrite_with_meta(&prepped);
+    let post_rtk = meta
+        .executed_command
+        .as_deref()
+        .unwrap_or(prepped.as_str());
+    let final_command = crate::commands::remap_assets_lua_mispath_in_text(post_rtk, workdir);
+    if final_command != post_rtk {
+        meta.executed_command = Some(final_command);
+    }
+    meta
+}
+
 pub fn augment_path_with_rtk(current_path: Option<std::ffi::OsString>) -> Option<std::ffi::OsString> {
     if !enabled() {
         return current_path;
@@ -280,5 +296,32 @@ mod tests {
             "unexpected rewrite: {rewritten}"
         );
         assert!(rewritten.starts_with("rtk"));
+    }
+
+    #[test]
+    fn rewrite_bash_with_meta_remaps_paths_before_and_after_rtk() {
+        if std::env::var("LOCUS_RTK_DISABLED").is_ok() {
+            return;
+        }
+        let bundle = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("gen")
+            .join("rtk");
+        if rtk_binary_in_dir(&bundle).is_none() {
+            eprintln!("skipping: bundled rtk unavailable");
+            return;
+        }
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let workspace = temp.path().join("project");
+        std::fs::create_dir_all(workspace.join("Assets.Lua/Core")).expect("create assets lua");
+
+        let command = r#"grep -n foo Assets/Lua/Core/foo.lua"#;
+        let meta = rewrite_bash_with_meta(command, Some(&workspace));
+        let executed = meta.executed_command.expect("executed command");
+        assert!(
+            executed.contains("Assets.Lua/Core/foo.lua"),
+            "unexpected command: {executed}"
+        );
+        assert!(!executed.contains("Assets/Lua/"));
     }
 }

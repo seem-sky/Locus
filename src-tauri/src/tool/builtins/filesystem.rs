@@ -2,6 +2,45 @@ use super::misc::truncate_utf8_prefix;
 use super::{make_exec, ToolDef, ToolResult};
 use crate::eol::{apply_line_ending, normalize_lf, resolve_preferred_line_ending};
 
+fn resolve_tool_file_path(
+    args: &serde_json::Value,
+    workspace_root: Option<&std::path::Path>,
+) -> (String, String) {
+    let requested_path = args
+        .get("filePath")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let meta = crate::commands::resolve_workspace_file_path_with_meta(
+        workspace_root,
+        &requested_path,
+    );
+    let resolved = meta.resolved.to_string_lossy().to_string();
+    let remap_prefix = crate::commands::assets_lua_remap_notice_from_tool_args(args, &resolved);
+    let remap_prefix = if remap_prefix.is_empty() && meta.assets_lua_remapped {
+        crate::commands::format_assets_lua_path_remap_notice(&requested_path, &resolved)
+    } else {
+        remap_prefix
+    };
+    (resolved, remap_prefix)
+}
+
+fn resolve_tool_dir_path(
+    args: &serde_json::Value,
+    workspace_root: Option<&std::path::Path>,
+    path_arg: &str,
+) -> (String, String) {
+    let meta = crate::commands::resolve_workspace_file_path_with_meta(workspace_root, path_arg);
+    let resolved = meta.resolved.to_string_lossy().to_string();
+    let remap_prefix = crate::commands::assets_lua_remap_notice_from_tool_args(args, &resolved);
+    let remap_prefix = if remap_prefix.is_empty() && meta.assets_lua_remapped {
+        crate::commands::format_assets_lua_path_remap_notice(path_arg, &resolved)
+    } else {
+        remap_prefix
+    };
+    (resolved, remap_prefix)
+}
+
 // ─── read ───────────────────────────────────────────────────────────────────
 
 pub(super) fn read() -> ToolDef {
@@ -12,15 +51,12 @@ pub(super) fn read() -> ToolDef {
         parameters: prompt.parameters,
         execute: make_exec(|args, ctx| {
             Box::pin(async move {
-                let file_path = match args.get("filePath").and_then(|v| v.as_str()) {
-                    Some(p) => p.to_string(),
-                    None => {
-                        return ToolResult {
-                            output: "Missing required parameter: filePath".to_string(),
-                            is_error: true,
-                        };
-                    }
-                };
+                if args.get("filePath").and_then(|v| v.as_str()).is_none() {
+                    return ToolResult {
+                        output: "Missing required parameter: filePath".to_string(),
+                        is_error: true,
+                    };
+                }
 
                 let offset = args
                     .get("offset")
@@ -34,12 +70,8 @@ pub(super) fn read() -> ToolDef {
                     .as_deref()
                     .map(std::path::Path::new)
                     .filter(|root| !root.as_os_str().is_empty());
-                let file_path = crate::commands::resolve_workspace_file_path(
-                    workspace_root,
-                    &file_path,
-                )
-                .to_string_lossy()
-                .to_string();
+                let (file_path, remap_prefix) =
+                    resolve_tool_file_path(&args, workspace_root);
 
                 let path = std::path::Path::new(&file_path);
 
@@ -183,7 +215,7 @@ pub(super) fn read() -> ToolDef {
                             output.push_str("\n</content>");
 
                             ToolResult {
-                                output,
+                                output: format!("{remap_prefix}{output}"),
                                 is_error: false,
                             }
                         }
@@ -217,15 +249,12 @@ pub(super) fn write() -> ToolDef {
         parameters: prompt.parameters,
         execute: make_exec(|args, ctx| {
             Box::pin(async move {
-                let file_path = match args.get("filePath").and_then(|v| v.as_str()) {
-                    Some(p) => p.to_string(),
-                    None => {
-                        return ToolResult {
-                            output: "Missing required parameter: filePath".to_string(),
-                            is_error: true,
-                        };
-                    }
-                };
+                if args.get("filePath").and_then(|v| v.as_str()).is_none() {
+                    return ToolResult {
+                        output: "Missing required parameter: filePath".to_string(),
+                        is_error: true,
+                    };
+                }
                 let content = match args.get("content").and_then(|v| v.as_str()) {
                     Some(c) => c.to_string(),
                     None => {
@@ -241,12 +270,8 @@ pub(super) fn write() -> ToolDef {
                     .as_deref()
                     .map(std::path::Path::new)
                     .filter(|root| !root.as_os_str().is_empty());
-                let file_path = crate::commands::resolve_workspace_file_path(
-                    workspace_root,
-                    &file_path,
-                )
-                .to_string_lossy()
-                .to_string();
+                let (file_path, remap_prefix) =
+                    resolve_tool_file_path(&args, workspace_root);
 
                 match tokio::fs::metadata(&file_path).await {
                     Ok(metadata) => {
@@ -283,7 +308,7 @@ pub(super) fn write() -> ToolDef {
 
                 match tokio::fs::write(&file_path, &content).await {
                     Ok(()) => ToolResult {
-                        output: format!("Created {}", file_path),
+                        output: format!("{remap_prefix}Created {file_path}"),
                         is_error: false,
                     },
                     Err(e) => ToolResult {
@@ -306,27 +331,20 @@ pub(super) fn edit() -> ToolDef {
         parameters: prompt.parameters,
         execute: make_exec(|args, ctx| {
             Box::pin(async move {
-                let file_path = match args.get("filePath").and_then(|v| v.as_str()) {
-                    Some(p) => p.to_string(),
-                    None => {
-                        return ToolResult {
-                            output: "Missing required parameter: filePath".to_string(),
-                            is_error: true,
-                        };
-                    }
-                };
+                if args.get("filePath").and_then(|v| v.as_str()).is_none() {
+                    return ToolResult {
+                        output: "Missing required parameter: filePath".to_string(),
+                        is_error: true,
+                    };
+                }
 
                 let workspace_root = ctx
                     .working_dir
                     .as_deref()
                     .map(std::path::Path::new)
                     .filter(|root| !root.as_os_str().is_empty());
-                let file_path = crate::commands::resolve_workspace_file_path(
-                    workspace_root,
-                    &file_path,
-                )
-                .to_string_lossy()
-                .to_string();
+                let (file_path, remap_prefix) =
+                    resolve_tool_file_path(&args, workspace_root);
 
                 let metadata = match tokio::fs::metadata(&file_path).await {
                     Ok(m) => m,
@@ -461,7 +479,7 @@ pub(super) fn edit() -> ToolDef {
                         match tokio::fs::write(&file_path, rewritten).await {
                             Ok(()) => {
                                 return ToolResult {
-                                    output: format!("Created {}", file_path),
+                                    output: format!("{remap_prefix}Created {file_path}"),
                                     is_error: false,
                                 };
                             }
@@ -513,11 +531,11 @@ pub(super) fn edit() -> ToolDef {
                         ToolResult {
                             output: if applied_count > 1 {
                                 format!(
-                                    "Edited {} ({} edits applied){}",
+                                    "{remap_prefix}Edited {} ({} edits applied){}",
                                     file_path, applied_count, lines_info
                                 )
                             } else {
-                                format!("Edited {}{}", file_path, lines_info)
+                                format!("{remap_prefix}Edited {}{}", file_path, lines_info)
                             },
                             is_error: false,
                         }
@@ -706,7 +724,7 @@ pub(super) fn list() -> ToolDef {
         name: "list".to_string(),
         description: prompt.description,
         parameters: prompt.parameters,
-        execute: make_exec(|args, _ctx| {
+        execute: make_exec(|args, ctx| {
             Box::pin(async move {
                 let root_path = args
                     .get("path")
@@ -723,6 +741,14 @@ pub(super) fn list() -> ToolDef {
                         };
                     }
                 };
+
+                let workspace_root = ctx
+                    .working_dir
+                    .as_deref()
+                    .map(std::path::Path::new)
+                    .filter(|root| !root.as_os_str().is_empty());
+                let (root_path, remap_prefix) =
+                    resolve_tool_dir_path(&args, workspace_root, &root_path);
 
                 let max_depth = args
                     .get("depth")
@@ -774,7 +800,7 @@ pub(super) fn list() -> ToolDef {
                 }
 
                 ToolResult {
-                    output,
+                    output: format!("{remap_prefix}{output}"),
                     is_error: false,
                 }
             })
@@ -1236,5 +1262,45 @@ mod tests {
             std::fs::read(&target).expect("read edited bytes"),
             b"alpha\nbeta\ngamma\n"
         );
+    }
+
+    #[test]
+    fn read_reports_assets_lua_path_remap_notice() {
+        let root = tempdir().expect("temp dir");
+        let workspace = root.path().join("project");
+        let target = workspace
+            .join("Assets.Lua")
+            .join("Core")
+            .join("foo.lua");
+        std::fs::create_dir_all(target.parent().expect("parent")).expect("create dirs");
+        std::fs::write(&target, "print('ok')\n").expect("write lua");
+
+        let wrong_path = workspace
+            .join("Assets")
+            .join("Lua")
+            .join("Core")
+            .join("foo.lua")
+            .to_string_lossy()
+            .to_string();
+
+        let result = tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(async {
+                (read().execute)(
+                    json!({
+                        "filePath": wrong_path,
+                    }),
+                    ToolExecutionContext {
+                        working_dir: Some(workspace.to_string_lossy().to_string()),
+                        ..ToolExecutionContext::default()
+                    },
+                )
+                .await
+            });
+
+        assert!(!result.is_error, "{}", result.output);
+        assert!(result.output.contains("Assets.Lua/Core/foo.lua"));
+        assert!(result.output.contains("Assets/Lua/Core/foo.lua"));
+        assert!(result.output.contains("print('ok')"));
     }
 }

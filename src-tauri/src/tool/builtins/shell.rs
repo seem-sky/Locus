@@ -56,6 +56,19 @@ pub(super) fn bash() -> ToolDef {
         parameters: prompt.parameters,
         execute: make_exec(|args, ctx| {
             Box::pin(async move {
+                let workdir = args
+                    .get("workdir")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string());
+                if workdir.is_none() {
+                    return ToolResult {
+                        output: "Missing required parameter: workdir".to_string(),
+                        is_error: true,
+                    };
+                }
+
                 let command = match args.get("command").and_then(|v| v.as_str()) {
                     Some(c) => c.to_string(),
                     None => {
@@ -65,7 +78,8 @@ pub(super) fn bash() -> ToolDef {
                         };
                     }
                 };
-                let rtk_meta = crate::rtk::rewrite_with_meta(&command);
+                let workdir_path = workdir.as_deref().map(std::path::Path::new);
+                let rtk_meta = crate::rtk::rewrite_bash_with_meta(&command, workdir_path);
                 let execution_meta = serde_json::json!({ "rtk": rtk_meta.to_json() });
                 if let Some(sink) = ctx.execution_meta_sink.as_ref() {
                     if let Ok(mut slot) = sink.lock() {
@@ -81,19 +95,6 @@ pub(super) fn bash() -> ToolDef {
                     .get("timeout")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(120_000);
-                let workdir = args
-                    .get("workdir")
-                    .and_then(|v| v.as_str())
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(|s| s.to_string());
-                if workdir.is_none() {
-                    return ToolResult {
-                        output: "Missing required parameter: workdir".to_string(),
-                        is_error: true,
-                    };
-                }
-
                 let python =
                     crate::python_runtime::resolve_effective_python(ctx.app_handle.as_ref());
                 if let Some(ref python) = python {
@@ -111,6 +112,22 @@ pub(super) fn bash() -> ToolDef {
                     .executed_command
                     .clone()
                     .unwrap_or_else(|| command.clone());
+                let mut bash_remap_prefix = crate::commands::assets_lua_remap_notice_from_tool_args(
+                    &args,
+                    &rewritten_command,
+                );
+                if bash_remap_prefix.is_empty() {
+                    let pre_rtk = crate::commands::remap_assets_lua_mispath_in_text(
+                        &command,
+                        workdir_path,
+                    );
+                    if pre_rtk != command {
+                        bash_remap_prefix = crate::commands::format_assets_lua_path_remap_notice(
+                            &command,
+                            &rewritten_command,
+                        );
+                    }
+                }
                 let sh_command = || {
                     if let Some(ref python) = python {
                         format!(
@@ -222,7 +239,10 @@ pub(super) fn bash() -> ToolDef {
 
                         let exit_code = output.status.code().unwrap_or(-1);
                         ToolResult {
-                            output: format!("Exit code: {}\n{}", exit_code, out),
+                            output: format!(
+                                "{bash_remap_prefix}Exit code: {}\n{}",
+                                exit_code, out
+                            ),
                             is_error: exit_code != 0,
                         }
                     }

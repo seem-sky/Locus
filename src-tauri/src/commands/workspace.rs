@@ -71,7 +71,7 @@ pub(crate) fn app_temp_dir() -> Result<std::path::PathBuf, String> {
     Ok(dir)
 }
 
-fn read_nonempty_string(path: &std::path::Path) -> Option<String> {
+pub(crate) fn read_nonempty_string(path: &std::path::Path) -> Option<String> {
     std::fs::read_to_string(path)
         .ok()
         .map(|s| s.trim().to_string())
@@ -936,21 +936,26 @@ pub(crate) fn load_codex_model_config() -> Result<CodexModelConfig, String> {
         .unwrap_or_default())
 }
 
-#[tauri::command]
-pub async fn get_model_defaults(_app_handle: AppHandle) -> Result<ModelDefaults, AppError> {
-    let primary_path = persistent_config_dir()?.join("model_defaults.json");
-    if let Some(defaults) = std::fs::read_to_string(&primary_path)
+pub(crate) fn load_model_defaults() -> ModelDefaults {
+    let primary_path = match persistent_config_dir() {
+        Ok(dir) => dir.join("model_defaults.json"),
+        Err(_) => return ModelDefaults::default(),
+    };
+    std::fs::read_to_string(&primary_path)
         .ok()
         .and_then(|s| serde_json::from_str::<ModelDefaults>(&s).ok())
-    {
-        return Ok(defaults);
-    }
-    Ok(ModelDefaults::default())
+        .unwrap_or_default()
+}
+
+#[tauri::command]
+pub async fn get_model_defaults(_app_handle: AppHandle) -> Result<ModelDefaults, AppError> {
+    Ok(load_model_defaults())
 }
 
 #[tauri::command]
 pub async fn save_model_defaults(
     defaults: ModelDefaults,
+    memory_store: State<'_, Arc<crate::agentmemory::AgentMemoryState>>,
     _app_handle: AppHandle,
 ) -> Result<(), AppError> {
     let json = serde_json::to_string_pretty(&defaults)
@@ -959,6 +964,7 @@ pub async fn save_model_defaults(
     let dir = persistent_config_dir().map_err(|e| format!("Failed to get config dir: {}", e))?;
     std::fs::write(dir.join("model_defaults.json"), &json)
         .map_err(|e| format!("Failed to save model defaults: {}", e))?;
+    crate::commands::memory::schedule_agentmemory_restart(memory_store.inner());
     Ok(())
 }
 
@@ -1195,6 +1201,7 @@ pub async fn get_custom_endpoints(app_handle: AppHandle) -> Result<Vec<CustomEnd
 #[tauri::command]
 pub async fn save_custom_endpoints(
     endpoints: Vec<CustomEndpoint>,
+    memory_store: State<'_, Arc<crate::agentmemory::AgentMemoryState>>,
     app_handle: AppHandle,
 ) -> Result<(), AppError> {
     let path = custom_endpoints_path(&app_handle)?;
@@ -1226,6 +1233,7 @@ pub async fn save_custom_endpoints(
         let _ = keychain::delete_secret(&keychain::endpoint_key_name(endpoint_id));
     }
     prune_stale_custom_model_refs(&next_endpoint_ids)?;
+    crate::commands::memory::schedule_agentmemory_restart(memory_store.inner());
     Ok(())
 }
 
@@ -1676,6 +1684,17 @@ const ASSET_ROOT_DIRS: &[&str] = &["Assets", "Assets.Lua", "Packages", "ProjectS
 const LINKED_ASSET_ROOT_DIRS: &[&str] = &["Assets", "Assets.Lua", "Packages"];
 const WORKSPACE_SEARCH_MAX_DEPTH: usize = 64;
 
+/// Internal tool-arg keys set by [`crate::agent::instance::AgentInstance::inject_working_dir`]
+/// when an `Assets/Lua/` mis-path is rewritten to `Assets.Lua/`.
+pub(crate) const LOCUSS_REQUESTED_PATH_KEY: &str = "_locusRequestedPath";
+pub(crate) const LOCUSS_ASSETS_LUA_REMAPPED_KEY: &str = "_locusAssetsLuaRemapped";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WorkspaceFilePathResolution {
+    pub resolved: std::path::PathBuf,
+    pub assets_lua_remapped: bool,
+}
+
 /// Resolve a workspace file path, applying well-known aliases when the direct
 /// path does not exist. Some Unity/xLua projects use a top-level `Assets.Lua`
 /// directory; models often mis-resolve it as `Assets/Lua/...`.
@@ -1683,9 +1702,19 @@ pub(crate) fn resolve_workspace_file_path(
     workspace_root: Option<&std::path::Path>,
     raw_path: &str,
 ) -> std::path::PathBuf {
+    resolve_workspace_file_path_with_meta(workspace_root, raw_path).resolved
+}
+
+pub(crate) fn resolve_workspace_file_path_with_meta(
+    workspace_root: Option<&std::path::Path>,
+    raw_path: &str,
+) -> WorkspaceFilePathResolution {
     let trimmed = raw_path.trim();
     if trimmed.is_empty() {
-        return std::path::PathBuf::new();
+        return WorkspaceFilePathResolution {
+            resolved: std::path::PathBuf::new(),
+            assets_lua_remapped: false,
+        };
     }
 
     let path = std::path::Path::new(trimmed);
@@ -1698,39 +1727,238 @@ pub(crate) fn resolve_workspace_file_path(
     };
 
     if path_exists(&candidate) {
-        return candidate;
+        return WorkspaceFilePathResolution {
+            resolved: candidate,
+            assets_lua_remapped: false,
+        };
     }
 
     if let Some(remapped) = remap_assets_lua_mispath(workspace_root, &candidate) {
         if path_exists(&remapped) {
-            return remapped;
+            return WorkspaceFilePathResolution {
+                resolved: remapped,
+                assets_lua_remapped: true,
+            };
         }
     }
 
-    candidate
+    WorkspaceFilePathResolution {
+        resolved: candidate,
+        assets_lua_remapped: false,
+    }
+}
+
+/// User-visible notice when `Assets/Lua/` was rewritten to `Assets.Lua/`.
+pub(crate) fn format_assets_lua_path_remap_notice(requested: &str, resolved: &str) -> String {
+    let requested = requested.trim().replace('\\', "/");
+    let resolved = resolved.trim().replace('\\', "/");
+    format!(
+        "Note: Resolved to `{resolved}` (requested: `{requested}`). \
+         This project uses top-level `Assets.Lua/` (dot in the directory name), not `Assets/Lua/`.\n\n",
+    )
+}
+
+pub(crate) fn assets_lua_remap_notice_from_tool_args(
+    args: &serde_json::Value,
+    resolved: &str,
+) -> String {
+    if !args
+        .get(LOCUSS_ASSETS_LUA_REMAPPED_KEY)
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        return String::new();
+    }
+    let requested = args
+        .get(LOCUSS_REQUESTED_PATH_KEY)
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    if requested.is_empty() {
+        return String::new();
+    }
+    format_assets_lua_path_remap_notice(requested, resolved)
 }
 
 fn path_exists(path: &std::path::Path) -> bool {
     std::fs::metadata(path).is_ok()
 }
 
+const ASSETS_LUA_MISPATH_SEGMENT: &str = "assets/lua";
+const ASSETS_LUA_CANONICAL: &str = "Assets.Lua/";
+const ASSETS_LUA_CANONICAL_SEGMENT: &str = "Assets.Lua";
+
+fn is_assets_lua_mispath_segment_start(text: &str, idx: usize) -> bool {
+    if idx > 0 {
+        match text.as_bytes().get(idx - 1) {
+            Some(b'/') | Some(b'\\') | Some(b':') => {}
+            _ => return false,
+        }
+    }
+    text[idx..]
+        .to_ascii_lowercase()
+        .starts_with(ASSETS_LUA_MISPATH_SEGMENT)
+}
+
+fn assets_lua_mispath_segment_end(text: &str, idx: usize) -> usize {
+    let after = idx + ASSETS_LUA_MISPATH_SEGMENT.len();
+    if text.as_bytes().get(after) == Some(&b'/') {
+        after + 1
+    } else {
+        after
+    }
+}
+
+fn assets_lua_mispath_segment_is_valid(text: &str, idx: usize) -> bool {
+    if !is_assets_lua_mispath_segment_start(text, idx) {
+        return false;
+    }
+    let after = idx + ASSETS_LUA_MISPATH_SEGMENT.len();
+    match text.as_bytes().get(after) {
+        None => true,
+        Some(b'/') | Some(b'\\') => true,
+        Some(_) => false,
+    }
+}
+
+fn assets_lua_canonical_replacement(include_trailing_slash: bool) -> &'static str {
+    if include_trailing_slash {
+        ASSETS_LUA_CANONICAL
+    } else {
+        ASSETS_LUA_CANONICAL_SEGMENT
+    }
+}
+
+fn find_next_assets_lua_mispath_segment(lower: &str, search_from: usize) -> Option<usize> {
+    let mut pos = search_from;
+    while pos < lower.len() {
+        let rel_idx = lower[pos..].find(ASSETS_LUA_MISPATH_SEGMENT)?;
+        let idx = pos + rel_idx;
+        if assets_lua_mispath_segment_is_valid(lower, idx) {
+            return Some(idx);
+        }
+        pos = idx + 1;
+    }
+    None
+}
+
+fn workspace_has_assets_lua_root(workspace_root: &std::path::Path) -> bool {
+    workspace_root.join("Assets.Lua").is_dir()
+}
+
+/// Walk upward from `start` (file or directory) to find a workspace root that
+/// contains `Assets.Lua`.
+pub(crate) fn find_assets_lua_workspace_root(
+    start: &std::path::Path,
+) -> Option<std::path::PathBuf> {
+    let mut current = if start.is_dir() {
+        start.to_path_buf()
+    } else {
+        start.parent()?.to_path_buf()
+    };
+    loop {
+        if workspace_has_assets_lua_root(&current) {
+            return Some(current);
+        }
+        if !current.pop() {
+            return None;
+        }
+    }
+}
+
+/// Replace every `Assets/Lua` mis-segment with `Assets.Lua` when the workspace
+/// has a top-level `Assets.Lua` directory. Matches both `Assets/Lua/...` and
+/// directory roots like `Assets/Lua` without a trailing slash.
+pub(crate) fn remap_assets_lua_mispath_in_text(
+    text: &str,
+    workspace_hint: Option<&std::path::Path>,
+) -> String {
+    // Normalize path separators so Windows `Assets\Lua\` is caught too.
+    let normalized = text.replace('\\', "/");
+    let mut result = normalized;
+    let mut lower = result.to_ascii_lowercase();
+    let mut search_from = 0;
+    while let Some(idx) = find_next_assets_lua_mispath_segment(&lower, search_from) {
+        let include_trailing_slash = result.as_bytes().get(idx + ASSETS_LUA_MISPATH_SEGMENT.len())
+            == Some(&b'/');
+        let replace_end = assets_lua_mispath_segment_end(&result, idx);
+        if should_remap_assets_lua_occurrence(&result, idx, workspace_hint) {
+            let replacement = assets_lua_canonical_replacement(include_trailing_slash);
+            result.replace_range(idx..replace_end, replacement);
+            lower = result.to_ascii_lowercase();
+            search_from = idx + replacement.len();
+        } else {
+            search_from = idx + ASSETS_LUA_MISPATH_SEGMENT.len();
+        }
+    }
+    result
+}
+
+fn should_remap_assets_lua_occurrence(
+    text: &str,
+    mispath_idx: usize,
+    workspace_hint: Option<&std::path::Path>,
+) -> bool {
+    if let Some(root) = workspace_root_before_assets_lua_mispath(text, mispath_idx) {
+        return workspace_has_assets_lua_root(&root);
+    }
+
+    workspace_hint
+        .and_then(find_assets_lua_workspace_root)
+        .is_some()
+}
+
+fn workspace_root_before_assets_lua_mispath(
+    text: &str,
+    mispath_idx: usize,
+) -> Option<std::path::PathBuf> {
+    let prefix = text[..mispath_idx].trim_end_matches('/').trim_end_matches('\\');
+    if prefix.is_empty() {
+        return None;
+    }
+
+    let lower = prefix.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    let mut drive_start: Option<usize> = None;
+    for i in 0..bytes.len().saturating_sub(2) {
+        if bytes[i].is_ascii_alphabetic() && bytes[i + 1] == b':' && bytes[i + 2] == b'/' {
+            drive_start = Some(i);
+        }
+    }
+
+    let start = drive_start?;
+    let mut root = prefix[start..]
+        .trim_end_matches('"')
+        .trim_end_matches('\'')
+        .trim_end_matches('/')
+        .trim_end_matches('\\')
+        .to_string();
+    if root.is_empty() {
+        return None;
+    }
+    Some(std::path::PathBuf::from(root))
+}
+
 fn remap_assets_lua_mispath(
     workspace_root: Option<&std::path::Path>,
     path: &std::path::Path,
 ) -> Option<std::path::PathBuf> {
-    let workspace_root = workspace_root?;
-    if !workspace_root.join("Assets.Lua").is_dir() {
+    let unified = path.to_string_lossy().replace('\\', "/");
+    let lower = unified.to_ascii_lowercase();
+    let mispath_idx = find_next_assets_lua_mispath_segment(&lower, 0)?;
+    let effective_root = workspace_root
+        .map(|root| root.to_path_buf())
+        .or_else(|| workspace_root_before_assets_lua_mispath(&unified, mispath_idx))?;
+    if !workspace_has_assets_lua_root(&effective_root) {
         return None;
     }
 
-    let unified = path.to_string_lossy().replace('\\', "/");
-    let lower = unified.to_ascii_lowercase();
-    const WRONG: &str = "assets/lua/";
-    const RIGHT: &str = "Assets.Lua/";
-    let idx = lower.find(WRONG)?;
-    let mut fixed = unified;
-    fixed.replace_range(idx..idx + WRONG.len(), RIGHT);
-    Some(std::path::PathBuf::from(fixed))
+    let remapped = remap_assets_lua_mispath_in_text(&unified, Some(&effective_root));
+    if remapped == unified {
+        None
+    } else {
+        Some(std::path::PathBuf::from(remapped))
+    }
 }
 
 pub(crate) fn normalize_workspace_sub_path(sub_path: &str) -> Result<String, AppError> {
@@ -2625,11 +2853,12 @@ pub async fn get_config_registry(
 #[cfg(test)]
 mod tests {
     use super::{
-        collect_dir_entries, normalize_custom_endpoint_config,
-        normalize_tool_permission_mode_request, normalize_workspace_sub_path,
+        collect_dir_entries, find_assets_lua_workspace_root, format_assets_lua_path_remap_notice,
+        normalize_custom_endpoint_config, normalize_tool_permission_mode_request,
+        normalize_workspace_sub_path, remap_assets_lua_mispath_in_text,
         resolve_workspace_dir_target, resolve_workspace_file_path,
-        search_workspace_entries_in_dir, workspace_search_score,
-        CustomEndpoint,
+        resolve_workspace_file_path_with_meta, search_workspace_entries_in_dir,
+        workspace_search_score, CustomEndpoint,
     };
     use std::path::Path;
     use tempfile::tempdir;
@@ -2969,6 +3198,37 @@ mod tests {
     }
 
     #[test]
+    fn resolve_workspace_file_path_with_meta_flags_assets_lua_remap() {
+        let temp = tempdir().expect("create temp dir");
+        let workspace = temp.path().join("project");
+        let target = workspace
+            .join("Assets.Lua")
+            .join("Games")
+            .join("Texas")
+            .join("foo.lua");
+        std::fs::create_dir_all(target.parent().expect("parent dir")).expect("create dirs");
+        std::fs::write(&target, "print('ok')").expect("write lua file");
+
+        let meta = resolve_workspace_file_path_with_meta(
+            Some(&workspace),
+            "Assets/Lua/Games/Texas/foo.lua",
+        );
+        assert_eq!(meta.resolved, target);
+        assert!(meta.assets_lua_remapped);
+    }
+
+    #[test]
+    fn format_assets_lua_path_remap_notice_mentions_both_paths() {
+        let notice = format_assets_lua_path_remap_notice(
+            "H:/game/Assets/Lua/Core/foo.lua",
+            "H:/game/Assets.Lua/Core/foo.lua",
+        );
+        assert!(notice.contains("Assets/Lua/Core/foo.lua"));
+        assert!(notice.contains("Assets.Lua/Core/foo.lua"));
+        assert!(notice.contains("Assets.Lua/`"));
+    }
+
+    #[test]
     fn resolve_workspace_file_path_remaps_assets_lua_alias() {
         let temp = tempdir().expect("create temp dir");
         let workspace = temp.path().join("project");
@@ -2989,5 +3249,132 @@ mod tests {
         let absolute_wrong = workspace.join("Assets").join("Lua").join("Games").join("Texas").join("foo.lua");
         let resolved_absolute = resolve_workspace_file_path(Some(&workspace), &absolute_wrong.to_string_lossy());
         assert_eq!(resolved_absolute, target);
+    }
+
+    fn remap_assets_lua_mispath_in_text_rewrites_directory_root_without_trailing_slash() {
+        let temp = tempdir().expect("create temp dir");
+        let workspace = temp.path().join("project");
+        std::fs::create_dir_all(workspace.join("Assets.Lua/Core")).expect("create dirs");
+
+        let original = format!(
+            "{}/Assets/Lua",
+            workspace.to_string_lossy().replace('\\', "/")
+        );
+        let remapped = remap_assets_lua_mispath_in_text(&original, Some(&workspace));
+        assert!(remapped.ends_with("Assets.Lua"));
+        assert!(!remapped.contains("Assets/Lua"));
+
+        let backslash = format!(r"{}\\Assets\\Lua", workspace.display());
+        let remapped_backslash =
+            remap_assets_lua_mispath_in_text(&backslash, Some(&workspace));
+        assert!(remapped_backslash.ends_with("Assets.Lua"));
+    }
+
+    #[test]
+    fn remap_assets_lua_mispath_in_text_leaves_canonical_assets_lua_unchanged() {
+        let temp = tempdir().expect("create temp dir");
+        let workspace = temp.path().join("project");
+        std::fs::create_dir_all(workspace.join("Assets.Lua/Core")).expect("create dirs");
+
+        let canonical = format!(
+            "{}/Assets.Lua/Core/foo.lua",
+            workspace.to_string_lossy().replace('\\', "/")
+        );
+        let remapped = remap_assets_lua_mispath_in_text(&canonical, Some(&workspace));
+        assert_eq!(remapped, canonical);
+    }
+
+    #[test]
+    fn resolve_workspace_file_path_remaps_assets_lua_directory_root() {
+        let temp = tempdir().expect("create temp dir");
+        let workspace = temp.path().join("project");
+        std::fs::create_dir_all(workspace.join("Assets.Lua/Core")).expect("create dirs");
+
+        let wrong = workspace.join("Assets").join("Lua");
+        let meta = resolve_workspace_file_path_with_meta(
+            Some(&workspace),
+            &wrong.to_string_lossy(),
+        );
+        assert_eq!(meta.resolved, workspace.join("Assets.Lua"));
+        assert!(meta.assets_lua_remapped);
+    }
+
+    #[test]
+    fn remap_assets_lua_mispath_in_text_rewrites_bash_paths() {
+        let temp = tempdir().expect("create temp dir");
+        let workspace = temp.path().join("project");
+        std::fs::create_dir_all(workspace.join("Assets.Lua/Core/framework/async"))
+            .expect("create dirs");
+
+        let original = r#"grep -nE "function AsyncQueue" "H:/texas-game/Assets/Lua/Core/framework/async/async_queue.lua""#;
+        let remapped = remap_assets_lua_mispath_in_text(original, Some(&workspace));
+        assert!(remapped.contains("Assets.Lua/Core/framework/async/async_queue.lua"));
+        assert!(!remapped.contains("Assets/Lua/"));
+
+        let unchanged = remap_assets_lua_mispath_in_text(
+            r#"grep -n foo "Z:/nonexistent-locus-test/Assets/Lua/foo.lua""#,
+            None,
+        );
+        assert_eq!(
+            unchanged,
+            r#"grep -n foo "Z:/nonexistent-locus-test/Assets/Lua/foo.lua""#
+        );
+    }
+
+    #[test]
+    fn remap_assets_lua_mispath_in_text_rewrites_backslash_paths() {
+        let temp = tempdir().expect("create temp dir");
+        let workspace = temp.path().join("project");
+        std::fs::create_dir_all(workspace.join("Assets.Lua/Core/framework/async"))
+            .expect("create dirs");
+
+        let original =
+            r#"grep -n "AsyncQueue" "H:\texas-game\Assets\Lua\Core\framework\async\async_queue.lua""#;
+        let remapped = remap_assets_lua_mispath_in_text(original, Some(&workspace));
+        assert!(remapped.contains("Assets.Lua/Core/framework/async/async_queue.lua"));
+        assert!(!remapped.contains("Assets/Lua/"));
+        assert!(!remapped.contains("Assets\\Lua\\"));
+    }
+
+    #[test]
+    fn remap_assets_lua_mispath_in_text_finds_assets_lua_from_subdir_workdir() {
+        let temp = tempdir().expect("create temp dir");
+        let workspace = temp.path().join("project");
+        let subdir = workspace.join("src");
+        std::fs::create_dir_all(workspace.join("Assets.Lua/Core")).expect("create assets lua");
+        std::fs::create_dir_all(&subdir).expect("create subdir");
+
+        let remapped = remap_assets_lua_mispath_in_text(
+            "grep -r foo Assets/Lua/Core",
+            Some(&subdir),
+        );
+        assert!(remapped.contains("Assets.Lua/Core"));
+    }
+
+    #[test]
+    fn find_assets_lua_workspace_root_walks_up_from_subdir() {
+        let temp = tempdir().expect("create temp dir");
+        let workspace = temp.path().join("project");
+        let subdir = workspace.join("src").join("module");
+        std::fs::create_dir_all(workspace.join("Assets.Lua")).expect("create assets lua");
+        std::fs::create_dir_all(&subdir).expect("create subdir");
+
+        let found = find_assets_lua_workspace_root(&subdir).expect("workspace root");
+        assert_eq!(found, workspace);
+    }
+
+    #[test]
+    fn remap_assets_lua_mispath_in_text_uses_absolute_path_root_without_workdir_hint() {
+        let temp = tempdir().expect("create temp dir");
+        let workspace = temp.path().join("project");
+        std::fs::create_dir_all(workspace.join("Assets.Lua/Core")).expect("create assets lua");
+
+        let workspace_str = workspace.to_string_lossy().replace('\\', "/");
+        let original = format!(
+            r#"grep -n foo "{}/Assets/Lua/Core/foo.lua""#,
+            workspace_str
+        );
+        let remapped = remap_assets_lua_mispath_in_text(&original, None);
+        assert!(remapped.contains("Assets.Lua/Core/foo.lua"));
     }
 }

@@ -10,13 +10,13 @@ Before implementation or review, explore with read-only tools:
 
 **Simple task** (1–2 files, localized, no API contract change):
 
-1. `read`, `grep`, or `list` on the target file(s)
+1. **`codegraph_search` / `codegraph_context`** first for any structural question; `read`, `grep`, or `list` only for literal text or files not in the index
 2. Unity tools when asset-scoped (`unity_yaml_*`, `unity_asset_search`, …)
 
 **Complex code edit** (multi-file, refactor, named symbols, cross-module — see `codegraph` rule):
 
 1. **`codegraph_context`** (preferred), or `codegraph_impact` / `codegraph_trace` / `codegraph_callers` / `codegraph_callees` / `codegraph_search` on the change scope
-2. `read`, `grep`, `list` on files/lines CodeGraph surfaced (not whole-tree grep loops)
+2. `read` on files/lines CodeGraph surfaced — `grep` only for literal text, never for symbol lookups
 3. Optional breadth: `task` with `subagent_type: "explorer"` (does not replace CodeGraph on complex scope)
 
 **Always available (not gated like `edit`/`write`):** `unity_execute`, `unity_run_states`, `unity_recompile`, `unity_capture_viewport`.
@@ -27,7 +27,7 @@ Before implementation or review, explore with read-only tools:
 
 Requirements before the next stage (`read_gate=true`):
 
-- **Exploration (`exploration_gate`):** at least one `read` / `grep` / `list`, **`codegraph_context`** (also counts as exploration), or completed `task(explorer)`.
+- **Exploration (`exploration_gate`):** at least one `read` / `grep` / `list`, **`codegraph_context`** (also counts as exploration), or completed `task(explorer)`. **Prefer CodeGraph** for structural questions; `grep` is for literal text only.
 - **CodeGraph (`codegraph_gate`):** required only for **complex** edits — at least one relationship-analysis tool (`codegraph_status` / `codegraph_sync` alone do **not** count). Simple tasks do not need `codegraph_gate`.
 - You can explain **current behavior** and **risks** for the change scope.
 
@@ -35,7 +35,7 @@ Requirements before the next stage (`read_gate=true`):
 
 When the user asks to **review existing code** without edits (e.g. GC audit, security review, style check):
 
-After Read, dispatch reviewer directly — **do not** skip Read; **do not** require PLAN:
+Dispatch `task(reviewer)` directly from READ or PLAN (before plan confirmation). **Do not** require parent dev `exploration_gate` — the reviewer subagent explores with `read` / `grep` / `list` (and CodeGraph when needed). **Do not** require PLAN for read-only review:
 
 ```json
 {
@@ -77,7 +77,7 @@ Present the plan to the user, then call `ask_user_question` with these options (
 }
 ```
 
-- **确认执行** — runtime sets `plan_confirmed=true`; dispatch `task(implementer)` next
+- **确认执行** — runtime sets `plan_confirmed=true`; dispatch `task(implementer)` next. If a complex edit skipped CodeGraph during READ, run `codegraph_context` / `codegraph_impact` in PLAN phase first to satisfy `codegraph_gate`, then dispatch implementer.
 - **取消** — phase resets to READ; re-explore before a new plan
 - **修改** — stay in PLAN; revise the plan from user feedback (with the same per-file detail) and call `ask_user_question` again
 

@@ -3655,6 +3655,24 @@ fn copy_model_storage_entry(source: &Path, target: &Path) -> Result<(), String> 
     Ok(())
 }
 
+pub fn embedding_dimensions_for_config(config: &EmbeddingConfig) -> u32 {
+    if config.embedding_mode == "remote" {
+        if config.remote_dimensions > 0 {
+            return config.remote_dimensions;
+        }
+        let from_model = model_dimension_for_id(config.remote_model.trim());
+        if from_model > 0 {
+            return from_model as u32;
+        }
+        return 1536;
+    }
+    let from_model = model_dimension_for_id(config.local_model.trim());
+    if from_model > 0 {
+        return from_model as u32;
+    }
+    1536
+}
+
 pub fn load_config(library_dir: &Path) -> EmbeddingConfig {
     let path = config_path(library_dir);
     match std::fs::read_to_string(&path) {

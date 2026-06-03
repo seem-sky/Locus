@@ -27,6 +27,7 @@ function createDisplayState(): DisplaySettings {
     changesAutoOpen: true,
     changesAutoClose: true,
     fileChangePopoverEnabled: true,
+    showThinkingProcess: false,
     thinkingAutoOpen: false,
     thinkingAutoExpand: true,
     chatDiffReviewTarget: "inline",

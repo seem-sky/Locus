@@ -163,9 +163,12 @@ impl WorkflowGate {
         }
     }
 
-    /// Move CodeGraph analysis tools to the front of the request list during READ (after meta tools).
+    /// Move CodeGraph analysis tools to the front of the request list during READ/PLAN (after meta tools).
     pub fn prioritize_request_tools(&self, names: &mut Vec<String>) {
-        if self.phase != CodeEditPhase::Read || self.codegraph_satisfied {
+        if self.codegraph_satisfied {
+            return;
+        }
+        if self.phase != CodeEditPhase::Read && self.phase != CodeEditPhase::Plan {
             return;
         }
         let meta_count = names
@@ -352,8 +355,24 @@ impl WorkflowGate {
 
         if effective == "ask_user_question" {
             if let Some(answer) = output.and_then(extract_ask_user_answer) {
+                self.reset_workflow_text_stop_nudges();
                 if self.phase == CodeEditPhase::Plan {
-                    self.reset_workflow_text_stop_nudges();
+                    return self.handle_plan_confirmation_answer(&answer);
+                }
+                if self.phase == CodeEditPhase::Read {
+                    if !self.read_satisfied() {
+                        let codegraph_note = if self.codegraph_satisfied {
+                            " codegraph_gate is already true, but exploration_gate still requires read/grep/list on surfaced files (or use codegraph_context, which also satisfies exploration_gate). "
+                        } else {
+                            " "
+                        };
+                        return Some(format!(
+                            "[Dev workflow] ask_user_question was answered in READ phase while read_gate=false — plan confirmation was NOT recorded (plan_confirmed remains false).{codegraph_note} \
+                             Complete exploration_gate first; phase advances to PLAN automatically when read_gate=true. \
+                             Then present the modification plan and call ask_user_question again with {PLAN_ASK_USER_OPTIONS}."
+                        ));
+                    }
+                    self.maybe_advance_read_to_plan();
                     return self.handle_plan_confirmation_answer(&answer);
                 }
             }
@@ -392,7 +411,7 @@ impl WorkflowGate {
         match parse_plan_confirmation_choice(answer) {
             PlanConfirmationChoice::Confirm => {
                 self.plan_confirmed = true;
-                Some(plan_confirmed_hint(self.review_cycle))
+                Some(plan_confirmed_hint(self.review_cycle, self.codegraph_satisfied))
             }
             PlanConfirmationChoice::Cancel => {
                 self.phase = CodeEditPhase::Read;
@@ -526,6 +545,12 @@ impl WorkflowGate {
         }
     }
 
+    fn check_reviewer_dispatch(&self, _args: &Value) -> Option<String> {
+        // Reviewer subagent performs its own read/grep/list (and CodeGraph when needed).
+        // Parent dev agent does not need exploration_gate or codegraph_gate before dispatch.
+        None
+    }
+
     fn check_task_tool(&self, args: &Value) -> Option<String> {
         let subagent = args
             .get("subagent_type")
@@ -550,21 +575,7 @@ impl WorkflowGate {
                     )));
                 }
                 if subagent == "reviewer" {
-                    if !self.read_satisfied() {
-                        return Some(self.block_message(&format!(
-                            "Cannot dispatch reviewer in READ phase until READ is complete. {READ_GATE_REQUIREMENT} Then use task(reviewer) for read-only review, or complete PLAN → task(implementer) if code must change.",
-                            READ_GATE_REQUIREMENT = read_gate_requirement_detail(self)
-                        )));
-                    }
-                    if let Some(prompt) = args.get("prompt").and_then(|v| v.as_str()) {
-                        if is_complex_code_edit_prompt(prompt) && !self.codegraph_satisfied {
-                            return Some(self.block_message(
-                                "Cannot dispatch reviewer for complex structural review: codegraph_gate=false. \
-                                 Run CodeGraph on the review scope first.",
-                            ));
-                        }
-                    }
-                    return None;
+                    return self.check_reviewer_dispatch(args);
                 }
                 None
             }
@@ -586,17 +597,22 @@ impl WorkflowGate {
                                 "Cannot dispatch implementer for a complex edit: codegraph_gate=false. \
                                  Run CodeGraph first — `codegraph_context` (preferred) or `codegraph_impact` / \
                                  `codegraph_trace` / `codegraph_callers` / `codegraph_callees` on the change scope. \
-                                 Simple 1–2 file fixes do not require CodeGraph.",
+                                 Simple 1–2 file fixes do not require CodeGraph. \
+                                 CodeGraph can be run now in PLAN phase (invoke analysis tools directly — not `tool_load`). \
+                                 After codegraph_gate=true, retry task(implementer).",
                             ));
                         }
                     }
                     return None;
                 }
                 if subagent == "reviewer" {
-                    return Some(self.block_message(
-                        "In PLAN phase use ask_user_question to confirm the plan first. \
-                         For read-only review without edits, return to exploration or wait until implementation is done.",
-                    ));
+                    if self.plan_confirmed {
+                        return Some(self.block_message(
+                            "Plan is confirmed — dispatch task(subagent_type=implementer) next. \
+                             task(reviewer) runs after task(optimizer) in the full edit cycle.",
+                        ));
+                    }
+                    return self.check_reviewer_dispatch(args);
                 }
                 None
             }
@@ -684,7 +700,7 @@ impl WorkflowGate {
             "Runtime enforcement is OFF (LOCUS_DEV_WORKFLOW_STRICT=0); follow the workflow via rules and reminders."
         };
         format!(
-            "[Dev workflow gate] Current phase: {}. read_gate={}. plan_confirmed={}. codegraph_gate={}. exploration_gate={}. review_cycle={}. {}\n\nRequired flow: READ (exploration; CodeGraph mandatory for complex edits) → PLAN (write plan + ask_user_question: {PLAN_ASK_USER_OPTIONS}) → task(implementer) → task(optimizer) → task(reviewer), loop until reviewer returns PASS or PASS_WITH_RISKS. Read-only review: READ → task(reviewer). {SOURCE_CODE_DISCIPLINE} {enforcement} Set LOCUS_DEV_WORKFLOW_STRICT=0 to disable blocking.",
+            "[Dev workflow gate] Current phase: {}. read_gate={}. plan_confirmed={}. codegraph_gate={}. exploration_gate={}. review_cycle={}. {}\n\nRequired flow: READ (exploration; CodeGraph mandatory for complex edits) → PLAN (write plan + ask_user_question: {PLAN_ASK_USER_OPTIONS}) → task(implementer) → task(optimizer) → task(reviewer), loop until reviewer returns PASS or PASS_WITH_RISKS. Read-only review: task(reviewer) from READ or PLAN (before plan confirmation) — reviewer explores with read/grep/list itself; parent dev exploration_gate not required. {SOURCE_CODE_DISCIPLINE} {enforcement} Set LOCUS_DEV_WORKFLOW_STRICT=0 to disable blocking.",
             self.phase.label(),
             self.read_satisfied(),
             self.plan_confirmed,
@@ -706,8 +722,11 @@ impl WorkflowGate {
             String::new()
         };
         let next = match (self.phase, self.read_satisfied(), self.plan_confirmed) {
+            (CodeEditPhase::Read, false, _) if !self.exploration_satisfied && self.review_cycle > 0 => {
+                "Next: review retry cycle — read/grep/list affected files to complete exploration_gate; for complex edits also run CodeGraph. Then PLAN + ask_user_question before task(implementer). Do NOT skip to implementer."
+            }
             (CodeEditPhase::Read, false, _) if !self.exploration_satisfied => {
-                "Next: read/grep/list the target file(s) to complete exploration_gate. For complex edits, also run CodeGraph (codegraph_context / impact / trace / callers / callees). Tools that cannot be classified as read-only vs edit will prompt you for approval before running."
+                "Next: read/grep/list the target file(s) to complete exploration_gate before PLAN or task(implementer). For read-only review, dispatch task(subagent_type=reviewer) directly — reviewer will explore with read/grep/list. For complex edits, also run CodeGraph (codegraph_context / impact / trace / callers / callees). Tools that cannot be classified as read-only vs edit will prompt you for approval before running."
             }
             (CodeEditPhase::Read, false, _) => {
                 "Next: complete exploration_gate with read/grep/list on the change scope."
@@ -719,7 +738,10 @@ impl WorkflowGate {
                 "Next: enter PLAN — write modification plan; task(reviewer) for read-only review (no edits). Do NOT use edit/write on dev."
             }
             (CodeEditPhase::Plan, _, false) => {
-                "Next: write the modification plan — file list; for EACH file include change type, symbols/lines, current vs planned behavior, before→after snippets, per-file runtime notes; plus impact assessment and rollback strategy. Call ask_user_question with options 确认执行 / 取消 / 修改 — wait for user confirmation before task(implementer). Unclassified tools prompt for approval before execution."
+                "Next: write the modification plan and call ask_user_question (确认执行 / 取消 / 修改), or dispatch task(subagent_type=reviewer) for read-only review without edits. After plan confirmation, use task(implementer) → task(optimizer) → task(reviewer)."
+            }
+            (CodeEditPhase::Plan, _, true) if !self.codegraph_satisfied => {
+                "Next: run CodeGraph (codegraph_context preferred) to satisfy codegraph_gate, then task(subagent_type=implementer). CodeGraph can be run in PLAN phase. Do NOT use edit/write on dev."
             }
             (CodeEditPhase::Plan, _, true) => {
                 "Next: task(subagent_type=implementer) to apply the confirmed plan. Do NOT use edit/write on dev."
@@ -792,11 +814,25 @@ pub fn parse_review_verdict(output: &str) -> ReviewVerdict {
     ReviewVerdict::Unknown
 }
 
-fn read_gate_requirement_detail(gate: &WorkflowGate) -> &'static str {
-    if !gate.exploration_satisfied {
-        "Complete exploration_gate: read/grep/list the target file(s). For complex edits, also run CodeGraph (codegraph_context / impact / trace / callers / callees)."
+fn read_gate_requirement_detail(gate: &WorkflowGate) -> String {
+    let base = if !gate.exploration_satisfied {
+        if gate.codegraph_satisfied {
+            "Complete exploration_gate: read/grep/list the target file(s) surfaced by CodeGraph (codegraph_context also satisfies exploration_gate in one step). \
+             ask_user_question answered in READ phase does NOT record plan confirmation — wait until PLAN phase."
+        } else {
+            "Complete exploration_gate: read/grep/list the target file(s). For complex edits, also run CodeGraph (codegraph_context / impact / trace / callers / callees)."
+        }
     } else {
         "exploration_gate satisfied. For complex edits, run CodeGraph before PLAN and task(implementer)."
+    };
+    if gate.review_cycle > 0 {
+        format!(
+            "{base} Review BLOCK reset the workflow (retry cycle #{}). \
+             Full READ → PLAN → ask_user_question confirmation → task(implementer) is required — cannot skip directly to implementer.",
+            gate.review_cycle
+        )
+    } else {
+        base.to_string()
     }
 }
 
@@ -870,17 +906,18 @@ fn read_partial_progress_hint(gate: &WorkflowGate) -> Option<String> {
     if gate.read_satisfied() {
         return None;
     }
+    if gate.codegraph_satisfied && !gate.exploration_satisfied {
+        return Some(
+            "[Dev workflow] READ partial: codegraph_gate=true, exploration_gate=false. \
+             Next: read/grep/list the surfaced files (codegraph_context also satisfies exploration_gate). \
+             ask_user_question in READ phase does NOT record plan confirmation — wait for PLAN phase."
+                .to_string(),
+        );
+    }
     if !gate.exploration_satisfied {
         return Some(
             "[Dev workflow] READ started: read/grep/list the target file(s) to satisfy exploration_gate. \
              For complex edits, also run CodeGraph (codegraph_context / impact / trace / callers / callees)."
-                .to_string(),
-        );
-    }
-    if gate.codegraph_satisfied && !gate.exploration_satisfied {
-        return Some(
-            "[Dev workflow] READ partial: codegraph_gate=true, exploration_gate=false. \
-             Next: read/grep/list the surfaced files (or task(explorer)) before implementer."
                 .to_string(),
         );
     }
@@ -894,12 +931,24 @@ fn read_complete_hint(review_cycle: u32) -> String {
         )
     } else {
         format!(
-            "[Dev workflow] READ gate satisfied. Next: enter PLAN — write the {PLAN_CONTENT_CHECKLIST} ({PLAN_FILE_CHANGE_DETAIL}), call ask_user_question with options {PLAN_ASK_USER_OPTIONS}, and wait for user confirmation. For read-only review (no edits), use task(subagent_type=\"reviewer\") instead. {SOURCE_CODE_DISCIPLINE}"
+            "[Dev workflow] READ gate satisfied. Next: enter PLAN — write the {PLAN_CONTENT_CHECKLIST} ({PLAN_FILE_CHANGE_DETAIL}), call ask_user_question with options {PLAN_ASK_USER_OPTIONS}, and wait for user confirmation. For read-only review (no edits), dispatch task(subagent_type=\"reviewer\") from PLAN before plan confirmation. {SOURCE_CODE_DISCIPLINE}"
         )
     }
 }
 
-fn plan_confirmed_hint(review_cycle: u32) -> String {
+fn plan_confirmed_hint(review_cycle: u32, codegraph_satisfied: bool) -> String {
+    if !codegraph_satisfied {
+        if review_cycle > 0 {
+            return format!(
+                "[Dev workflow] User confirmed the plan (retry cycle #{review_cycle}). \
+                 Complex edits require CodeGraph first — run `codegraph_context` or `codegraph_impact` in PLAN phase to satisfy codegraph_gate, then dispatch task(subagent_type=\"implementer\"). {SOURCE_CODE_DISCIPLINE}"
+            );
+        }
+        return format!(
+            "[Dev workflow] User confirmed the plan. \
+             Complex edits require CodeGraph first — run `codegraph_context` or `codegraph_impact` in PLAN phase to satisfy codegraph_gate, then dispatch task(subagent_type=\"implementer\"). {SOURCE_CODE_DISCIPLINE}"
+        );
+    }
     if review_cycle > 0 {
         format!(
             "[Dev workflow] User confirmed the plan (retry cycle #{review_cycle}). Next required step: dispatch task(subagent_type=\"implementer\") with the confirmed plan. {SOURCE_CODE_DISCIPLINE}"
@@ -1233,6 +1282,65 @@ pub fn workflow_ambiguous_tool_requires_user_confirm(
 }
 
 pub const WORKFLOW_AMBIGUOUS_TOOL_CONFIRM_NOTE: &str = "READ/PLAN 阶段：无法判定该工具是只读探索还是修改代码。请确认是否执行。";
+
+pub const BASH_RM_CONFIRM_NOTE: &str =
+    "该 bash 命令包含删除操作（rm / rmdir / del / Remove-Item 等）。执行前请二次确认，避免误删文件或目录。";
+
+/// Whether a bash command deletes files/directories and must be confirmed by the user.
+pub fn bash_rm_requires_user_confirm(args: &Value) -> bool {
+    let Some(command) = args.get("command").and_then(|v| v.as_str()) else {
+        return false;
+    };
+    is_rm_bash_command(command)
+}
+
+pub fn is_rm_bash_command(command: &str) -> bool {
+    if command.contains("$(") || command.contains('`') {
+        return true;
+    }
+    for segment in iter_bash_atomic_command_segments(command) {
+        let tokens = split_shell_words(&segment);
+        if shell_tokens_are_rm_destructive(&tokens) {
+            return true;
+        }
+    }
+    false
+}
+
+fn iter_bash_atomic_command_segments(command: &str) -> Vec<String> {
+    let mut segments = Vec::new();
+    for pipe_part in command.split('|') {
+        for and_part in pipe_part.split("&&") {
+            for or_part in and_part.split("||") {
+                for semi_part in or_part.split([';', '\n', '\r']) {
+                    let trimmed = semi_part.trim();
+                    if !trimmed.is_empty() {
+                        segments.push(trimmed.to_string());
+                    }
+                }
+            }
+        }
+    }
+    segments
+}
+
+fn shell_tokens_are_rm_destructive(tokens: &[String]) -> bool {
+    let Some(first) = tokens.first().map(|value| value.to_ascii_lowercase()) else {
+        return false;
+    };
+    const RM_COMMANDS: &[&str] = &["rm", "rmdir", "del", "erase", "remove-item", "ri"];
+    if RM_COMMANDS.contains(&first.as_str()) {
+        return true;
+    }
+    if first == "rtk" {
+        return tokens
+            .get(1)
+            .map(|value| value.to_ascii_lowercase())
+            .map(|value| RM_COMMANDS.contains(&value.as_str()))
+            .unwrap_or(false);
+    }
+    false
+}
 
 /// Whether a bash invocation is read-only (allowed during READ phase).
 pub fn is_read_only_bash_args(args: &Value) -> bool {
@@ -1587,20 +1695,26 @@ pub fn advance_to_implement_if_allowed(gate: &mut WorkflowGate, args: &Value) ->
     false
 }
 
-/// When reviewer is allowed after READ (read-only review path), advance phase before dispatch.
+/// When reviewer is allowed for read-only review, advance phase before dispatch.
 pub fn advance_to_review_if_allowed(gate: &mut WorkflowGate, args: &Value) -> bool {
     let sub = args
         .get("subagent_type")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    if sub != "reviewer" || !gate.read_satisfied() {
+    if sub != "reviewer" {
         return false;
     }
-    if gate.phase == CodeEditPhase::Read {
-        gate.phase = CodeEditPhase::Review;
-        return true;
+    match gate.phase {
+        CodeEditPhase::Read => {
+            gate.phase = CodeEditPhase::Review;
+            true
+        }
+        CodeEditPhase::Plan if !gate.plan_confirmed => {
+            gate.phase = CodeEditPhase::Review;
+            true
+        }
+        _ => false,
     }
-    false
 }
 
 #[cfg(test)]
@@ -1868,6 +1982,22 @@ mod tests {
     }
 
     #[test]
+    fn is_rm_bash_command_detects_rm_and_compound_chains() {
+        assert!(is_rm_bash_command("rm -rf Assets.Lua"));
+        assert!(is_rm_bash_command("Remove-Item -Recurse -Force foo"));
+        assert!(is_rm_bash_command("diff a b && rm -rf Assets.Lua"));
+        assert!(!is_rm_bash_command("grep -r foo Assets.Lua"));
+        assert!(!is_rm_bash_command("git status"));
+    }
+
+    #[test]
+    fn bash_rm_requires_user_confirm_for_bash_args() {
+        let args = serde_json::json!({"command": "rm -f foo.lua"});
+        assert!(bash_rm_requires_user_confirm(&args));
+        assert!(!bash_rm_requires_user_confirm(&serde_json::json!({"command": "ls"})));
+    }
+
+    #[test]
     fn is_read_only_bash_command_recognizes_grep_and_pipelines() {
         assert!(is_read_only_bash_command("grep -r WorkflowGate src-tauri"));
         assert!(is_read_only_bash_command("rg plan_confirmed --glob '*.rs'"));
@@ -2014,6 +2144,20 @@ mod tests {
     }
 
     #[test]
+    fn reviewer_allowed_in_read_without_exploration_gate() {
+        let mut gate = WorkflowGate::with_strict(true);
+        assert!(!gate.read_satisfied());
+        let args = serde_json::json!({
+            "subagent_type": "reviewer",
+            "prompt": "review gc hotspots in Application.lua",
+            "description": "review"
+        });
+        assert!(gate.check_tool("task", &args).is_none());
+        assert!(advance_to_review_if_allowed(&mut gate, &args));
+        assert_eq!(gate.phase, CodeEditPhase::Review);
+    }
+
+    #[test]
     fn read_satisfied_allows_reviewer_for_read_only_review() {
         let mut gate = WorkflowGate::with_strict(true);
         satisfy_read_gates(&mut gate);
@@ -2025,6 +2169,49 @@ mod tests {
         assert!(gate.check_tool("task", &args).is_none());
         assert!(advance_to_review_if_allowed(&mut gate, &args));
         assert_eq!(gate.phase, CodeEditPhase::Review);
+    }
+
+    #[test]
+    fn reviewer_allowed_for_complex_prompt_without_codegraph_gate() {
+        let mut gate = WorkflowGate::with_strict(true);
+        assert!(!gate.codegraph_satisfied);
+        let args = serde_json::json!({
+            "subagent_type": "reviewer",
+            "prompt": "refactor cross-module architecture and review blast radius",
+            "description": "review"
+        });
+        assert!(gate.check_tool("task", &args).is_none());
+    }
+
+    #[test]
+    fn plan_phase_allows_reviewer_before_plan_confirmation() {
+        let mut gate = WorkflowGate::with_strict(true);
+        enter_plan_phase(&mut gate);
+        assert!(!gate.plan_confirmed);
+        let args = serde_json::json!({
+            "subagent_type": "reviewer",
+            "prompt": "review attached files",
+            "description": "review"
+        });
+        assert!(gate.check_tool("task", &args).is_none());
+        assert!(advance_to_review_if_allowed(&mut gate, &args));
+        assert_eq!(gate.phase, CodeEditPhase::Review);
+    }
+
+    #[test]
+    fn plan_phase_blocks_reviewer_after_plan_confirmation() {
+        let mut gate = WorkflowGate::with_strict(true);
+        enter_plan_phase(&mut gate);
+        confirm_plan(&mut gate);
+        let args = serde_json::json!({
+            "subagent_type": "reviewer",
+            "prompt": "review attached files",
+            "description": "review"
+        });
+        let err = gate.check_tool("task", &args).unwrap();
+        assert!(err.contains("Plan is confirmed"));
+        assert!(!advance_to_review_if_allowed(&mut gate, &args));
+        assert_eq!(gate.phase, CodeEditPhase::Plan);
     }
 
     #[test]
@@ -2119,6 +2306,26 @@ mod tests {
         assert!(!gate.read_satisfied());
         assert_eq!(gate.review_cycle, 1);
         assert!(msg.is_some());
+    }
+
+    #[test]
+    fn implementer_blocked_in_read_after_review_block() {
+        let mut gate = WorkflowGate::with_strict(true);
+        gate.phase = CodeEditPhase::Review;
+        satisfy_read_gates(&mut gate);
+        gate.on_subagent_done("reviewer", false, Some("Verdict: BLOCK"));
+        assert_eq!(gate.phase, CodeEditPhase::Read);
+        assert_eq!(gate.review_cycle, 1);
+        let args = serde_json::json!({
+            "subagent_type": "implementer",
+            "prompt": "apply review fixes",
+            "description": "fix"
+        });
+        let err = gate.check_tool("task", &args).unwrap();
+        assert!(err.contains("retry cycle #1"));
+        assert!(err.contains("cannot skip directly to implementer"));
+        let reminder = gate.status_reminder();
+        assert!(reminder.contains("review retry cycle"));
     }
 
     #[test]
@@ -2293,6 +2500,64 @@ mod tests {
     }
 
     #[test]
+    fn ask_user_in_read_with_codegraph_only_does_not_confirm_plan() {
+        let mut gate = WorkflowGate::with_strict(true);
+        gate.on_tool_success(
+            "codegraph_impact",
+            &serde_json::json!({"symbol": "WorkflowGate"}),
+            None,
+        );
+        assert!(gate.codegraph_satisfied);
+        assert!(!gate.exploration_satisfied);
+        assert_eq!(gate.phase, CodeEditPhase::Read);
+        let hint = gate
+            .on_tool_success(
+                "ask_user_question",
+                &serde_json::json!({"question": "confirm plan", "options": []}),
+                Some("User answered: 确认执行"),
+            )
+            .unwrap();
+        assert!(!gate.plan_confirmed);
+        assert_eq!(gate.phase, CodeEditPhase::Read);
+        assert!(hint.contains("NOT recorded"));
+        assert!(hint.contains("plan_confirmed remains false"));
+        let args = serde_json::json!({
+            "subagent_type": "implementer",
+            "prompt": "implement plan",
+            "description": "implement"
+        });
+        let err = gate.check_tool("task", &args).unwrap();
+        assert!(err.contains("exploration_gate"));
+    }
+
+    #[test]
+    fn read_partial_hint_when_codegraph_without_exploration() {
+        let mut gate = WorkflowGate::with_strict(true);
+        gate.codegraph_satisfied = true;
+        gate.exploration_satisfied = false;
+        gate.phase = CodeEditPhase::Read;
+        let partial = read_partial_progress_hint(&gate).unwrap();
+        assert!(partial.contains("codegraph_gate=true, exploration_gate=false"));
+        assert!(partial.contains("ask_user_question in READ phase does NOT record"));
+    }
+
+    #[test]
+    fn ask_user_in_read_after_read_gate_advances_to_plan_and_confirms() {
+        let mut gate = WorkflowGate::with_strict(true);
+        gate.on_tool_success("read", &serde_json::json!({"path": "src/a.rs"}), None);
+        assert_eq!(gate.phase, CodeEditPhase::Plan);
+        let hint = gate
+            .on_tool_success(
+                "ask_user_question",
+                &serde_json::json!({"question": "confirm", "options": []}),
+                Some("User answered: 确认执行"),
+            )
+            .unwrap();
+        assert!(gate.plan_confirmed);
+        assert!(hint.contains("implementer"));
+    }
+
+    #[test]
     fn plan_confirm_via_ask_user_advances_to_implementer_ready() {
         let mut gate = WorkflowGate::with_strict(true);
         enter_plan_phase(&mut gate);
@@ -2304,7 +2569,79 @@ mod tests {
             )
             .unwrap();
         assert!(gate.plan_confirmed);
+        assert!(hint.contains("CodeGraph"));
+        assert!(hint.contains("codegraph_gate"));
         assert!(hint.contains("implementer"));
+    }
+
+    #[test]
+    fn plan_confirm_with_codegraph_hints_implementer_directly() {
+        let mut gate = WorkflowGate::with_strict(true);
+        satisfy_full_read_gates(&mut gate);
+        gate.maybe_advance_read_to_plan();
+        let hint = gate
+            .on_tool_success(
+                "ask_user_question",
+                &serde_json::json!({"question": "confirm plan", "options": []}),
+                Some("User answered: 确认执行"),
+            )
+            .unwrap();
+        assert!(gate.plan_confirmed);
+        assert!(hint.contains("Next required step: dispatch"));
+        assert!(!hint.contains("Complex edits require CodeGraph first"));
+    }
+
+    #[test]
+    fn plan_confirmed_status_reminder_without_codegraph() {
+        let mut gate = WorkflowGate::with_strict(true);
+        enter_plan_phase(&mut gate);
+        confirm_plan(&mut gate);
+        let reminder = gate.status_reminder();
+        assert!(reminder.contains("codegraph_gate=false"));
+        assert!(reminder.contains("codegraph_context"));
+        assert!(reminder.contains("PLAN phase"));
+    }
+
+    #[test]
+    fn codegraph_in_plan_phase_satisfies_gate_then_implementer_allowed() {
+        let mut gate = WorkflowGate::with_strict(true);
+        enter_plan_phase(&mut gate);
+        confirm_plan(&mut gate);
+        let args = serde_json::json!({
+            "subagent_type": "implementer",
+            "prompt": "Refactor auth across src/a.rs, src/b.rs, and src/c.rs",
+            "description": "refactor"
+        });
+        let err = gate.check_tool("task", &args).unwrap();
+        assert!(err.contains("codegraph_gate=false"));
+        assert!(err.contains("PLAN phase"));
+        gate.on_tool_success(
+            "codegraph_context",
+            &serde_json::json!({"task": "auth refactor scope"}),
+            None,
+        );
+        assert!(gate.codegraph_satisfied);
+        assert!(gate.check_tool("task", &args).is_none());
+    }
+
+    #[test]
+    fn prioritize_request_tools_in_plan_phase() {
+        let mut gate = WorkflowGate::with_strict(true);
+        enter_plan_phase(&mut gate);
+        assert!(!gate.codegraph_satisfied);
+        let mut names = vec![
+            "tool_load".to_string(),
+            "tool_call".to_string(),
+            "read".to_string(),
+            "grep".to_string(),
+            "codegraph_impact".to_string(),
+            "codegraph_context".to_string(),
+        ];
+        gate.prioritize_request_tools(&mut names);
+        assert_eq!(names[0], "tool_load");
+        assert_eq!(names[1], "tool_call");
+        assert_eq!(names[2], "codegraph_context");
+        assert_eq!(names[3], "codegraph_impact");
     }
 
     #[test]

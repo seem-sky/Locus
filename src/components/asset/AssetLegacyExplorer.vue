@@ -141,7 +141,7 @@ function fileIconClass(node: AssetExplorerNode) {
 </script>
 
 <template>
-  <div class="alx-root">
+  <div class="alx-root" :class="{ 'is-asset-ref-draggable': assetRefDraggable }">
     <FileTreeList
       class="alx-tree"
       :items="visibleRows"
@@ -270,11 +270,12 @@ function fileIconClass(node: AssetExplorerNode) {
   outline-offset: -2px;
 }
 
-.alx-row[data-asset-ref-path] {
-  cursor: grab;
+.alx-root.is-asset-ref-draggable .alx-row,
+.alx-root.is-asset-ref-draggable .alx-row[data-asset-ref-path] {
+  cursor: default;
 }
 
-body.asset-ref-pointer-dragging .alx-row[data-asset-ref-path] {
+body.asset-ref-pointer-dragging .alx-root.is-asset-ref-draggable .alx-row[data-asset-ref-path] {
   cursor: grabbing;
 }
 

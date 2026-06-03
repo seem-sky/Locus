@@ -1465,7 +1465,7 @@ function buildAssetRefsPromptBlock(assetRefs: AssetRefAttachment[]) {
     const label = assetRef.kind === "sceneObject" ? "scene object" : "asset";
     return `- ${label}: {@${assetRef.path}}`;
   });
-  return `<locus-references>\nUse Unity refs as exact asset anchors. Use project knowledge refs as exact knowledge_read paths.\n${lines.join("\n")}\n</locus-references>`;
+  return `<locus-references>\nThe user attached these workspace references via drag-and-drop. Read every attached target before planning or editing: use \`read\` for text/code files, \`list\` for folders, \`unity_yaml_read\` / \`unity_yaml_list\` for Unity YAML assets and scene objects, and \`knowledge_read\` for project knowledge paths.\n${lines.join("\n")}\n</locus-references>`;
 }
 
 function appendAssetRefsPromptBlock(text: string, assetRefs: AssetRefAttachment[]) {

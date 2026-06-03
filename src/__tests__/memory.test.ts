@@ -34,13 +34,15 @@ describe("memory service", () => {
     });
 
     expect(ipcInvokeMock).toHaveBeenCalledWith("memory_list", {
-      workingDir: "G:/Proj",
-      category: "user",
-      scope: "project",
-      tags: ["prefs"],
-      query: "theme",
-      limit: 20,
-      offset: 0,
+      request: {
+        workingDir: "G:/Proj",
+        category: "user",
+        scope: "project",
+        tags: ["prefs"],
+        query: "theme",
+        limit: 20,
+        offset: 0,
+      },
     });
   });
 
@@ -57,14 +59,16 @@ describe("memory service", () => {
     });
 
     expect(ipcInvokeMock).toHaveBeenCalledWith("memory_create", {
-      workingDir: "G:/Proj",
-      category: "feedback",
-      scope: null,
-      content: "Avoid renaming public APIs without impact review.",
-      tags: ["api"],
-      pinned: true,
-      pinWeight: 120,
-      sourceSessionId: "s1",
+      request: {
+        workingDir: "G:/Proj",
+        category: "feedback",
+        scope: null,
+        content: "Avoid renaming public APIs without impact review.",
+        tags: ["api"],
+        pinned: true,
+        pinWeight: 120,
+        sourceSessionId: "s1",
+      },
     });
   });
 
@@ -77,11 +81,13 @@ describe("memory service", () => {
     });
 
     expect(ipcInvokeMock).toHaveBeenCalledWith("memory_retrieve", {
-      workingDir: "G:/Proj",
-      query: "unity scene graph",
-      limit: 8,
-      tokenBudget: 600,
-      scopes: ["project", "user"],
+      request: {
+        workingDir: "G:/Proj",
+        query: "unity scene graph",
+        limit: 8,
+        tokenBudget: 600,
+        scopes: ["project", "user"],
+      },
     });
   });
 

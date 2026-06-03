@@ -6,15 +6,98 @@ const SCOPE_PREFIX: &str = "locus-scope:";
 const CATEGORY_PREFIX: &str = "locus-category:";
 const PINNED_TAG: &str = "locus:pinned";
 
+/// Claude Code / agentmemory hook names — not user-facing memory content.
+const OBSERVATION_HOOK_MARKERS: &[&str] = &[
+    "UserPromptSubmit",
+    "PostToolUse",
+    "PostToolUseFailure",
+    "PreToolUse",
+    "SessionStart",
+    "SessionEnd",
+    "Stop",
+    "SubagentStop",
+    "Notification",
+    "PermissionRequest",
+];
+
+pub fn is_observation_hook_noise(value: &str) -> bool {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    OBSERVATION_HOOK_MARKERS
+        .iter()
+        .any(|marker| trimmed.eq_ignore_ascii_case(marker))
+}
+
+pub fn should_include_memory_content(content: &str) -> bool {
+    !is_observation_hook_noise(content)
+}
+
+pub fn extract_search_result_content(result: &serde_json::Value) -> Option<String> {
+    let observation = result.get("observation");
+    let candidates = [
+        result.get("narrative").and_then(|v| v.as_str()),
+        result.get("title").and_then(|v| v.as_str()),
+        observation
+            .and_then(|o| o.get("narrative"))
+            .and_then(|v| v.as_str()),
+        observation
+            .and_then(|o| o.get("title"))
+            .and_then(|v| v.as_str()),
+        observation
+            .and_then(|o| o.get("data"))
+            .and_then(|d| d.get("prompt"))
+            .and_then(|v| v.as_str()),
+    ];
+    for candidate in candidates {
+        if let Some(text) = candidate {
+            let trimmed = text.trim();
+            if should_include_memory_content(trimmed) {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    if let Some(facts) = observation
+        .and_then(|o| o.get("facts"))
+        .and_then(|v| v.as_array())
+    {
+        let joined: Vec<&str> = facts
+            .iter()
+            .filter_map(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| should_include_memory_content(s))
+            .collect();
+        if !joined.is_empty() {
+            return Some(joined.join("; "));
+        }
+    }
+    None
+}
+
+pub fn search_result_category(result: &serde_json::Value) -> MemoryCategory {
+    let obs_type = result
+        .get("type")
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            result
+                .get("observation")
+                .and_then(|o| o.get("type"))
+                .and_then(|v| v.as_str())
+        })
+        .unwrap_or("fact");
+    agent_type_to_category(obs_type)
+}
+
+/// Stable workspace path for agentmemory HTTP APIs (no `\\?\` extended-length prefix).
 pub fn normalize_project_path(working_dir: &str) -> String {
     let trimmed = working_dir.trim();
     if trimmed.is_empty() {
         return String::new();
     }
-    std::path::Path::new(trimmed)
-        .canonicalize()
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| trimmed.replace('\\', "/"))
+    let path = dunce::canonicalize(trimmed)
+        .unwrap_or_else(|_| std::path::PathBuf::from(trimmed));
+    crate::process_util::windows_command_path(&path)
 }
 
 pub fn category_to_agent_type(category: MemoryCategory) -> &'static str {
@@ -111,6 +194,9 @@ pub fn remote_memory_to_entry(
 ) -> Option<MemoryEntry> {
     let id = remote.get("id")?.as_str()?.to_string();
     let content = remote.get("content")?.as_str()?.to_string();
+    if !should_include_memory_content(&content) {
+        return None;
+    }
     let concepts = remote
         .get("concepts")
         .and_then(|v| v.as_array())
@@ -181,6 +267,43 @@ pub fn remote_memory_to_entry(
     })
 }
 
+/// Map a successful `/agentmemory/remember` payload, falling back to the local entry when
+/// agentmemory returns hook-noise or sparse content that `remote_memory_to_entry` skips.
+pub fn entry_from_remember_response(
+    entry: MemoryEntry,
+    body: &serde_json::Value,
+    fallback_scope: MemoryScope,
+    fallback_project: &str,
+) -> Result<MemoryEntry, String> {
+    let memory = body.get("memory").unwrap_or(body);
+    if let Some(mapped) = remote_memory_to_entry(memory, fallback_scope, fallback_project) {
+        return Ok(mapped);
+    }
+    let id = memory
+        .get("id")
+        .and_then(|v| v.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            "agentmemory remember succeeded but response had no memory id".to_string()
+        })?;
+    let created_at = memory
+        .get("createdAt")
+        .and_then(|v| v.as_str())
+        .map(parse_iso_ms)
+        .unwrap_or(entry.created_at);
+    let updated_at = memory
+        .get("updatedAt")
+        .and_then(|v| v.as_str())
+        .map(parse_iso_ms)
+        .unwrap_or(created_at);
+    Ok(MemoryEntry {
+        id: id.to_string(),
+        created_at,
+        updated_at,
+        ..entry
+    })
+}
+
 pub fn entry_matches_filter(entry: &MemoryEntry, filter: &crate::memory::models::MemoryListFilter) -> bool {
     if let Some(category) = filter.category {
         if entry.category != category {
@@ -211,6 +334,27 @@ pub fn entry_matches_filter(entry: &MemoryEntry, filter: &crate::memory::models:
         }
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hook_names_are_filtered_as_noise() {
+        assert!(is_observation_hook_noise("UserPromptSubmit"));
+        assert!(is_observation_hook_noise("  PostToolUse  "));
+        assert!(!is_observation_hook_noise("所有会话使用简体中文"));
+    }
+
+    #[test]
+    fn normalize_project_path_strips_extended_prefix_on_windows() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let normalized = normalize_project_path(temp.path().to_str().expect("utf8 path"));
+        assert!(!normalized.is_empty());
+        assert!(!normalized.starts_with(r"\\?\"));
+        assert!(!normalized.starts_with("//?/"));
+    }
 }
 
 pub fn entry_belongs_to_workspace(

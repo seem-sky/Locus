@@ -76,15 +76,24 @@ pub fn set_new_process_group(cmd: &mut Command) {
 
 /// Node on Windows re-parses argv from the full command line; backslashes in paths
 /// such as `\node_modules` can corrupt later arguments down to `G:`.
+/// Also strip `\\?\` extended-length prefixes — converting them to `/` yields `//?/G:`
+/// which Node resolves as the drive root directory `G:`.
 pub fn windows_command_path(path: &Path) -> String {
-    let text = path.to_string_lossy();
+    let mut text = path.to_string_lossy().into_owned();
     #[cfg(windows)]
     {
+        if let Some(rest) = text.strip_prefix(r"\\?\") {
+            text = if let Some(unc) = rest.strip_prefix("UNC\\") {
+                format!(r"\\{}", unc)
+            } else {
+                rest.to_string()
+            };
+        }
         text.replace('\\', "/")
     }
     #[cfg(not(windows))]
     {
-        text.into_owned()
+        text
     }
 }
 

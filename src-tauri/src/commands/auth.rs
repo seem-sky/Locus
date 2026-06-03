@@ -9,6 +9,8 @@ use crate::auth::{AuthState, AuthStatus, AuthUrlInfo};
 use crate::keychain;
 use crate::llm::codex_usage::CodexRateLimitsResponse;
 
+use crate::agentmemory::AgentMemoryState;
+use crate::commands::memory::schedule_agentmemory_restart;
 use crate::error::AppError;
 use crate::{ApiKeyState, ProviderKeysState};
 
@@ -65,6 +67,7 @@ pub async fn auth_logout(
 pub async fn save_api_key(
     key: String,
     api_key_state: State<'_, ApiKeyState>,
+    memory_store: State<'_, Arc<AgentMemoryState>>,
     _app_handle: AppHandle,
 ) -> Result<bool, AppError> {
     let key = key.trim().to_string();
@@ -80,12 +83,14 @@ pub async fn save_api_key(
     keychain::set_secret(keychain::KEY_OPENROUTER, &key)?;
 
     eprintln!("[Locus] OpenRouter API key saved to keychain");
+    schedule_agentmemory_restart(memory_store.inner());
     Ok(true)
 }
 
 #[tauri::command]
 pub async fn clear_api_key(
     api_key_state: State<'_, ApiKeyState>,
+    memory_store: State<'_, Arc<AgentMemoryState>>,
     _app_handle: AppHandle,
 ) -> Result<(), AppError> {
     {
@@ -96,6 +101,7 @@ pub async fn clear_api_key(
     keychain::delete_secret(keychain::KEY_OPENROUTER)?;
 
     eprintln!("[Locus] OpenRouter API key cleared from keychain");
+    schedule_agentmemory_restart(memory_store.inner());
     Ok(())
 }
 
@@ -179,6 +185,7 @@ pub async fn save_provider_key(
     key: String,
     api_key_state: State<'_, ApiKeyState>,
     provider_keys: State<'_, ProviderKeysState>,
+    memory_store: State<'_, Arc<AgentMemoryState>>,
     app_handle: AppHandle,
 ) -> Result<bool, AppError> {
     let key = key.trim().to_string();
@@ -201,6 +208,7 @@ pub async fn save_provider_key(
     }
 
     eprintln!("[Locus] provider key saved to keychain: {}", provider);
+    schedule_agentmemory_restart(memory_store.inner());
     Ok(true)
 }
 
@@ -209,6 +217,7 @@ pub async fn delete_provider_key(
     provider: String,
     api_key_state: State<'_, ApiKeyState>,
     provider_keys: State<'_, ProviderKeysState>,
+    memory_store: State<'_, Arc<AgentMemoryState>>,
     app_handle: AppHandle,
 ) -> Result<(), AppError> {
     if provider == "openrouter" {
@@ -225,6 +234,7 @@ pub async fn delete_provider_key(
     }
 
     eprintln!("[Locus] provider key deleted from keychain: {}", provider);
+    schedule_agentmemory_restart(memory_store.inner());
     Ok(())
 }
 

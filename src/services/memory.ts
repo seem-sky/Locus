@@ -41,48 +41,58 @@ export interface MemoryUpdateParams {
 
 export function memoryList(params: MemoryListParams): Promise<MemoryEntry[]> {
   return ipcInvoke<MemoryEntry[]>("memory_list", {
-    workingDir: params.workingDir,
-    category: params.category ?? null,
-    scope: params.scope ?? null,
-    tags: params.tags ?? null,
-    query: params.query ?? null,
-    limit: params.limit ?? null,
-    offset: params.offset ?? null,
+    request: {
+      workingDir: params.workingDir,
+      category: params.category ?? null,
+      scope: params.scope ?? null,
+      tags: params.tags ?? null,
+      query: params.query ?? null,
+      limit: params.limit ?? null,
+      offset: params.offset ?? null,
+    },
   });
 }
 
 export function memoryGet(workingDir: string, scope: MemoryScope, id: string): Promise<MemoryEntry> {
-  return ipcInvoke<MemoryEntry>("memory_get", { workingDir, scope, id });
+  return ipcInvoke<MemoryEntry>("memory_get", {
+    request: { workingDir, scope, id },
+  });
 }
 
 export function memoryCreate(params: MemoryCreateParams): Promise<MemoryEntry> {
   return ipcInvoke<MemoryEntry>("memory_create", {
-    workingDir: params.workingDir,
-    category: params.category,
-    scope: params.scope ?? null,
-    content: params.content,
-    tags: params.tags ?? [],
-    pinned: params.pinned ?? null,
-    pinWeight: params.pinWeight ?? null,
-    sourceSessionId: params.sourceSessionId ?? null,
+    request: {
+      workingDir: params.workingDir,
+      category: params.category,
+      scope: params.scope ?? null,
+      content: params.content,
+      tags: params.tags ?? [],
+      pinned: params.pinned ?? null,
+      pinWeight: params.pinWeight ?? null,
+      sourceSessionId: params.sourceSessionId ?? null,
+    },
   });
 }
 
 export function memoryUpdate(params: MemoryUpdateParams): Promise<MemoryEntry> {
   return ipcInvoke<MemoryEntry>("memory_update", {
-    workingDir: params.workingDir,
-    scope: params.scope,
-    id: params.id,
-    category: params.category ?? null,
-    content: params.content ?? null,
-    tags: params.tags ?? null,
-    pinned: params.pinned ?? null,
-    pinWeight: params.pinWeight ?? null,
+    request: {
+      workingDir: params.workingDir,
+      scope: params.scope,
+      id: params.id,
+      category: params.category ?? null,
+      content: params.content ?? null,
+      tags: params.tags ?? null,
+      pinned: params.pinned ?? null,
+      pinWeight: params.pinWeight ?? null,
+    },
   });
 }
 
 export function memoryDelete(workingDir: string, scope: MemoryScope, id: string): Promise<void> {
-  return ipcInvoke("memory_delete", { workingDir, scope, id });
+  return ipcInvoke("memory_delete", {
+    request: { workingDir, scope, id },
+  });
 }
 
 export function memoryPin(
@@ -93,11 +103,13 @@ export function memoryPin(
   pinWeight?: number | null,
 ): Promise<MemoryEntry> {
   return ipcInvoke<MemoryEntry>("memory_pin", {
-    workingDir,
-    scope,
-    id,
-    pinned,
-    pinWeight: pinWeight ?? null,
+    request: {
+      workingDir,
+      scope,
+      id,
+      pinned,
+      pinWeight: pinWeight ?? null,
+    },
   });
 }
 
@@ -107,7 +119,9 @@ export function memoryTagUpdate(
   id: string,
   tags: string[],
 ): Promise<MemoryEntry> {
-  return ipcInvoke<MemoryEntry>("memory_tag_update", { workingDir, scope, id, tags });
+  return ipcInvoke<MemoryEntry>("memory_tag_update", {
+    request: { workingDir, scope, id, tags },
+  });
 }
 
 export function memoryRetrieve(
@@ -120,11 +134,13 @@ export function memoryRetrieve(
   },
 ): Promise<MemoryRetrieveHit[]> {
   return ipcInvoke<MemoryRetrieveHit[]>("memory_retrieve", {
-    workingDir,
-    query,
-    limit: options?.limit ?? null,
-    tokenBudget: options?.tokenBudget ?? null,
-    scopes: options?.scopes ?? null,
+    request: {
+      workingDir,
+      query,
+      limit: options?.limit ?? null,
+      tokenBudget: options?.tokenBudget ?? null,
+      scopes: options?.scopes ?? null,
+    },
   });
 }
 
@@ -153,6 +169,9 @@ export interface AgentMemoryStatus {
   bundleVersion?: string | null;
   usingBundledRuntime?: boolean;
   error?: string | null;
+  llmConfigured?: boolean;
+  llmProvider?: string | null;
+  llmWarning?: string | null;
 }
 
 function isTransientIpcError(error: unknown): boolean {

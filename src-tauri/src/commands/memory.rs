@@ -267,6 +267,12 @@ pub struct AgentMemoryStatusResponse {
 
     pub error: Option<String>,
 
+    pub llm_configured: bool,
+
+    pub llm_provider: Option<String>,
+
+    pub llm_warning: Option<String>,
+
 }
 
 
@@ -326,6 +332,7 @@ fn build_create_entry(request: MemoryCreateRequest) -> Result<MemoryEntry, Strin
 fn status_response(store: &AgentMemoryState) -> AgentMemoryStatusResponse {
 
     let health = store.health();
+    let llm_env = store.current_llm_env();
 
     AgentMemoryStatusResponse {
 
@@ -347,7 +354,51 @@ fn status_response(store: &AgentMemoryState) -> AgentMemoryStatusResponse {
 
         error: health.error,
 
+        llm_configured: llm_env.configured,
+
+        llm_provider: if llm_env.provider_label.is_empty() || llm_env.provider_label == "none" {
+            None
+        } else {
+            Some(llm_env.provider_label)
+        },
+
+        llm_warning: llm_env.warning,
+
     }
+
+}
+
+pub(crate) fn schedule_agentmemory_restart(store: &std::sync::Arc<AgentMemoryState>) {
+    let store = store.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        if let Err(error) = store.restart_if_running() {
+            eprintln!(
+                "[Locus] agentmemory restart after config change failed: {}",
+                error
+            );
+        }
+    });
+}
+
+
+
+async fn run_memory_blocking<T, F>(join_code: &str, join_message: &str, task: F) -> Result<T, AppError>
+
+where
+
+    T: Send + 'static,
+
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+
+{
+
+    tauri::async_runtime::spawn_blocking(task)
+
+        .await
+
+        .map_err(|e| AppError::new(join_code, format!("{join_message}: {e}")))?
+
+        .map_err(AppError::from)
 
 }
 
@@ -489,11 +540,17 @@ pub async fn memory_list(
 
     };
 
-    store
+    let store = store.inner().clone();
 
-        .list(&request.working_dir, None, &filter)
+    let working_dir = request.working_dir;
 
-        .map_err(AppError::from)
+    run_memory_blocking("memory.list.join_failed", "Failed to list memory entries", move || {
+
+        store.list(&working_dir, None, &filter)
+
+    })
+
+    .await
 
 }
 
@@ -509,21 +566,21 @@ pub async fn memory_get(
 
 ) -> Result<Option<MemoryEntry>, AppError> {
 
-    store
+    let scope = map_scope(&request.scope)?;
 
-        .get(
+    let store = store.inner().clone();
 
-            &request.working_dir,
+    let working_dir = request.working_dir;
 
-            None,
+    let id = request.id;
 
-            map_scope(&request.scope)?,
+    run_memory_blocking("memory.get.join_failed", "Failed to get memory entry", move || {
 
-            &request.id,
+        store.get(&working_dir, None, scope, &id)
 
-        )
+    })
 
-        .map_err(AppError::from)
+    .await
 
 }
 
@@ -543,7 +600,15 @@ pub async fn memory_create(
 
     let entry = build_create_entry(request)?;
 
-    apply_memory_entry(store.inner(), &working_dir, None, entry, None).map_err(AppError::from)
+    let store = store.inner().clone();
+
+    run_memory_blocking("memory.create.join_failed", "Failed to create memory entry", move || {
+
+        apply_memory_entry(store.as_ref(), &working_dir, None, entry, None)
+
+    })
+
+    .await
 
 }
 
@@ -583,25 +648,19 @@ pub async fn memory_update(
 
     };
 
-    store
+    let store = store.inner().clone();
 
-        .update(
+    let working_dir = request.working_dir;
 
-            &request.working_dir,
+    let id = request.id;
 
-            None,
+    run_memory_blocking("memory.update.join_failed", "Failed to update memory entry", move || {
 
-            scope,
+        store.update(&working_dir, None, scope, &id, &patch, None)
 
-            &request.id,
+    })
 
-            &patch,
-
-            None,
-
-        )
-
-        .map_err(AppError::from)
+    .await
 
 }
 
@@ -617,21 +676,21 @@ pub async fn memory_delete(
 
 ) -> Result<(), AppError> {
 
-    store
+    let scope = map_scope(&request.scope)?;
 
-        .delete(
+    let store = store.inner().clone();
 
-            &request.working_dir,
+    let working_dir = request.working_dir;
 
-            None,
+    let id = request.id;
 
-            map_scope(&request.scope)?,
+    run_memory_blocking("memory.delete.join_failed", "Failed to delete memory entry", move || {
 
-            &request.id,
+        store.delete(&working_dir, None, scope, &id)
 
-        )
+    })
 
-        .map_err(AppError::from)
+    .await
 
 }
 
@@ -647,25 +706,25 @@ pub async fn memory_pin(
 
 ) -> Result<MemoryEntry, AppError> {
 
-    store
+    let scope = map_scope(&request.scope)?;
 
-        .pin(
+    let store = store.inner().clone();
 
-            &request.working_dir,
+    let working_dir = request.working_dir;
 
-            None,
+    let id = request.id;
 
-            map_scope(&request.scope)?,
+    let pinned = request.pinned;
 
-            &request.id,
+    let pin_weight = request.pin_weight;
 
-            request.pinned,
+    run_memory_blocking("memory.pin.join_failed", "Failed to pin memory entry", move || {
 
-            request.pin_weight,
+        store.pin(&working_dir, None, scope, &id, pinned, pin_weight)
 
-        )
+    })
 
-        .map_err(AppError::from)
+    .await
 
 }
 
@@ -681,23 +740,27 @@ pub async fn memory_tag_update(
 
 ) -> Result<MemoryEntry, AppError> {
 
-    store
+    let scope = map_scope(&request.scope)?;
 
-        .update_tags(
+    let store = store.inner().clone();
 
-            &request.working_dir,
+    let working_dir = request.working_dir;
 
-            None,
+    let id = request.id;
 
-            map_scope(&request.scope)?,
+    let tags = request.tags;
 
-            &request.id,
+    run_memory_blocking(
 
-            request.tags,
+        "memory.tag_update.join_failed",
 
-        )
+        "Failed to update memory entry tags",
 
-        .map_err(AppError::from)
+        move || store.update_tags(&working_dir, None, scope, &id, tags),
+
+    )
+
+    .await
 
 }
 
@@ -922,19 +985,18 @@ pub async fn apply_memory_proposal(
     let mut apply_error: Option<String> = None;
 
     for item in &proposal.items {
+        if !crate::agentmemory::mapping::should_include_memory_content(&item.content) {
+            continue;
+        }
 
         let entry = build_memory_entry_from_proposal_item(item, Some(session_id.clone()));
 
-        if let Err(error) = apply_memory_entry(memory_store.inner(), &working_dir, None, entry, None)
-
+        if let Err(error) =
+            apply_memory_entry(memory_store.inner(), &working_dir, None, entry, None)
         {
-
             apply_error = Some(error);
-
             break;
-
         }
-
     }
 
 

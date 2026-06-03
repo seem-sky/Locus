@@ -306,7 +306,11 @@ watch(
       </template>
 
       <template v-if="activeCategory === 'memory'">
-        <MemorySettings />
+        <MemorySettings
+          :model-defaults="modelDefaults"
+          :all-models="allModels"
+          @open-models="activeCategory = 'models'"
+        />
       </template>
 
       <template v-if="activeCategory === 'proxy'">

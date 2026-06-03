@@ -4,6 +4,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use super::client::{AgentMemoryClient, AgentMemoryHealthStatus};
+use super::llm_env;
 use super::resolve::{self, ResolvedAgentmemory};
 
 const STARTUP_POLL_MS: u64 = 400;
@@ -70,8 +71,7 @@ impl AgentMemoryService {
     }
 
     pub fn ensure_running(&self, client: &AgentMemoryClient) -> Result<(), String> {
-        if client.health().available {
-            self.reap_exited_child();
+        if self.locus_managed_process_alive() && client.health().available {
             return Ok(());
         }
         if !self.autostart {
@@ -85,38 +85,35 @@ impl AgentMemoryService {
     }
 
     pub fn start_and_wait(&self, client: &AgentMemoryClient) -> Result<(), String> {
-        if client.health().available {
-            self.reap_exited_child();
-            return Ok(());
-        }
         self.start(client)?;
         self.wait_for_health(client)
     }
 
+    /// True when this service spawned a child that is still running.
+    fn locus_managed_process_alive(&self) -> bool {
+        let Ok(mut guard) = self.child.lock() else {
+            return false;
+        };
+        let Some(child) = guard.as_mut() else {
+            return false;
+        };
+        matches!(child.try_wait(), Ok(None))
+    }
+
     pub fn start(&self, client: &AgentMemoryClient) -> Result<(), String> {
-        if client.health().available {
-            self.reap_exited_child();
+        self.reap_exited_child();
+        if client.health().available && self.locus_managed_process_alive() {
             return Ok(());
         }
 
         self.stop()?;
-        cleanup_stale_listener(client);
+        if client.health().available {
+            reclaim_listener_port(client);
+        } else {
+            cleanup_stale_listener(client);
+        }
 
         let mut guard = self.child.lock().map_err(|e| e.to_string())?;
-        if let Some(child) = guard.as_mut() {
-            match child.try_wait() {
-                Ok(Some(_)) => {
-                    *guard = None;
-                }
-                Ok(None) => return Ok(()),
-                Err(e) => {
-                    return Err(format!(
-                        "Failed to inspect agentmemory child process: {}",
-                        e
-                    ));
-                }
-            }
-        }
 
         let resolved = resolve::resolve_agentmemory()?;
         self.remember_runtime(&resolved);
@@ -127,9 +124,14 @@ impl AgentMemoryService {
             .ok()
             .and_then(|guard| guard.clone());
 
-        let (program, prefix_args, spawn_cwd) = windows_spawn_command(&resolved, export_root.as_deref());
-        let mut cmd = crate::process_util::command(&program);
+        let (program, prefix_args, spawn_cwd) = windows_spawn_command(&resolved);
+        let mut cmd = std::process::Command::new(&program);
+        crate::process_util::suppress_command_window(&mut cmd);
+        crate::network::apply_proxy_env_to_command(&mut cmd);
         crate::process_util::set_new_process_group(&mut cmd);
+        if let Some(path) = prepend_path_env(&resolved.iii_bin_dir) {
+            cmd.env("PATH", path);
+        }
         cmd.args(prefix_args)
             .current_dir(&spawn_cwd)
             .stdout(Stdio::null())
@@ -145,15 +147,25 @@ impl AgentMemoryService {
                 {
                     cmd.stderr(Stdio::from(log_file));
                 }
-                cmd.env(
-                    "AGENTMEMORY_SERVICE_LOG",
-                    crate::process_util::windows_command_path(&log_path),
-                );
+                cmd.env("AGENTMEMORY_SERVICE_LOG", log_path.display().to_string());
             }
             cmd.env(
                 "AGENTMEMORY_EXPORT_ROOT",
-                crate::process_util::windows_command_path(&export_root),
+                export_root.display().to_string(),
             );
+        }
+
+        let llm_env = llm_env::resolve_for_agentmemory();
+        if llm_env.configured {
+            eprintln!(
+                "[Locus] agentmemory LLM bridge: provider={}",
+                llm_env.provider_label
+            );
+        } else if let Some(warning) = &llm_env.warning {
+            eprintln!("[Locus] agentmemory LLM bridge: {}", warning);
+        }
+        for (key, value) in llm_env.vars {
+            cmd.env(key, value);
         }
 
         let child = cmd
@@ -226,79 +238,21 @@ impl Drop for AgentMemoryService {
 }
 
 fn prepend_path_env(bin_dir: &Path) -> Option<std::ffi::OsString> {
-    let bin_dir = PathBuf::from(crate::process_util::windows_command_path(bin_dir));
-    let mut paths = vec![bin_dir];
+    let mut paths = vec![bin_dir.to_path_buf()];
     if let Ok(existing) = std::env::var("PATH") {
         paths.extend(std::env::split_paths(&existing));
     }
     std::env::join_paths(paths).ok()
 }
 
-/// Bundled codegraph `node.exe` often lives under `...\node_modules\...`; on Windows,
-/// Node re-parses the full command line and `\n` inside `\node_modules` truncates argv.
-/// Use a small launcher script plus system Node when that path shape is detected.
-fn windows_spawn_command(
-    resolved: &ResolvedAgentmemory,
-    export_root: Option<&Path>,
-) -> (String, Vec<String>, PathBuf) {
-    let working_dir =
-        PathBuf::from(crate::process_util::windows_command_path(&resolved.working_dir));
-
-    #[cfg(windows)]
-    {
-        let bundled = resolved.program.to_string_lossy();
-        if bundled.contains("node_modules") {
-            let launcher = resolved.bundle_root.join("launcher.mjs");
-            if launcher.is_file() {
-                if let Some(system_node) = system_node_executable() {
-                    return (
-                        crate::process_util::windows_command_path(&system_node),
-                        vec![crate::process_util::windows_command_path(&launcher)],
-                        working_dir.clone(),
-                    );
-                }
-            }
-        }
-        return (
-            crate::process_util::windows_command_path(&resolved.program),
-            resolved.prefix_args.clone(),
-            working_dir,
-        );
-    }
-
-    #[cfg(not(windows))]
-    {
-        let _ = export_root;
-        (
-            resolved.program.to_string_lossy().into_owned(),
-            resolved.prefix_args.clone(),
-            working_dir,
-        )
-    }
-}
-
-fn system_node_executable() -> Option<PathBuf> {
-    let path_var = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path_var) {
-        let candidate = dir.join("node.exe");
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-
-    #[cfg(windows)]
-    {
-        for candidate in [
-            PathBuf::from(r"C:\Program Files\nodejs\node.exe"),
-            PathBuf::from(r"C:\Program Files (x86)\nodejs\node.exe"),
-        ] {
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-        }
-    }
-
-    None
+/// Spawn bundled codegraph Node with `--liftoff-only` and a forward-slash CLI path.
+/// `prefix_args` is built in resolve.rs; `iii` is discovered via PATH prepended in `start()`.
+fn windows_spawn_command(resolved: &ResolvedAgentmemory) -> (PathBuf, Vec<String>, PathBuf) {
+    (
+        resolved.program.clone(),
+        resolved.prefix_args.clone(),
+        resolved.working_dir.clone(),
+    )
 }
 
 fn service_log_path(export_root: &Path) -> Option<PathBuf> {
@@ -310,6 +264,11 @@ fn cleanup_stale_listener(client: &AgentMemoryClient) {
     if health.available || !health.orphaned_listener {
         return;
     }
+    reclaim_listener_port(client);
+}
+
+/// Stop any agentmemory listener on the REST port so Locus can spawn a managed child with fresh env.
+fn reclaim_listener_port(client: &AgentMemoryClient) {
     if let Some(port) = rest_port_from_base_url(client.base_url()) {
         if let Some(pid) = find_listening_pid(port) {
             if is_agentmemory_listener_pid(pid) {
@@ -463,9 +422,10 @@ mod tests {
         let log_path = temp.path().join("stderr.log");
         let log_file = std::fs::File::create(&log_path).expect("log file");
 
-        let (program, prefix_args, spawn_cwd) = windows_spawn_command(&resolved, None);
+        let (program, prefix_args, spawn_cwd) = windows_spawn_command(&resolved);
 
-        let mut cmd = crate::process_util::command(&program);
+        let mut cmd = std::process::Command::new(&program);
+        crate::process_util::suppress_command_window(&mut cmd);
         crate::process_util::set_new_process_group(&mut cmd);
         cmd.args(prefix_args.clone())
             .current_dir(&spawn_cwd)

@@ -871,6 +871,7 @@ enum ToolConfirmReason {
     UserPermission,
     KnowledgeGovernance,
     WorkflowAmbiguous,
+    DestructiveBashRm,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2448,40 +2449,57 @@ impl AgentInstance {
     }
 
     fn resolve_path_against_working_dir(&self, raw_path: &str) -> Option<String> {
+        let (resolved, _) = self.resolve_path_against_working_dir_with_meta(raw_path)?;
+        Some(resolved)
+    }
+
+    fn resolve_path_against_working_dir_with_meta(
+        &self,
+        raw_path: &str,
+    ) -> Option<(String, bool)> {
         let trimmed = raw_path.trim();
         if trimmed.is_empty() {
             return None;
         }
 
         let path = std::path::Path::new(trimmed);
-        if path.is_absolute() {
-            let workspace_root = if self.has_selected_working_dir() && self.knowledge_access_mode.allows_context() {
-                Some(std::path::Path::new(&self.working_dir))
-            } else {
-                None
-            };
-            return Some(
-                crate::commands::resolve_workspace_file_path(workspace_root, trimmed)
-                    .display()
-                    .to_string(),
-            );
-        }
+        let workspace_root = if self.has_selected_working_dir() && self.knowledge_access_mode.allows_context() {
+            Some(std::path::Path::new(&self.working_dir))
+        } else {
+            None
+        };
 
-        if !self.has_selected_working_dir() {
+        let meta = if path.is_absolute() {
+            crate::commands::resolve_workspace_file_path_with_meta(workspace_root, trimmed)
+        } else if let Some(root) = workspace_root {
+            crate::commands::resolve_workspace_file_path_with_meta(Some(root), trimmed)
+        } else {
             return None;
-        }
-        if !self.knowledge_access_mode.allows_context() {
-            return None;
-        }
+        };
 
-        Some(
-            crate::commands::resolve_workspace_file_path(
-                Some(std::path::Path::new(&self.working_dir)),
-                trimmed,
-            )
-            .display()
-            .to_string(),
-        )
+        Some((
+            meta.resolved.display().to_string(),
+            meta.assets_lua_remapped,
+        ))
+    }
+
+    fn apply_assets_lua_path_resolution(
+        &self,
+        args: &mut serde_json::Value,
+        field: &str,
+        raw_path: &str,
+    ) {
+        let Some((resolved, remapped)) = self.resolve_path_against_working_dir_with_meta(raw_path)
+        else {
+            return;
+        };
+        if remapped {
+            args[crate::commands::LOCUSS_REQUESTED_PATH_KEY] =
+                serde_json::Value::String(raw_path.to_string());
+            args[crate::commands::LOCUSS_ASSETS_LUA_REMAPPED_KEY] =
+                serde_json::Value::Bool(true);
+        }
+        args[field] = serde_json::Value::String(resolved);
     }
 
     fn normalize_path_lexically(path: &std::path::Path) -> std::path::PathBuf {
@@ -3933,19 +3951,40 @@ impl AgentInstance {
     fn inject_working_dir(&self, tool_name: &str, args: &mut serde_json::Value) {
         match tool_name {
             "bash" => {
-                if let Some(dir) = args.get("workdir").and_then(|v| v.as_str()) {
+                let workspace_root = if let Some(dir) = args.get("workdir").and_then(|v| v.as_str()) {
                     if let Some(resolved) = self.resolve_path_against_working_dir(dir) {
-                        args["workdir"] = serde_json::Value::String(resolved);
+                        args["workdir"] = serde_json::Value::String(resolved.clone());
+                        Some(resolved)
+                    } else {
+                        Some(dir.to_string())
                     }
                 } else if self.has_selected_working_dir() {
                     args["workdir"] = serde_json::Value::String(self.working_dir.clone());
+                    Some(self.working_dir.clone())
+                } else {
+                    None
+                };
+
+                if let (Some(root), Some(command)) = (
+                    workspace_root.as_deref(),
+                    args.get("command").and_then(|v| v.as_str()),
+                ) {
+                    let remapped = crate::commands::remap_assets_lua_mispath_in_text(
+                        command,
+                        Some(std::path::Path::new(root)),
+                    );
+                    if remapped != command {
+                        args[crate::commands::LOCUSS_REQUESTED_PATH_KEY] =
+                            serde_json::Value::String(command.to_string());
+                        args[crate::commands::LOCUSS_ASSETS_LUA_REMAPPED_KEY] =
+                            serde_json::Value::Bool(true);
+                        args["command"] = serde_json::Value::String(remapped);
+                    }
                 }
             }
             "grep" | "list" => {
-                if let Some(p) = args.get("path").and_then(|v| v.as_str()) {
-                    if let Some(resolved) = self.resolve_path_against_working_dir(p) {
-                        args["path"] = serde_json::Value::String(resolved);
-                    }
+                if let Some(p) = args.get("path").and_then(|v| v.as_str()).map(str::to_string) {
+                    self.apply_assets_lua_path_resolution(args, "path", &p);
                 } else if self.has_selected_working_dir() {
                     args["path"] = serde_json::Value::String(self.working_dir.clone());
                 }
@@ -3968,10 +4007,12 @@ impl AgentInstance {
                 }
             }
             "read" | "write" | "edit" => {
-                if let Some(fp) = args.get("filePath").and_then(|v| v.as_str()) {
-                    if let Some(resolved) = self.resolve_path_against_working_dir(fp) {
-                        args["filePath"] = serde_json::Value::String(resolved);
-                    }
+                if let Some(fp) = args
+                    .get("filePath")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+                {
+                    self.apply_assets_lua_path_resolution(args, "filePath", &fp);
                 }
             }
             "unity_log" | "unity_recompile" => {
@@ -6381,11 +6422,109 @@ impl AgentInstance {
         format!("skill/{}.md", normalized_dir_name)
     }
 
+    fn attached_asset_ref_read_tool(kind: &str, path: &str) -> &'static str {
+        if kind == "knowledge" {
+            return "knowledge_read";
+        }
+        if kind == "sceneObject" {
+            return "unity_yaml_read";
+        }
+        let normalized = path.trim().replace('\\', "/");
+        if normalized.ends_with('/') || !normalized.rsplit('/').next().unwrap_or("").contains('.') {
+            return "list";
+        }
+        let lower = normalized.to_ascii_lowercase();
+        if [
+            ".unity",
+            ".prefab",
+            ".asset",
+            ".mat",
+            ".anim",
+            ".controller",
+        ]
+        .iter()
+        .any(|ext| lower.ends_with(ext))
+        {
+            "unity_yaml_read"
+        } else {
+            "read"
+        }
+    }
+
+    fn build_attached_asset_refs_reminder(
+        asset_refs: Option<&[crate::session::models::AssetRefData]>,
+    ) -> Option<String> {
+        let asset_refs = asset_refs.filter(|refs| !refs.is_empty())?;
+        let mut lines = Vec::new();
+        for asset_ref in asset_refs {
+            let path = asset_ref.path.trim();
+            if path.is_empty() {
+                continue;
+            }
+            let tool = Self::attached_asset_ref_read_tool(&asset_ref.kind, path);
+            lines.push(format!("- `{path}` → call `{tool}` before proceeding"));
+        }
+        if lines.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "<system-reminder>\nThe user attached workspace references via drag-and-drop. Read every attached target with the listed tool before planning, reviewing, or editing. Do not skip unread attachments.\n\n{}\n</system-reminder>",
+            lines.join("\n")
+        ))
+    }
+
+    fn collect_recent_user_asset_refs(
+        store: &SessionStore,
+        session_id: &str,
+        max_user_messages: usize,
+    ) -> Vec<crate::session::models::AssetRefData> {
+        let Ok(messages) = store.get_messages(session_id) else {
+            return Vec::new();
+        };
+        let mut refs = Vec::new();
+        let mut seen = HashSet::new();
+        let mut user_messages_seen = 0usize;
+        for message in messages.into_iter().rev() {
+            if message.role != crate::session::models::MessageRole::User {
+                continue;
+            }
+            user_messages_seen += 1;
+            if user_messages_seen > max_user_messages {
+                break;
+            }
+            let Some(message_refs) = message.asset_refs.as_ref() else {
+                continue;
+            };
+            for asset_ref in message_refs {
+                let key = format!("{}::{}", asset_ref.kind, asset_ref.path);
+                if seen.insert(key) {
+                    refs.push(asset_ref.clone());
+                }
+            }
+        }
+        refs.reverse();
+        refs
+    }
+
+    fn append_attached_asset_refs_to_subagent_prompt(
+        prompt: &str,
+        asset_refs: &[crate::session::models::AssetRefData],
+    ) -> String {
+        let Some(reminder) = Self::build_attached_asset_refs_reminder(Some(asset_refs)) else {
+            return prompt.to_string();
+        };
+        if prompt.trim().is_empty() {
+            return reminder;
+        }
+        format!("{prompt}\n\n{reminder}")
+    }
+
     fn build_user_prompt_suffix(
         &self,
         store: &SessionStore,
         mode: &str,
         user_intent: Option<&crate::session::models::UserIntentPayload>,
+        asset_refs: Option<&[crate::session::models::AssetRefData]>,
     ) -> Option<String> {
         let mut parts = Vec::new();
         if let Some(reminder) = self
@@ -6393,6 +6532,9 @@ impl AgentInstance {
             .user_turn_reminder()
         {
             parts.push(reminder.to_string());
+        }
+        if let Some(reminder) = Self::build_attached_asset_refs_reminder(asset_refs) {
+            parts.push(reminder);
         }
         if let Some(intent) = user_intent {
             let skill_reminder = self.build_selected_skill_reminder(intent);
@@ -6469,6 +6611,7 @@ impl AgentInstance {
                     store,
                     &effective_mode,
                     input.user_intent.as_ref(),
+                    input.asset_refs.as_deref(),
                 );
                 let language_prompt_prefix = self.language_prompt_prefix(store);
                 let first_user_message_id = store.first_user_message_id(&self.session_id)?;
@@ -6954,8 +7097,12 @@ impl AgentInstance {
             language_prompt_prefix,
             followup_memory_prefix.as_deref(),
         );
-        let user_prompt_suffix =
-            self.build_user_prompt_suffix(store, initial_mode, user_intent.as_ref());
+        let user_prompt_suffix = self.build_user_prompt_suffix(
+            store,
+            initial_mode,
+            user_intent.as_ref(),
+            asset_refs,
+        );
         let first_user_message_id = store.first_user_message_id(&self.session_id)?;
         let current_prompt_prefix = if first_user_message_id.is_none() {
             combined_prompt_prefix.as_deref()
@@ -8041,7 +8188,7 @@ impl AgentInstance {
                             let tool_input = args.clone();
                             let tool_output = stored_output.clone();
                             let is_error = result.is_error;
-                            if let Err(error) = tokio::task::spawn_blocking(move || {
+                            if let Err(error) = tauri::async_runtime::spawn_blocking(move || {
                                 memory_store.observe_tool_use(
                                     &session_id,
                                     &working_dir,
@@ -8564,7 +8711,11 @@ impl AgentInstance {
                 app_handle.state();
             let memory_store = memory_store.inner().clone();
             let session_id = self.session_id.clone();
-            match tokio::task::spawn_blocking(move || memory_store.session_end(&session_id)).await {
+            match tauri::async_runtime::spawn_blocking(move || {
+                memory_store.session_end(&session_id)
+            })
+            .await
+            {
                 Ok(Err(error)) => {
                     eprintln!(
                         "[Agent {}] agentmemory session_end failed for {}: {}",
@@ -8838,6 +8989,7 @@ impl AgentInstance {
         knowledge_preview: Option<KnowledgeToolConfirmPreview>,
         knowledge_governance_requires_confirm: bool,
         workflow_ambiguous_requires_confirm: bool,
+        bash_rm_requires_confirm: bool,
     ) -> ToolConfirmAssessment {
         let mut reasons = Vec::new();
         if let Some(reason) = Self::permission_confirm_reason(global_mode, tool_mode, tool_name) {
@@ -8849,9 +9001,24 @@ impl AgentInstance {
         if workflow_ambiguous_requires_confirm {
             reasons.push(ToolConfirmReason::WorkflowAmbiguous);
         }
+        if bash_rm_requires_confirm {
+            reasons.push(ToolConfirmReason::DestructiveBashRm);
+        }
 
-        let workflow_note = workflow_ambiguous_requires_confirm
-            .then(|| crate::agent::workflow::WORKFLOW_AMBIGUOUS_TOOL_CONFIRM_NOTE.to_string());
+        let mut workflow_notes = Vec::new();
+        if workflow_ambiguous_requires_confirm {
+            workflow_notes.push(
+                crate::agent::workflow::WORKFLOW_AMBIGUOUS_TOOL_CONFIRM_NOTE.to_string(),
+            );
+        }
+        if bash_rm_requires_confirm {
+            workflow_notes.push(crate::agent::workflow::BASH_RM_CONFIRM_NOTE.to_string());
+        }
+        let workflow_note = if workflow_notes.is_empty() {
+            None
+        } else {
+            Some(workflow_notes.join("\n\n"))
+        };
 
         ToolConfirmAssessment {
             reasons,
@@ -8951,10 +9118,13 @@ impl AgentInstance {
                 })
                 .flatten()
                 .unwrap_or(false);
+        let bash_rm_requires_confirm = tool_name == "bash"
+            && crate::agent::workflow::bash_rm_requires_user_confirm(args);
 
         if normalized_global_mode == PermissionModeSetting::Auto
             && !knowledge_governance_requires_confirm
             && !workflow_ambiguous_requires_confirm
+            && !bash_rm_requires_confirm
         {
             eprintln!(
                 "[Agent {}] tool confirm skipped for '{}' (global_mode=auto)",
@@ -8971,6 +9141,7 @@ impl AgentInstance {
             knowledge_preview,
             knowledge_governance_requires_confirm,
             workflow_ambiguous_requires_confirm,
+            bash_rm_requires_confirm,
         );
 
         if assessment.reasons.is_empty() {
@@ -9264,6 +9435,7 @@ impl AgentInstance {
             }
 
             normalize_tool_args(&mut target_args);
+            self.inject_working_dir(&canonical, &mut target_args);
             if let Some(blocked) = self.workflow_gate_check(&canonical, &target_args, mode) {
                 return blocked;
             }
@@ -9280,7 +9452,11 @@ impl AgentInstance {
             target_call.arguments = target_arguments;
             if canonical == "bash" {
                 if let Some(command) = target_args.get("command").and_then(|v| v.as_str()) {
-                    let rtk_meta = crate::rtk::rewrite_with_meta(command);
+                    let workdir = target_args
+                        .get("workdir")
+                        .and_then(|v| v.as_str())
+                        .map(std::path::Path::new);
+                    let rtk_meta = crate::rtk::rewrite_bash_with_meta(command, workdir);
                     emit_stream(
                         app_handle,
                         run_id,
@@ -9484,7 +9660,11 @@ impl AgentInstance {
             let meta_sink = tool_context.execution_meta_sink.clone();
             if tc.name == "bash" {
                 if let Some(command) = args.get("command").and_then(|v| v.as_str()) {
-                    let rtk_meta = crate::rtk::rewrite_with_meta(command);
+                    let workdir = args
+                        .get("workdir")
+                        .and_then(|v| v.as_str())
+                        .map(std::path::Path::new);
+                    let rtk_meta = crate::rtk::rewrite_bash_with_meta(command, workdir);
                     emit_stream(
                         app_handle,
                         run_id,
@@ -9846,7 +10026,7 @@ impl AgentInstance {
         let working_dir = self.working_dir.clone();
         let query = query.to_string();
 
-        match tokio::task::spawn_blocking(move || {
+        match tauri::async_runtime::spawn_blocking(move || {
             memory_store.build_chat_memory_prefix(&session_id, &working_dir, &query)
         })
         .await
@@ -13474,12 +13654,18 @@ impl AgentInstance {
             return Self::interrupted_tool_result();
         }
 
+        let parent_asset_refs = Self::collect_recent_user_asset_refs(store, &self.session_id, 3);
+        let enriched_prompt = Self::append_attached_asset_refs_to_subagent_prompt(
+            prompt,
+            &parent_asset_refs,
+        );
+
         match self
             .run_subagent_task(
                 app_handle,
                 store,
                 description,
-                prompt,
+                &enriched_prompt,
                 subagent_type,
                 tool_call_id,
                 run_id,
@@ -15799,6 +15985,7 @@ Create a reusable Skill.
             None,
             true,
             false,
+            false,
         );
         assert_eq!(
             assessment.reasons,
@@ -15816,8 +16003,37 @@ Create a reusable Skill.
             None,
             false,
             false,
+            false,
         );
         assert!(assessment.reasons.is_empty());
+    }
+
+    #[test]
+    fn global_auto_mode_keeps_confirmation_for_bash_rm() {
+        let assessment = AgentInstance::assess_tool_confirmation(
+            "auto",
+            Some("auto"),
+            "bash",
+            "{\"command\":\"rm -rf Assets.Lua\"}",
+            None,
+            false,
+            false,
+            true,
+        );
+        assert_eq!(
+            assessment.reasons,
+            vec![super::ToolConfirmReason::DestructiveBashRm]
+        );
+        match assessment.display {
+            super::ToolConfirmDisplay::Basic(display) => {
+                assert_eq!(display.tool_name, "bash");
+                assert_eq!(
+                    display.workflow_note.as_deref(),
+                    Some(crate::agent::workflow::BASH_RM_CONFIRM_NOTE)
+                );
+            }
+            other => panic!("unexpected confirm display: {other:?}"),
+        }
     }
 
     #[test]
@@ -16909,5 +17125,63 @@ Create a reusable Skill.
         );
         assert!(value.get("document").is_none());
         assert!(value.get("directory").is_none());
+    }
+
+    #[test]
+    fn attached_asset_ref_read_tool_selects_expected_reader() {
+        assert_eq!(
+            AgentInstance::attached_asset_ref_read_tool("knowledge", "skill/ui.md"),
+            "knowledge_read"
+        );
+        assert_eq!(
+            AgentInstance::attached_asset_ref_read_tool("sceneObject", "Assets/Main.unity/Player"),
+            "unity_yaml_read"
+        );
+        assert_eq!(
+            AgentInstance::attached_asset_ref_read_tool("asset", "Assets/Scripts/Foo.cs"),
+            "read"
+        );
+        assert_eq!(
+            AgentInstance::attached_asset_ref_read_tool("asset", "Assets/Prefabs/Bar.prefab"),
+            "unity_yaml_read"
+        );
+        assert_eq!(
+            AgentInstance::attached_asset_ref_read_tool("asset", "Assets/Art"),
+            "list"
+        );
+    }
+
+    #[test]
+    fn build_attached_asset_refs_reminder_requires_read_before_proceeding() {
+        let reminder = AgentInstance::build_attached_asset_refs_reminder(Some(&[
+            crate::session::models::AssetRefData {
+                path: "Assets/Scripts/Foo.cs".to_string(),
+                kind: "asset".to_string(),
+                name: None,
+                type_label: None,
+                source: Some("manual".to_string()),
+            },
+        ]))
+        .expect("reminder");
+        assert!(reminder.contains("<system-reminder>"));
+        assert!(reminder.contains("Assets/Scripts/Foo.cs"));
+        assert!(reminder.contains("`read`"));
+        assert!(reminder.contains("Do not skip unread attachments"));
+    }
+
+    #[test]
+    fn append_attached_asset_refs_to_subagent_prompt_preserves_task_prompt() {
+        let enriched = AgentInstance::append_attached_asset_refs_to_subagent_prompt(
+            "Implement the fix.",
+            &[crate::session::models::AssetRefData {
+                path: "Assets/Scripts/Foo.cs".to_string(),
+                kind: "asset".to_string(),
+                name: None,
+                type_label: None,
+                source: Some("manual".to_string()),
+            }],
+        );
+        assert!(enriched.starts_with("Implement the fix."));
+        assert!(enriched.contains("Assets/Scripts/Foo.cs"));
     }
 }

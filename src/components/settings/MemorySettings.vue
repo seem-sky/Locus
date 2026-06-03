@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from "vue";
+import { computed, nextTick, onMounted, ref, watch } from "vue";
 import { t } from "../../i18n";
 import {
   agentmemoryStart,
@@ -33,12 +33,14 @@ const activeTag = ref<string | null>(null);
 const searchQuery = ref("");
 
 const editingEntry = ref<MemoryEntry | null>(null);
+const editModalRef = ref<HTMLElement | null>(null);
 const editContent = ref("");
 const editTags = ref("");
 const editSaving = ref(false);
 const deletingId = ref<string | null>(null);
 const serviceStatus = ref<AgentMemoryStatus | null>(null);
 const serviceLoading = ref(false);
+let loadEntriesSeq = 0;
 
 const viewerUrl = computed(() => {
   const port = serviceStatus.value?.viewerPort ?? 3113;
@@ -177,34 +179,75 @@ function formatTime(ms: number): string {
   return new Date(ms).toLocaleString();
 }
 
-async function loadEntries() {
+async function loadEntries(options?: { force?: boolean }) {
+  const seq = ++loadEntriesSeq;
   if (!hasWorkspace.value) {
     entries.value = [];
     error.value = "";
+    loading.value = false;
+    return;
+  }
+  if (
+    !options?.force
+    && serviceStatus.value
+    && !serviceStatus.value.available
+  ) {
+    entries.value = [];
+    error.value = serviceStatus.value.error?.trim() || t("memory.agentmemory.unavailable");
+    loading.value = false;
     return;
   }
   loading.value = true;
   error.value = "";
   try {
-    entries.value = await memoryList({ workingDir: project.workingDir });
+    const nextEntries = await memoryList({ workingDir: project.workingDir });
+    if (seq !== loadEntriesSeq) return;
+    entries.value = nextEntries;
   } catch (cause) {
+    if (seq !== loadEntriesSeq) return;
     entries.value = [];
     error.value = normalizeAppError(cause).message;
   } finally {
-    loading.value = false;
+    if (seq === loadEntriesSeq) loading.value = false;
   }
+}
+
+async function reloadEntries() {
+  await loadServiceStatus();
+  await loadEntries({ force: true });
 }
 
 function openEdit(entry: MemoryEntry) {
   editingEntry.value = entry;
   editContent.value = entry.content;
   editTags.value = entry.tags.join(", ");
+  void nextTick(() => editModalRef.value?.focus());
 }
 
-function closeEdit() {
+function isEditDirty(): boolean {
+  const entry = editingEntry.value;
+  if (!entry) return false;
+  const tags = editTags.value
+    .split(",")
+    .map((tag) => tag.trim())
+    .filter(Boolean);
+  return editContent.value.trim() !== entry.content.trim()
+    || tags.join("\0") !== entry.tags.join("\0");
+}
+
+function closeEdit(force = false) {
+  if (!force && isEditDirty() && !window.confirm(t("memory.editor.discardConfirm"))) {
+    return;
+  }
   editingEntry.value = null;
   editContent.value = "";
   editTags.value = "";
+}
+
+function onEditKeydown(event: KeyboardEvent) {
+  if (event.key !== "Escape") return;
+  event.preventDefault();
+  closeEdit();
 }
 
 async function saveEdit() {
@@ -225,7 +268,7 @@ async function saveEdit() {
     });
     entries.value = entries.value.map((item) => (item.id === updated.id ? updated : item));
     notificationStore.addNotice("success", t("memory.saved"));
-    closeEdit();
+    closeEdit(true);
   } catch (cause) {
     notificationStore.addNotice("error", normalizeAppError(cause).message);
   } finally {
@@ -279,10 +322,18 @@ async function createSampleEntry() {
   }
 }
 
-watch(() => project.workingDir, () => void loadEntries(), { immediate: false });
-onMounted(() => {
-  void loadServiceStatus();
-  void loadEntries();
+watch(() => project.workingDir, () => void reloadEntries(), { immediate: false });
+watch(
+  () => serviceStatus.value?.available,
+  (available, previous) => {
+    if (available && previous === false && hasWorkspace.value) {
+      void loadEntries({ force: true });
+    }
+  },
+);
+onMounted(async () => {
+  await loadServiceStatus();
+  await loadEntries();
 });
 </script>
 
@@ -293,7 +344,7 @@ onMounted(() => {
         <h2>{{ t("memory.title") }}</h2>
         <p class="settings-section-desc">{{ t("memory.description") }}</p>
       </div>
-      <BaseButton variant="neutral" size="sm" :disabled="loading || !hasWorkspace" @click="loadEntries">
+      <BaseButton variant="neutral" size="sm" :disabled="loading || !hasWorkspace" @click="reloadEntries">
         {{ t("memory.reload") }}
       </BaseButton>
     </div>
@@ -319,6 +370,23 @@ onMounted(() => {
           </span>
           <span v-if="serviceStatus?.bundleVersion" class="memory-service-detail">
             {{ t("memory.agentmemory.bundleVersion", serviceStatus.bundleVersion) }}
+          </span>
+          <span v-if="serviceStatus?.llmConfigured" class="memory-service-detail">
+            {{
+              t(
+                "memory.agentmemory.llmConfigured",
+                serviceStatus.llmProvider || "unknown",
+              )
+            }}
+          </span>
+          <span v-else class="memory-service-detail memory-service-warn">
+            {{ t("memory.agentmemory.llmNotConfigured") }}
+          </span>
+          <span
+            v-if="serviceStatus?.llmWarning"
+            class="memory-service-detail memory-service-warn"
+          >
+            {{ serviceStatus.llmWarning }}
           </span>
           <span v-if="serviceStatus?.error" class="memory-service-detail memory-service-error">
             {{ serviceStatus.error }}
@@ -444,8 +512,16 @@ onMounted(() => {
       </div>
     </template>
 
-    <div v-if="editingEntry" class="memory-edit-modal-backdrop" @click="closeEdit">
-      <div class="memory-edit-modal" @click.stop>
+    <div v-if="editingEntry" class="memory-edit-modal-backdrop">
+      <div
+        ref="editModalRef"
+        class="memory-edit-modal"
+        role="dialog"
+        aria-modal="true"
+        tabindex="-1"
+        :aria-label="t('memory.editTitle')"
+        @keydown="onEditKeydown"
+      >
         <h3>{{ t("memory.editTitle") }}</h3>
         <textarea v-model="editContent" class="memory-edit-textarea" rows="8" />
         <label class="memory-edit-label">{{ t("memory.tagsLabel") }}</label>
@@ -540,6 +616,10 @@ onMounted(() => {
 .memory-service-detail {
   font-size: 12px;
   color: var(--text-secondary);
+}
+
+.memory-service-warn {
+  color: var(--warning-fg, #b8860b);
 }
 
 .memory-service-error {
@@ -712,6 +792,10 @@ onMounted(() => {
   display: flex;
   flex-direction: column;
   gap: 10px;
+}
+
+.memory-edit-modal:focus {
+  outline: none;
 }
 
 .memory-edit-modal h3 {

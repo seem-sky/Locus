@@ -1,4 +1,5 @@
 pub mod client;
+pub mod llm_env;
 pub mod mapping;
 pub mod resolve;
 pub mod service;
@@ -14,8 +15,9 @@ use crate::memory::models::{
 };
 
 use mapping::{
-    build_concepts, category_to_agent_type, entry_belongs_to_workspace, entry_matches_filter,
-    normalize_project_path, remote_memory_to_entry,
+    build_concepts, category_to_agent_type, entry_belongs_to_workspace, entry_from_remember_response,
+    entry_matches_filter, extract_search_result_content, normalize_project_path,
+    remote_memory_to_entry, search_result_category,
 };
 
 pub struct AgentMemoryState {
@@ -61,6 +63,16 @@ impl AgentMemoryState {
 
     pub fn set_export_root(&self, path: std::path::PathBuf) {
         self.service.set_export_root(path);
+    }
+
+    pub fn current_llm_env(&self) -> llm_env::AgentMemoryLlmEnv {
+        llm_env::resolve_for_agentmemory()
+    }
+
+    /// Restart the sidecar so new LLM env vars take effect (reclaims port if needed).
+    pub fn restart_if_running(&self) -> Result<(), String> {
+        self.stop()?;
+        self.start_and_wait()
     }
 
     fn load_entries_for_workspace(
@@ -153,6 +165,9 @@ impl AgentMemoryState {
             MemoryScope::Project => (Some(project.as_str()), Some("locus")),
             MemoryScope::User => (None, Some("locus-user")),
         };
+        if entry.content.trim().is_empty() {
+            return Err("Memory content cannot be empty".to_string());
+        }
         let body = self.client.remember(
             &entry.content,
             category_to_agent_type(entry.category),
@@ -160,10 +175,8 @@ impl AgentMemoryState {
             project_arg,
             agent_id,
         )?;
-        let memory = body.get("memory").unwrap_or(&body);
-        remote_memory_to_entry(memory, entry.scope, &project).ok_or_else(|| {
-            "agentmemory remember succeeded but response could not be mapped".to_string()
-        })
+        let scope = entry.scope;
+        entry_from_remember_response(entry, &body, scope, &project)
     }
 
     pub fn update(
@@ -287,44 +300,43 @@ impl AgentMemoryState {
         options: &MemoryRetrieveOptions,
     ) -> Result<Vec<MemoryRetrieveHit>, String> {
         self.ensure_ready()?;
-        let project = normalize_project_path(working_dir);
+        let query = options.query.trim();
         let limit = options.limit.unwrap_or(crate::memory::models::DEFAULT_RETRIEVE_LIMIT);
+        let scopes = options
+            .scopes
+            .as_deref()
+            .filter(|scopes| !scopes.is_empty())
+            .unwrap_or(&[MemoryScope::Project, MemoryScope::User]);
+
+        // agentmemory /search requires a non-empty query; browse recent entries instead.
+        if query.is_empty() {
+            let entries = self.list_all_for_retrieval(working_dir, None, scopes)?;
+            return Ok(entries
+                .into_iter()
+                .take(limit)
+                .map(|entry| MemoryRetrieveHit {
+                    entry,
+                    score: 1.0,
+                    keyword_score: 0.0,
+                    semantic_score: 0.0,
+                })
+                .collect());
+        }
+
+        let project = normalize_project_path(working_dir);
         let token_budget = options
             .token_budget
             .unwrap_or(crate::memory::models::DEFAULT_TOKEN_BUDGET);
+        let cwd = normalize_project_path(working_dir);
+        let cwd_ref = if cwd.is_empty() { working_dir } else { cwd.as_str() };
         let body = self.client.search(
-            &options.query,
+            query,
             Some(project.as_str()),
-            Some(working_dir),
+            Some(cwd_ref),
             Some(limit),
             Some(token_budget),
             "narrative",
         )?;
-        if let Some(text) = body.get("text").and_then(|v| v.as_str()) {
-            let trimmed = text.trim();
-            if !trimmed.is_empty() {
-                return Ok(vec![MemoryRetrieveHit {
-                    entry: MemoryEntry {
-                        id: "agentmemory-context".to_string(),
-                        category: crate::memory::models::MemoryCategory::Topic,
-                        scope: MemoryScope::Project,
-                        content: trimmed.to_string(),
-                        tags: Vec::new(),
-                        pinned: false,
-                        pin_weight: 100,
-                        access_count: 0,
-                        last_accessed_at: 0,
-                        created_at: 0,
-                        updated_at: 0,
-                        source_session_id: None,
-                        linked_doc_path: None,
-                    },
-                    score: 1.0,
-                    keyword_score: 0.5,
-                    semantic_score: 0.5,
-                }]);
-            }
-        }
         let results = body
             .get("results")
             .and_then(|v| v.as_array())
@@ -332,26 +344,16 @@ impl AgentMemoryState {
             .unwrap_or_default();
         let mut hits = Vec::new();
         for result in results {
-            let narrative = result
-                .get("narrative")
-                .or_else(|| result.get("title"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .trim()
-                .to_string();
-            if narrative.is_empty() {
+            let Some(content) = extract_search_result_content(&result) else {
                 continue;
-            }
+            };
             let score = result
                 .get("score")
                 .and_then(|v| v.as_f64())
                 .unwrap_or(0.0) as f32;
-            let obs_type = result
-                .get("type")
-                .and_then(|v| v.as_str())
-                .unwrap_or("fact");
             let obs_id = result
                 .get("obsId")
+                .or_else(|| result.get("observation").and_then(|o| o.get("id")))
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
@@ -362,9 +364,9 @@ impl AgentMemoryState {
                     } else {
                         obs_id
                     },
-                    category: mapping::agent_type_to_category(obs_type),
+                    category: search_result_category(&result),
                     scope: MemoryScope::Project,
-                    content: narrative,
+                    content,
                     tags: Vec::new(),
                     pinned: false,
                     pin_weight: 100,
@@ -375,6 +377,12 @@ impl AgentMemoryState {
                     source_session_id: result
                         .get("sessionId")
                         .and_then(|v| v.as_str())
+                        .or_else(|| {
+                            result
+                                .get("observation")
+                                .and_then(|o| o.get("sessionId"))
+                                .and_then(|v| v.as_str())
+                        })
                         .map(str::to_string),
                     linked_doc_path: None,
                 },
@@ -383,7 +391,7 @@ impl AgentMemoryState {
                 semantic_score: score * 0.6,
             });
         }
-        Ok(hits)
+        Ok(hits.into_iter().take(limit).collect())
     }
 
     /// Build the memory prefix injected into chat prompts. Must run on a blocking thread.
@@ -399,7 +407,6 @@ impl AgentMemoryState {
         }
 
         let _ = self.ensure_ready();
-        self.observe_user_prompt(session_id, working_dir, query);
 
         let session_context = self
             .session_start(session_id, working_dir, Some(query))
@@ -491,7 +498,9 @@ impl AgentMemoryState {
             "toolOutput": tool_output,
             "isError": is_error,
         });
-        let _ = self.client.observe(hook, session_id, &project, working_dir, data);
+        let cwd = normalize_project_path(working_dir);
+        let cwd_ref = if cwd.is_empty() { working_dir } else { cwd.as_str() };
+        let _ = self.client.observe(hook, session_id, &project, cwd_ref, data);
     }
 
     pub fn observe_user_prompt(
@@ -505,11 +514,13 @@ impl AgentMemoryState {
             return;
         }
         let data = serde_json::json!({ "prompt": prompt });
+        let cwd = normalize_project_path(working_dir);
+        let cwd_ref = if cwd.is_empty() { working_dir } else { cwd.as_str() };
         let _ = self.client.observe(
             "UserPromptSubmit",
             session_id,
             &project,
-            working_dir,
+            cwd_ref,
             data,
         );
     }
@@ -525,9 +536,11 @@ impl AgentMemoryState {
         if project.is_empty() {
             return Ok(None);
         }
+        let cwd = normalize_project_path(working_dir);
+        let cwd_ref = if cwd.is_empty() { working_dir } else { cwd.as_str() };
         let body = self
             .client
-            .session_start(session_id, &project, working_dir, title)?;
+            .session_start(session_id, &project, cwd_ref, title)?;
         Ok(body
             .get("context")
             .and_then(|v| v.as_str())

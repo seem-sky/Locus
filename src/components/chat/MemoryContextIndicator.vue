@@ -2,7 +2,7 @@
 import { computed, ref, watch } from "vue";
 import { Brain } from "lucide";
 import { t } from "../../i18n";
-import { memoryRetrieve } from "../../services/memory";
+import { memoryList, memoryRetrieve } from "../../services/memory";
 import { normalizeAppError } from "../../services/errors";
 import type { MemoryCategory, MemoryRetrieveHit } from "../../types";
 
@@ -55,7 +55,14 @@ async function loadHits() {
   error.value = "";
   try {
     const query = props.queryText?.trim() || "";
-    const nextHits = await memoryRetrieve(workingDir, query, { limit: 12, tokenBudget: 800 });
+    const nextHits = query
+      ? await memoryRetrieve(workingDir, query, { limit: 12, tokenBudget: 800 })
+      : (await memoryList({ workingDir, limit: 12 })).map((entry) => ({
+          entry,
+          score: 1,
+          keywordScore: 0,
+          semanticScore: 0,
+        }));
     if (seq !== loadSeq) return;
     hits.value = nextHits;
   } catch (cause) {
