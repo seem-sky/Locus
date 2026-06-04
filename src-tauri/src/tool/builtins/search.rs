@@ -64,6 +64,26 @@ pub(super) fn grep() -> ToolDef {
                     (resolved, prefix)
                 };
 
+                if let Some((rtk_output, rewrite_meta)) = crate::headroom::try_execute_rtk_grep(
+                    &pattern,
+                    &search_path,
+                    include.as_deref(),
+                    workspace_root,
+                ) {
+                    if let Some(sink) = ctx.execution_meta_sink.as_ref() {
+                        if let Ok(mut slot) = sink.lock() {
+                            *slot = Some(crate::headroom::execution_meta_json(
+                                rewrite_meta,
+                                None,
+                            ));
+                        }
+                    }
+                    return ToolResult {
+                        output: format!("{remap_prefix}{rtk_output}"),
+                        is_error: false,
+                    };
+                }
+
                 let regex = match regex::Regex::new(&pattern) {
                     Ok(r) => r,
                     Err(e) => {
@@ -243,8 +263,35 @@ pub(super) fn grep() -> ToolDef {
                     ));
                 }
 
+                let mut output = format!("{remap_prefix}{}", out.join("\n"));
+                let rewrite_meta = crate::headroom::grep_tool_native_meta(
+                    &pattern,
+                    &search_path,
+                    include.as_deref(),
+                );
+                let compress_meta = if rewrite_meta.rewritten {
+                    None
+                } else {
+                    let (compressed, meta) = crate::headroom::compress_tool_output(
+                        &output,
+                        ctx.llm_model.as_deref(),
+                    );
+                    if meta.compressed {
+                        output = compressed;
+                    }
+                    Some(meta)
+                };
+                if let Some(sink) = ctx.execution_meta_sink.as_ref() {
+                    if let Ok(mut slot) = sink.lock() {
+                        *slot = Some(crate::headroom::execution_meta_json(
+                            rewrite_meta,
+                            compress_meta,
+                        ));
+                    }
+                }
+
                 ToolResult {
-                    output: format!("{remap_prefix}{}", out.join("\n")),
+                    output,
                     is_error: false,
                 }
             })

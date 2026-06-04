@@ -473,6 +473,45 @@ pub async fn agentmemory_start(
 
 
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentMemoryReplayResponse {
+    pub replayed: usize,
+}
+
+#[tauri::command]
+pub async fn agentmemory_replay_session(
+    memory_store: State<'_, Arc<AgentMemoryState>>,
+    session_store: State<'_, Arc<SessionStore>>,
+    workspace: State<'_, Arc<Workspace>>,
+    session_id: String,
+) -> Result<AgentMemoryReplayResponse, AppError> {
+    let memory_store = memory_store.inner().clone();
+    let session_store = session_store.inner().clone();
+    let working_dir = workspace.path.read().await.clone();
+    if working_dir.trim().is_empty() {
+        return Err(AppError::new(
+            "agentmemory.replay.no_workspace",
+            "Select a workspace before replaying observations",
+        ));
+    }
+    let replayed = tauri::async_runtime::spawn_blocking(move || {
+        memory_store.replay_tool_observations_from_session_tree(
+            &session_store,
+            &session_id,
+            &working_dir,
+        )
+    })
+    .await
+    .map_err(|e| {
+        AppError::new(
+            "agentmemory.replay.join_failed",
+            format!("Failed to replay session observations: {}", e),
+        )
+    })??;
+    Ok(AgentMemoryReplayResponse { replayed })
+}
+
 #[tauri::command]
 
 pub async fn agentmemory_stop(

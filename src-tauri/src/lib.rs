@@ -35,8 +35,10 @@ pub mod network;
 pub mod plugin;
 pub mod process_util;
 pub mod prompt;
-mod rtk;
+mod headroom;
 pub mod python_runtime;
+pub mod lua_runtime;
+pub mod rtk_runtime;
 mod session;
 mod tool;
 pub mod unity_bridge;
@@ -414,12 +416,17 @@ pub fn run() {
             if let Ok(resource_dir) = app.path().resource_dir() {
                 process_util::set_managed_git_resource_dir(resource_dir.clone());
                 tool::builtins::codegraph::set_managed_codegraph_resource_dir(resource_dir.clone());
-                rtk::set_managed_rtk_resource_dir(resource_dir.clone());
+                lua_runtime::set_managed_lua_resource_dir(resource_dir.clone());
+                rtk_runtime::set_managed_rtk_resource_dir(resource_dir.clone());
                 crate::agentmemory::resolve::set_managed_agentmemory_resource_dir(resource_dir);
             }
             commands::restore_saved_git_override(&app.handle().clone());
 
             println!("[Locus] data_dir: {:?}", data_dir);
+            headroom::init_headroom_settings(&data_dir);
+            let headroom_proxy_state = Arc::new(headroom::HeadroomProxyState::new());
+            headroom_proxy_state.set_log_dir(data_dir.join("headroom"));
+            headroom::HeadroomProxyState::install_global(headroom_proxy_state.clone());
             startup_for_setup.mark("setup_storage_ready");
 
             let mut loaded_config = AppConfig::load(&data_dir);
@@ -606,6 +613,7 @@ pub fn run() {
             let memory_proposal_drafts: MemoryProposalDraftStore =
                 Arc::new(tokio::sync::Mutex::new(HashMap::new()));
             let memory_store = Arc::new(crate::agentmemory::AgentMemoryState::new());
+            let headroom_proxy_for_startup = headroom_proxy_state.clone();
 
             let undo_manager: UndoManagerHandle = Arc::new(vcs::UndoManager::new(vcs::GitProvider));
             let view_automation_store = Arc::new(view::ViewAutomationStore::default());
@@ -915,6 +923,7 @@ pub fn run() {
             memory_store.set_export_root(data_dir.join("agentmemory"));
             let memory_store_for_startup = memory_store.clone();
             app.manage(memory_store);
+            app.manage(headroom_proxy_state);
             app.manage(undo_manager);
             app.manage(view_automation_store);
             app.manage(tool_permission_mode);
@@ -932,6 +941,13 @@ pub fn run() {
                     Ok(()) => eprintln!("[Locus] agentmemory service ready"),
                     Err(error) => eprintln!(
                         "[Locus] warning: agentmemory autostart skipped or failed: {}",
+                        error
+                    ),
+                }
+                match headroom_proxy_for_startup.ensure_ready() {
+                    Ok(()) => {}
+                    Err(error) => eprintln!(
+                        "[Locus] warning: headroom proxy autostart skipped or failed: {}",
                         error
                     ),
                 }
@@ -1099,6 +1115,7 @@ pub fn run() {
             commands::agentmemory_status,
             commands::agentmemory_start,
             commands::agentmemory_stop,
+            commands::agentmemory_replay_session,
             commands::agentmemory_action_list,
             commands::agentmemory_action_create,
             commands::agentmemory_action_update,
@@ -1326,6 +1343,8 @@ pub fn run() {
             commands::set_view_open_in_existing_window,
             commands::get_proxy_status,
             commands::save_proxy_config,
+            commands::get_headroom_settings_status,
+            commands::save_headroom_settings,
             commands::get_python_runtime_state,
             commands::save_python_runtime_selection,
             commands::send_system_notification,

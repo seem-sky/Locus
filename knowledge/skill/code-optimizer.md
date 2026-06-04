@@ -67,10 +67,10 @@ argumentHint: "[path|symbol|scope] [--focus performance|readability|memory|all]"
 5. **实施**
    - 按方案编辑；跨文件/公共 API 改动前再次 `codegraph_impact`
    - Unity：Play Mode 下不用 `unity_execute` 改场景；改 `.cs` 后注意编译与 domain reload
-   - Locus 前端/Rust：遵循仓库脚本（优先 `rtk` 前缀命令）
+   - Locus 前端/Rust：遵循仓库脚本（`cargo test`、`vitest run` 等普通命令，Locus 经 Headroom 自动优化）
 
 6. **验证（必须）**
-   - 运行与范围匹配的命令，例如：`rtk cargo test`、`rtk vitest run …`、Unity Profiler / `view_console_read`
+   - 运行与范围匹配的命令，例如：`cargo test`、`vitest run …`、Unity Profiler / `view_console_read`
    - 对比优化前后：测试通过、指标改善或「无劣化」的说明
    - 未完成验证不得声称「已优化完成」
 
@@ -103,7 +103,7 @@ argumentHint: "[path|symbol|scope] [--focus performance|readability|memory|all]"
 | 场景 | 建议 |
 |------|------|
 | 查调用链、改公共符号 | CodeGraph impact / trace |
-| Rust / TS 测试 | `rtk cargo test`、`rtk vitest run` |
+| Rust / TS 测试 | `cargo test`、`vitest run` |
 | Lua / Unity C# 热路径 | Profiler、`unity_execute` 探针、避免 Update 内分配 |
 | 仅文档/配置 | 说明无需代码优化或只做文案精简 |
 

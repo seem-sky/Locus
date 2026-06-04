@@ -19,7 +19,7 @@ import { useNotificationStore } from "../stores/notification";
 import { useProjectStore } from "../stores/project";
 import { traceToolBlockLayoutChange } from "../services/layoutDiagnostics";
 import { resolveViewToolOpenId } from "./viewToolCallActions";
-import { resolveRtkDisplayForToolCall } from "../composables/rtkExecutionMeta";
+import { resolveHeadroomDisplayForToolCall } from "../composables/headroomExecutionMeta";
 import { resolveToolCallDisplayShape } from "../composables/toolCallBatches";
 
 import type { ToolCallDisplay, FileDiffPayload } from "../types";
@@ -82,15 +82,20 @@ const showRecompileHint = computed(() =>
   && props.toolCall.status === "running"
   && !unityBackgroundHookSolved.value,
 );
-const rtkDisplay = computed(() => resolveRtkDisplayForToolCall(props.toolCall));
-const rtkStatusLabel = computed(() => {
-  if (!rtkDisplay.value) return "";
-  switch (rtkDisplay.value.status) {
-    case "rewritten": return t("tool.rtk.status.rewritten");
-    case "passthrough": return t("tool.rtk.status.passthrough");
-    case "unavailable": return t("tool.rtk.status.unavailable");
-    case "disabled": return t("tool.rtk.status.disabled");
+const headroomDisplay = computed(() => resolveHeadroomDisplayForToolCall(props.toolCall));
+const headroomStatusLabel = computed(() => {
+  if (!headroomDisplay.value) return "";
+  switch (headroomDisplay.value.rewriteStatus) {
+    case "rewritten": return t("tool.headroom.status.rewritten");
+    case "passthrough": return t("tool.headroom.status.passthrough");
+    case "unavailable": return t("tool.headroom.status.unavailable");
+    case "disabled": return t("tool.headroom.status.disabled");
   }
+});
+const headroomCompressLabel = computed(() => {
+  const compress = headroomDisplay.value?.compress;
+  if (!compress?.compressed || compress.tokensSaved == null) return "";
+  return t("tool.headroom.compress.saved", String(compress.tokensSaved));
 });
 const toolBlockOverride = computed(() => resolveToolBlockOverride(props.toolCall.name));
 const toolLayoutKey = computed(() => props.toolCall.id || props.toolCall.name);
@@ -490,15 +495,16 @@ const highlightedOutput = computed(() => {
         </span>
         <span class="tool-call-name">{{ displayName }}</span>
         <span
-          v-if="rtkDisplay"
+          v-if="headroomDisplay"
           class="tool-call-rtk-inline"
-          :title="rtkStatusLabel"
+          :title="headroomStatusLabel"
         >
           <span
             class="tool-call-rtk-badge"
-            :class="`status-${rtkDisplay.status}`"
-          >RTK</span>
-          <span class="tool-call-rtk-status-text">{{ rtkStatusLabel }}</span>
+            :class="`status-${headroomDisplay.rewriteStatus}`"
+          >Headroom</span>
+          <span class="tool-call-rtk-status-text">{{ headroomStatusLabel }}</span>
+          <span v-if="headroomCompressLabel" class="tool-call-rtk-status-text">{{ headroomCompressLabel }}</span>
         </span>
         <span v-if="argsSummary" class="tool-call-summary">{{ argsSummary }}</span>
       </button>
@@ -532,19 +538,20 @@ const highlightedOutput = computed(() => {
       <div class="recompile-hint-sub">{{ t("tool.recompile.sub") }}</div>
     </div>
     <div v-if="expanded" class="tool-call-detail">
-      <div v-if="rtkDisplay" class="tool-call-section tool-call-rtk-section">
-        <div class="tool-call-section-label">{{ t("tool.rtk.section") }}</div>
-        <div class="tool-call-rtk-panel" :class="`status-${rtkDisplay.status}`">
-          <div class="tool-call-rtk-status">{{ rtkStatusLabel }}</div>
-          <div v-if="rtkDisplay.executedCommand && rtkDisplay.status === 'rewritten'" class="tool-call-rtk-command">
-            <span class="tool-call-rtk-command-label">{{ t("tool.rtk.original") }}</span>
-            <code class="tool-call-rtk-command-value ui-select-text">{{ rtkDisplay.originalCommand }}</code>
-            <span class="tool-call-rtk-command-label">{{ t("tool.rtk.executed") }}</span>
-            <code class="tool-call-rtk-command-value ui-select-text">{{ rtkDisplay.executedCommand }}</code>
+      <div v-if="headroomDisplay" class="tool-call-section tool-call-rtk-section">
+        <div class="tool-call-section-label">{{ t("tool.headroom.section") }}</div>
+        <div class="tool-call-rtk-panel" :class="`status-${headroomDisplay.rewriteStatus}`">
+          <div class="tool-call-rtk-status">{{ headroomStatusLabel }}</div>
+          <div v-if="headroomCompressLabel" class="tool-call-rtk-status">{{ headroomCompressLabel }}</div>
+          <div v-if="headroomDisplay.executedCommand && headroomDisplay.rewriteStatus === 'rewritten'" class="tool-call-rtk-command">
+            <span class="tool-call-rtk-command-label">{{ t("tool.headroom.original") }}</span>
+            <code class="tool-call-rtk-command-value ui-select-text">{{ headroomDisplay.originalCommand }}</code>
+            <span class="tool-call-rtk-command-label">{{ t("tool.headroom.executed") }}</span>
+            <code class="tool-call-rtk-command-value ui-select-text">{{ headroomDisplay.executedCommand }}</code>
           </div>
-          <div v-else-if="rtkDisplay.originalCommand" class="tool-call-rtk-command">
-            <span class="tool-call-rtk-command-label">{{ t("tool.rtk.command") }}</span>
-            <code class="tool-call-rtk-command-value ui-select-text">{{ rtkDisplay.originalCommand }}</code>
+          <div v-else-if="headroomDisplay.originalCommand" class="tool-call-rtk-command">
+            <span class="tool-call-rtk-command-label">{{ t("tool.headroom.command") }}</span>
+            <code class="tool-call-rtk-command-value ui-select-text">{{ headroomDisplay.originalCommand }}</code>
           </div>
         </div>
       </div>

@@ -1703,6 +1703,57 @@ namespace Locus
                         return OkResponse(reqId, result);
                     }
 
+                    case "lua_gc_monitor_start":
+                    {
+                        var tcs = new TaskCompletionSource<PipeEnvelope>();
+                        PostToMainThread(delegate
+                        {
+                            try
+                            {
+                                tcs.SetResult(HandleLuaGcMonitorStart(reqId, msg.message));
+                            }
+                            catch (Exception ex)
+                            {
+                                tcs.SetResult(ErrorResponse(reqId, ex.Message));
+                            }
+                        });
+                        return await tcs.Task;
+                    }
+
+                    case "lua_gc_monitor_stop":
+                    {
+                        var tcs = new TaskCompletionSource<PipeEnvelope>();
+                        PostToMainThread(delegate
+                        {
+                            try
+                            {
+                                tcs.SetResult(HandleLuaGcMonitorStop(reqId, msg.message));
+                            }
+                            catch (Exception ex)
+                            {
+                                tcs.SetResult(ErrorResponse(reqId, ex.Message));
+                            }
+                        });
+                        return await tcs.Task;
+                    }
+
+                    case "lua_gc_monitor_status":
+                    {
+                        var tcs = new TaskCompletionSource<PipeEnvelope>();
+                        PostToMainThread(delegate
+                        {
+                            try
+                            {
+                                tcs.SetResult(HandleLuaGcMonitorStatus(reqId));
+                            }
+                            catch (Exception ex)
+                            {
+                                tcs.SetResult(ErrorResponse(reqId, ex.Message));
+                            }
+                        });
+                        return await tcs.Task;
+                    }
+
                     default:
                         return ErrorResponse(reqId, "unknown message type: " + (msg.type ?? ""));
                 }

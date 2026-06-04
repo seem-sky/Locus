@@ -361,14 +361,16 @@ describe("reduceStreamEvent", () => {
       });
     });
 
-    it("attaches RTK execution meta to bash tool calls", () => {
+    it("attaches Headroom execution meta to bash tool calls", () => {
       const executionMeta = {
-        rtk: {
-          enabled: true,
-          available: true,
-          rewritten: true,
-          originalCommand: "git status",
-          executedCommand: "rtk git status",
+        headroom: {
+          rewrite: {
+            enabled: true,
+            available: true,
+            rewritten: true,
+            originalCommand: "git status",
+            executedCommand: "rtk git status",
+          },
         },
       };
       const state = makeState({
@@ -399,7 +401,7 @@ describe("reduceStreamEvent", () => {
       });
     });
 
-    it("falls back to RTK progress payload when executionMeta is missing", () => {
+    it("falls back to Headroom progress payload when executionMeta is missing", () => {
       const progressMeta = {
         enabled: true,
         available: true,
@@ -415,9 +417,9 @@ describe("reduceStreamEvent", () => {
           arguments: "{}",
           status: "running",
           progress: {
-            title: "RTK",
+            title: "Headroom",
             info: JSON.stringify(progressMeta),
-            state: "rtk",
+            state: "headroom",
           },
         }],
       });

@@ -28,6 +28,7 @@ pub struct ToolExecutionContext {
     pub unity_connected: Option<bool>,
     pub runtime_state: Option<Arc<ToolRuntimeState>>,
     pub execution_meta_sink: Option<Arc<Mutex<Option<serde_json::Value>>>>,
+    pub llm_model: Option<String>,
 }
 
 impl ToolExecutionContext {
@@ -535,6 +536,7 @@ mod tests {
             unity_connected: Some(true),
             runtime_state: Some(Arc::new(ToolRuntimeState::default())),
             execution_meta_sink: None,
+            llm_model: None,
         };
 
         assert!(context.should_redirect_unity_asset_read("Assets/Test/MyAsset.asset"));
@@ -551,6 +553,7 @@ mod tests {
             unity_connected: Some(false),
             runtime_state: Some(Arc::new(ToolRuntimeState::default())),
             execution_meta_sink: None,
+            llm_model: None,
         };
         assert!(!disconnected.should_redirect_unity_asset_read("Assets/Test/MyAsset.asset"));
 
@@ -561,6 +564,7 @@ mod tests {
             unity_connected: Some(true),
             runtime_state: Some(Arc::new(ToolRuntimeState::default())),
             execution_meta_sink: None,
+            llm_model: None,
         };
         assert!(!connected.should_redirect_unity_asset_read("src/main.rs"));
     }

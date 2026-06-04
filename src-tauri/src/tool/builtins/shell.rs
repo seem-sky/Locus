@@ -79,11 +79,14 @@ pub(super) fn bash() -> ToolDef {
                     }
                 };
                 let workdir_path = workdir.as_deref().map(std::path::Path::new);
-                let rtk_meta = crate::rtk::rewrite_bash_with_meta(&command, workdir_path);
-                let execution_meta = serde_json::json!({ "rtk": rtk_meta.to_json() });
+                let rewrite_meta =
+                    crate::headroom::rewrite_bash_with_meta(&command, workdir_path);
                 if let Some(sink) = ctx.execution_meta_sink.as_ref() {
                     if let Ok(mut slot) = sink.lock() {
-                        *slot = Some(execution_meta);
+                        *slot = Some(crate::headroom::execution_meta_json(
+                            rewrite_meta.clone(),
+                            None,
+                        ));
                     }
                 }
                 let _desc = args
@@ -107,8 +110,9 @@ pub(super) fn bash() -> ToolDef {
                         };
                     }
                 }
+                let lua = crate::lua_runtime::resolve_bundled_lua();
 
-                let rewritten_command = rtk_meta
+                let rewritten_command = rewrite_meta
                     .executed_command
                     .clone()
                     .unwrap_or_else(|| command.clone());
@@ -129,15 +133,16 @@ pub(super) fn bash() -> ToolDef {
                     }
                 }
                 let sh_command = || {
+                    let mut prefix = String::new();
                     if let Some(ref python) = python {
-                        format!(
-                            "{}{}",
-                            crate::python_runtime::sh_python_function_prefix(&python.path),
-                            rewritten_command
-                        )
-                    } else {
-                        rewritten_command.clone()
+                        prefix.push_str(&crate::python_runtime::sh_python_function_prefix(
+                            &python.path,
+                        ));
                     }
+                    if let Some(ref lua) = lua {
+                        prefix.push_str(&crate::lua_runtime::sh_lua_function_prefix(lua));
+                    }
+                    format!("{}{}", prefix, rewritten_command)
                 };
 
                 let mut cmd = if cfg!(target_os = "windows") {
@@ -197,9 +202,12 @@ pub(super) fn bash() -> ToolDef {
 
                 let mut path = augment_path_with_git(std::env::var_os("PATH"))
                     .or_else(|| std::env::var_os("PATH"));
-                path = crate::rtk::augment_path_with_rtk(path);
+                path = crate::headroom::augment_path_with_headroom_rtk(path);
                 if let Some(ref python) = python {
                     path = crate::python_runtime::prepend_python_to_path(path, &python.path);
+                }
+                if let Some(ref lua) = lua {
+                    path = crate::lua_runtime::prepend_lua_to_path(path, lua);
                 }
                 if let Some(path) = path {
                     cmd.env("PATH", path);
@@ -215,6 +223,8 @@ pub(super) fn bash() -> ToolDef {
                 )
                 .await;
 
+                let llm_model = ctx.llm_model.clone();
+
                 match result {
                     Ok(Ok(output)) => {
                         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -223,6 +233,50 @@ pub(super) fn bash() -> ToolDef {
                         let mut out = String::new();
                         out.push_str(&stdout);
                         out.push_str(&stderr);
+
+                        let rewrite_for_compress = rewrite_meta.clone();
+                        let (compressed_out, compress_meta) = tokio::task::spawn_blocking({
+                            let out = out.clone();
+                            let model = llm_model.clone();
+                            let rewrite = rewrite_for_compress;
+                            move || {
+                                crate::headroom::compress_bash_output(
+                                    &out,
+                                    model.as_deref(),
+                                    &rewrite,
+                                )
+                            }
+                        })
+                        .await
+                        .unwrap_or_else(|error| {
+                            (
+                                out.clone(),
+                                Some(crate::headroom::HeadroomCompressMeta {
+                                    enabled: crate::headroom::enabled(),
+                                    available: false,
+                                    compressed: false,
+                                    original_chars: out.chars().count(),
+                                    compressed_chars: None,
+                                    tokens_before: None,
+                                    tokens_after: None,
+                                    tokens_saved: None,
+                                    compression_ratio: None,
+                                    transforms_applied: Vec::new(),
+                                    ccr_hashes: Vec::new(),
+                                    error: Some(error.to_string()),
+                                }),
+                            )
+                        });
+                        out = compressed_out;
+
+                        if let Some(sink) = ctx.execution_meta_sink.as_ref() {
+                            if let Ok(mut slot) = sink.lock() {
+                                *slot = Some(crate::headroom::execution_meta_json(
+                                    rewrite_meta.clone(),
+                                    compress_meta,
+                                ));
+                            }
+                        }
 
                         if out.len() > 50_000 {
                             let total_bytes = out.len();

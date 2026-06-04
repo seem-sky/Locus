@@ -37,9 +37,12 @@ src-tauri/gen/codegraph-bundle/manifest.json
 src-tauri/gen/agentmemory-bundle/node_modules/
 src-tauri/gen/agentmemory-bundle/bin/
 src-tauri/gen/agentmemory-bundle/manifest.json
+src-tauri/gen/headroom-bundle/node_modules/
+src-tauri/gen/headroom-bundle/manifest.json
 src-tauri/gen/rtk/rtk.exe
 src-tauri/gen/rtk/rtk
 src-tauri/gen/rtk/manifest.json
+src-tauri/data/state_store.db/
 
 # Editor directories and files
 .vscode/

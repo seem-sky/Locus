@@ -19,7 +19,7 @@ export interface SessionSummary {
 
 export type ServerToolKind = "web_search";
 
-export interface RtkRewriteMeta {
+export interface HeadroomRewriteMeta {
   enabled: boolean;
   available: boolean;
   rewritten: boolean;
@@ -27,7 +27,32 @@ export interface RtkRewriteMeta {
   executedCommand?: string;
 }
 
+export interface HeadroomCompressMeta {
+  enabled: boolean;
+  available: boolean;
+  compressed: boolean;
+  originalChars: number;
+  compressedChars?: number;
+  tokensBefore?: number;
+  tokensAfter?: number;
+  tokensSaved?: number;
+  compressionRatio?: number;
+  transformsApplied?: string[];
+  ccrHashes?: string[];
+  error?: string;
+}
+
+export interface HeadroomExecutionMetaPayload {
+  rewrite: HeadroomRewriteMeta;
+  compress?: HeadroomCompressMeta;
+}
+
+/** @deprecated Legacy RTK-only meta shape */
+export interface RtkRewriteMeta extends HeadroomRewriteMeta {}
+
 export interface ToolExecutionMeta {
+  headroom?: HeadroomExecutionMetaPayload;
+  /** @deprecated Legacy RTK meta */
   rtk?: RtkRewriteMeta;
 }
 
@@ -529,6 +554,21 @@ export interface ProxyStatus {
   manual: ProxyEnvironmentEntry[];
   system: SystemProxyConfig;
   routes: ProxyRoute[];
+}
+
+export interface HeadroomSettings {
+  enabled: boolean;
+  contextCompressEnabled: boolean;
+  baseUrl: string;
+  apiKey: string;
+  rtkPath: string;
+  minCompressChars: number;
+}
+
+export interface HeadroomSettingsStatus {
+  settings: HeadroomSettings;
+  libraryAvailable: boolean;
+  contextLibraryAvailable: boolean;
 }
 
 export interface AuthUrlInfo {

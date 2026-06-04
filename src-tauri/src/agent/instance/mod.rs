@@ -2487,7 +2487,7 @@ impl AgentInstance {
         let memory_store: tauri::State<'_, std::sync::Arc<crate::agentmemory::AgentMemoryState>> =
             app_handle.state();
         let memory_store = memory_store.inner().clone();
-        let session_id = self.session_id.clone();
+        let session_id = self.agentmemory_session_id().to_string();
         let working_dir = self.working_dir.clone();
         let tool_name = tool_name.to_string();
         let tool_input = tool_input.clone();
@@ -3099,7 +3099,7 @@ impl AgentInstance {
             std::sync::Arc<crate::agentmemory::AgentMemoryState>,
         > = app_handle.state();
         let memory_store = memory_store.inner().clone();
-        let session_id = self.session_id.clone();
+        let session_id = self.agentmemory_session_id().to_string();
         let working_dir = self.working_dir.clone();
         let tool_name = tool_name.to_string();
         let args = args.clone();
@@ -3155,6 +3155,7 @@ impl AgentInstance {
             unity_connected,
             runtime_state: Some(self.tool_runtime_state.clone()),
             execution_meta_sink: Some(Arc::new(Mutex::new(None))),
+            llm_model: Some(self.effective_model.clone()),
         }
     }
 
@@ -6048,8 +6049,55 @@ impl AgentInstance {
             messages.len()
         );
 
+        let messages_for_compact = if crate::headroom::context_library_available() {
+            let system_parts_owned: Vec<String> =
+                system_parts.iter().map(|part| (*part).to_string()).collect();
+            let model_for_headroom = self.effective_model.clone();
+            let messages_clone = messages.clone();
+            match tokio::task::spawn_blocking(move || {
+                let refs: Vec<&str> = system_parts_owned.iter().map(String::as_str).collect();
+                crate::headroom::compress_chat_messages(
+                    &refs,
+                    &messages_clone,
+                    Some(&model_for_headroom),
+                )
+            })
+            .await
+            {
+                Ok((compressed, meta)) => {
+                    if meta.compressed {
+                        eprintln!(
+                            "[Agent {}] headroom compact-request compress: tokens_before={:?} tokens_after={:?} tokens_saved={:?}",
+                            self.id,
+                            meta.tokens_before,
+                            meta.tokens_after,
+                            meta.tokens_saved,
+                        );
+                        compressed
+                    } else {
+                        if let Some(error) = meta.error {
+                            eprintln!(
+                                "[Agent {}] headroom compact-request compress skipped: {}",
+                                self.id, error
+                            );
+                        }
+                        messages.clone()
+                    }
+                }
+                Err(error) => {
+                    eprintln!(
+                        "[Agent {}] headroom compact-request compress task failed: {}",
+                        self.id, error
+                    );
+                    messages.clone()
+                }
+            }
+        } else {
+            messages.clone()
+        };
+
         let mut compact_plan = match compact::build_compact_request_with_budget(
-            &messages,
+            &messages_for_compact,
             system_parts,
             context_limit,
         ) {
@@ -6348,7 +6396,7 @@ impl AgentInstance {
                 std::sync::Arc<crate::agentmemory::AgentMemoryState>,
             > = app_handle.state();
             let memory_store = memory_store.inner().clone();
-            let session_id = self.session_id.clone();
+            let session_id = self.agentmemory_session_id().to_string();
             let working_dir = self.working_dir.clone();
             if let Ok(Some(context)) = tauri::async_runtime::spawn_blocking(move || {
                 memory_store.fetch_compact_context(&session_id, &working_dir, 1500)
@@ -7181,7 +7229,7 @@ impl AgentInstance {
                     std::sync::Arc<crate::agentmemory::AgentMemoryState>,
                 > = app_handle.state();
                 let memory_store = memory_store.inner().clone();
-                let session_id = self.session_id.clone();
+                let session_id = self.agentmemory_session_id().to_string();
                 let working_dir = self.working_dir.clone();
                 let title = user_text.trim().to_string();
                 let title_opt = if title.is_empty() { None } else { Some(title) };
@@ -7421,7 +7469,7 @@ impl AgentInstance {
                 std::sync::Arc<crate::agentmemory::AgentMemoryState>,
             > = app_handle.state();
             let memory_store = memory_store.inner().clone();
-            let session_id = self.session_id.clone();
+            let session_id = self.agentmemory_session_id().to_string();
             let working_dir = self.working_dir.clone();
             let prompt = actual_user_text.clone();
             let _ = tauri::async_runtime::spawn_blocking(move || {
@@ -7573,7 +7621,7 @@ impl AgentInstance {
             } else {
                 model_context_limit(&self.effective_model)
             };
-            let prepared_messages = compact::prepare_messages_for_llm(&messages);
+            let mut prepared_messages = compact::prepare_messages_for_llm(&messages);
             let active_skill_tool_names = self.active_skill_tool_names(&selected_skill_tool_names);
             let request_tools = self
                 .build_request_tool_names_for_mode_and_skills(
@@ -7583,7 +7631,7 @@ impl AgentInstance {
                 )
                 .await;
             let api_tools = self.build_api_tools(&request_tools).await;
-            let estimated_input_tokens =
+            let mut estimated_input_tokens =
                 compact::estimate_request_tokens(&system_parts, &prepared_messages, &api_tools);
             let is_codex_backend = matches!(self.backend, LlmBackend::OpenAiCodex { .. });
             let should_preflight_compact = if is_codex_backend {
@@ -7593,9 +7641,64 @@ impl AgentInstance {
             };
             let mut preflight_compact_error: Option<String> = None;
 
-            if !compact_tracker.is_circuit_broken()
-                && should_preflight_compact
-            {
+            if !compact_tracker.is_circuit_broken() && should_preflight_compact {
+                if crate::headroom::context_library_available() {
+                    let system_parts_for_headroom: Vec<String> =
+                        system_parts.iter().map(|part| (*part).to_string()).collect();
+                    let model_for_headroom = self.effective_model.clone();
+                    let messages_for_headroom = prepared_messages.clone();
+                    match tokio::task::spawn_blocking(move || {
+                        let refs: Vec<&str> = system_parts_for_headroom
+                            .iter()
+                            .map(String::as_str)
+                            .collect();
+                        crate::headroom::compress_chat_messages(
+                            &refs,
+                            &messages_for_headroom,
+                            Some(&model_for_headroom),
+                        )
+                    })
+                    .await
+                    {
+                        Ok((compressed, meta)) => {
+                            if meta.compressed {
+                                eprintln!(
+                                    "[Agent {}] headroom context compress: tokens_before={:?} tokens_after={:?} tokens_saved={:?} ratio={:?}",
+                                    self.id,
+                                    meta.tokens_before,
+                                    meta.tokens_after,
+                                    meta.tokens_saved,
+                                    meta.compression_ratio,
+                                );
+                                prepared_messages = compressed;
+                                estimated_input_tokens = compact::estimate_request_tokens(
+                                    &system_parts,
+                                    &prepared_messages,
+                                    &api_tools,
+                                );
+                            } else if let Some(error) = meta.error {
+                                eprintln!(
+                                    "[Agent {}] headroom context compress unavailable: {}",
+                                    self.id, error
+                                );
+                            }
+                        }
+                        Err(error) => {
+                            eprintln!(
+                                "[Agent {}] headroom context compress task failed: {}",
+                                self.id, error
+                            );
+                        }
+                    }
+                }
+
+                let should_still_preflight_compact = if is_codex_backend {
+                    compact::should_codex_auto_compact(estimated_input_tokens, ctx_limit)
+                } else {
+                    compact::should_auto_compact(estimated_input_tokens, ctx_limit)
+                };
+
+                if should_still_preflight_compact {
                 eprintln!(
                     "[Agent {}] preflight auto-compact candidate: estimated_tokens={}, limit={}, messages={} -> {}",
                     self.id,
@@ -7629,6 +7732,7 @@ impl AgentInstance {
                         eprintln!("[Agent {}] preflight auto-compact failed: {}", self.id, e);
                         preflight_compact_error = Some(e);
                     }
+                }
                 }
             }
 
@@ -8168,6 +8272,18 @@ impl AgentInstance {
                         images: None,
                         execution_meta: tc.execution_meta.clone(),
                     });
+                    if self.has_selected_working_dir() {
+                        let args_value = serde_json::from_str::<serde_json::Value>(&tc.arguments)
+                            .unwrap_or_else(|_| serde_json::json!({ "raw": tc.arguments }));
+                        self.spawn_agentmemory_observe_tool_use(
+                            app_handle,
+                            &tc.name,
+                            &args_value,
+                            output,
+                            false,
+                        )
+                        .await;
+                    }
                     if let Some(ref parent) = self.parent_tool_call {
                         emit_parent_stream(
                             app_handle,
@@ -8366,7 +8482,7 @@ impl AgentInstance {
                         std::sync::Arc<crate::agentmemory::AgentMemoryState>,
                     > = app_handle.state();
                     let memory_store = memory_store.inner().clone();
-                    let session_id = self.session_id.clone();
+                    let session_id = self.agentmemory_session_id().to_string();
                     let working_dir = self.working_dir.clone();
                     for (tc, args) in &prepared {
                         let memory_store = memory_store.clone();
@@ -9034,7 +9150,17 @@ impl AgentInstance {
             let memory_store = memory_store.inner().clone();
             let session_id = self.session_id.clone();
             let working_dir = self.working_dir.clone();
+            let store = store.clone();
             match tauri::async_runtime::spawn_blocking(move || {
+                if let Err(error) = memory_store.replay_tool_observations_from_session_tree(
+                    &store,
+                    &session_id,
+                    &working_dir,
+                ) {
+                    eprintln!(
+                        "[agentmemory] replay tool observations failed for session {session_id}: {error}"
+                    );
+                }
                 memory_store.session_end(&session_id, Some(&working_dir))
             })
             .await
@@ -9277,6 +9403,15 @@ impl AgentInstance {
                 run_id: run_id.to_string(),
             },
         }
+    }
+
+    /// Agentmemory timeline/enrich/observe targets the parent chat session when this
+    /// instance is a Task subagent (tools run on a child session id in Locus DB).
+    fn agentmemory_session_id(&self) -> &str {
+        self.parent_tool_call
+            .as_ref()
+            .map(|parent| parent.session_id.as_str())
+            .unwrap_or(self.session_id.as_str())
     }
 
     fn permission_confirm_reason(
@@ -9842,17 +9977,18 @@ impl AgentInstance {
                         .get("workdir")
                         .and_then(|v| v.as_str())
                         .map(std::path::Path::new);
-                    let rtk_meta = crate::rtk::rewrite_bash_with_meta(command, workdir);
+                    let rewrite_meta =
+                        crate::headroom::rewrite_bash_with_meta(command, workdir);
                     emit_stream(
                         app_handle,
                         run_id,
                         StreamEvent::ToolCallProgress {
                             session_id: self.session_id.clone(),
                             tool_call_id: tc.id.clone(),
-                            title: "RTK".to_string(),
-                            info: crate::rtk::progress_info(&rtk_meta),
+                            title: "Headroom".to_string(),
+                            info: crate::headroom::progress_info(&rewrite_meta),
                             progress: None,
-                            state: "rtk".to_string(),
+                            state: "headroom".to_string(),
                         },
                     );
                 }
@@ -10058,17 +10194,18 @@ impl AgentInstance {
                         .get("workdir")
                         .and_then(|v| v.as_str())
                         .map(std::path::Path::new);
-                    let rtk_meta = crate::rtk::rewrite_bash_with_meta(command, workdir);
+                    let rewrite_meta =
+                        crate::headroom::rewrite_bash_with_meta(command, workdir);
                     emit_stream(
                         app_handle,
                         run_id,
                         StreamEvent::ToolCallProgress {
                             session_id: self.session_id.clone(),
                             tool_call_id: tc.id.clone(),
-                            title: "RTK".to_string(),
-                            info: crate::rtk::progress_info(&rtk_meta),
+                            title: "Headroom".to_string(),
+                            info: crate::headroom::progress_info(&rewrite_meta),
                             progress: None,
-                            state: "rtk".to_string(),
+                            state: "headroom".to_string(),
                         },
                     );
                 }
@@ -14335,6 +14472,20 @@ mod tests {
     }
 
     #[test]
+    fn agentmemory_session_id_uses_parent_for_subagents() {
+        let mut agent = test_agent_instance(String::new());
+        assert_eq!(agent.agentmemory_session_id(), "session-test");
+
+        agent.parent_tool_call = Some(ParentToolCall::new(
+            "parent-session".to_string(),
+            "parent-run".to_string(),
+            "task-1".to_string(),
+        ));
+        assert_eq!(agent.agentmemory_session_id(), "parent-session");
+        assert_eq!(agent.session_id, "session-test");
+    }
+
+    #[test]
     fn finalize_tool_call_record_preserves_nested_subagent_history() {
         let tool_call = ToolCallInfo {
             id: "task-1".to_string(),
@@ -16166,6 +16317,7 @@ Audit and export a plugin.
             None,
             HashMap::new(),
             cancel_rx,
+            None,
         );
 
         assert_eq!(
@@ -16209,6 +16361,7 @@ Audit and export a plugin.
             .build_request_tool_names_for_mode_and_skills(
                 crate::config::DynamicToolLoadingMode::MetaTool,
                 &active_skill_tool_names,
+                Some("build"),
             )
             .await;
         assert!(request_tool_names.contains(&"plugin_export".to_string()));

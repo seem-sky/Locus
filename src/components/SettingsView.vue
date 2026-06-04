@@ -17,6 +17,7 @@ import ShortcutSettings from "./settings/ShortcutSettings.vue";
 import ConsoleSettings from "./settings/ConsoleSettings.vue";
 import AboutSettings from "./settings/AboutSettings.vue";
 import ProxySettings from "./settings/ProxySettings.vue";
+import HeadroomSettings from "./settings/HeadroomSettings.vue";
 import ApiProviders from "./settings/ApiProviders.vue";
 import CustomEndpointModal from "./settings/CustomEndpointModal.vue";
 import ModelDefaultsPanel from "./settings/ModelDefaults.vue";
@@ -190,6 +191,16 @@ watch(
         </button>
         <button
           class="sidebar-item"
+          :class="{ active: activeCategory === 'headroom' }"
+          @click="activeCategory = 'headroom'"
+        >
+          <svg viewBox="0 0 16 16" fill="currentColor" width="14" height="14">
+            <path d="M3.5 2A1.5 1.5 0 0 0 2 3.5v9A1.5 1.5 0 0 0 3.5 14h9a1.5 1.5 0 0 0 1.5-1.5v-9A1.5 1.5 0 0 0 12.5 2h-9zM3 3.5a.5.5 0 0 1 .5-.5h9a.5.5 0 0 1 .5.5v9a.5.5 0 0 1-.5.5h-9a.5.5 0 0 1-.5-.5v-9zm2 2.25a.75.75 0 0 0 0 1.5h6a.75.75 0 0 0 0-1.5H5zm0 3a.75.75 0 0 0 0 1.5h4a.75.75 0 0 0 0-1.5H5z"/>
+          </svg>
+          <span>{{ t("settings.tab.headroom") }}</span>
+        </button>
+        <button
+          class="sidebar-item"
           :class="{ active: activeCategory === 'archived' }"
           @click="activeCategory = 'archived'"
         >
@@ -323,6 +334,10 @@ watch(
 
       <template v-if="activeCategory === 'proxy'">
         <ProxySettings />
+      </template>
+
+      <template v-if="activeCategory === 'headroom'">
+        <HeadroomSettings />
       </template>
 
       <template v-if="activeCategory === 'display'">

@@ -453,7 +453,26 @@ impl GitProvider {
     ) -> Result<(), String> {
         let restore_targets = Self::collect_restore_targets(files);
 
+        for file in files {
+            if matches!(file.status.as_str(), "A" | "R") {
+                Self::remove_worktree_path(working_dir, &file.path).await?;
+                if let Some(old_path) = &file.old_path {
+                    Self::remove_worktree_path(working_dir, old_path).await?;
+                }
+            }
+        }
+
         for path in &restore_targets {
+            if files.iter().any(|file| {
+                matches!(file.status.as_str(), "A" | "R")
+                    && (file.path.replace('\\', "/") == *path
+                        || file
+                            .old_path
+                            .as_ref()
+                            .is_some_and(|old| old.replace('\\', "/") == *path))
+            }) {
+                continue;
+            }
             Self::restore_worktree_path_to_tree(working_dir, checkpoint_id, path).await?;
         }
 

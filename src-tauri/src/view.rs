@@ -6630,9 +6630,11 @@ mod tests {
         assert_eq!(summary.package_rel_path, "Tools/material-inspector");
 
         let resolved = view_package_root(&working_dir, "material-inspector").expect("resolve view");
+        let resolved_path = dunce::canonicalize(&resolved).unwrap_or(resolved);
+        let expected_path = dunce::canonicalize(&root).unwrap_or(root);
         assert_eq!(
-            resolved.display().to_string().replace('\\', "/"),
-            root.display().to_string().replace('\\', "/")
+            resolved_path.display().to_string().replace('\\', "/"),
+            expected_path.display().to_string().replace('\\', "/")
         );
     }
 

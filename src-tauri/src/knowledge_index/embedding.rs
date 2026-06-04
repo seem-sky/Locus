@@ -6012,9 +6012,16 @@ mod tests {
         create_dummy_manual_model_files_without_special_tokens_map(&manual_dir);
 
         let catalog = local_model_catalog(dir.path());
+        let manual_path = dunce::canonicalize(&manual_dir).unwrap_or(manual_dir);
         assert!(catalog.available_models.iter().any(|model| {
-            model.label == "manual-model"
-                && model.local_model_path == manual_dir.display().to_string()
+            if model.label != "manual-model" {
+                return false;
+            }
+            let model_path =
+                dunce::canonicalize(&model.local_model_path).unwrap_or_else(|_| {
+                    std::path::PathBuf::from(&model.local_model_path)
+                });
+            model_path == manual_path
         }));
     }
 
@@ -6181,6 +6188,7 @@ mod tests {
 
     #[test]
     fn prepare_local_model_download_network_reports_configured_proxy_env() {
+        let _proxy = crate::network::TestProxyConfigGuard::set(crate::network::ProxyMode::Auto);
         let _guard = TempEnvGuard::set(&[
             ("https_proxy", None),
             ("ALL_PROXY", None),

@@ -1,5 +1,12 @@
 import { ipcInvoke } from "./ipc";
-import type { ProxyConfig, ProxyStatus, PythonRuntimeState, UnityBackgroundHookStatus } from "../types";
+import type {
+  HeadroomSettings,
+  HeadroomSettingsStatus,
+  ProxyConfig,
+  ProxyStatus,
+  PythonRuntimeState,
+  UnityBackgroundHookStatus,
+} from "../types";
 
 export const APP_CLOSE_REQUESTED_EVENT = "locus-main-window-close-requested";
 export type AppCloseBehavior = "exit" | "minimizeToTray";
@@ -95,6 +102,14 @@ export function getProxyStatus(): Promise<ProxyStatus> {
 
 export function saveProxyConfig(config: ProxyConfig): Promise<ProxyStatus> {
   return ipcInvoke<ProxyStatus>("save_proxy_config", { config });
+}
+
+export function getHeadroomSettingsStatus(): Promise<HeadroomSettingsStatus> {
+  return ipcInvoke<HeadroomSettingsStatus>("get_headroom_settings_status");
+}
+
+export function saveHeadroomSettings(settings: HeadroomSettings): Promise<HeadroomSettingsStatus> {
+  return ipcInvoke<HeadroomSettingsStatus>("save_headroom_settings", { settings });
 }
 
 export function getPythonRuntimeState(refresh = false, discover = true): Promise<PythonRuntimeState> {

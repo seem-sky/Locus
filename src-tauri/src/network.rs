@@ -255,6 +255,36 @@ fn set_proxy_config_override(config: Option<ProxyConfig>) {
     *guard = config;
 }
 
+/// Lets integration tests in other modules pin proxy mode without touching disk config.
+#[cfg(test)]
+pub(crate) struct TestProxyConfigGuard {
+    saved: Option<ProxyConfig>,
+}
+
+#[cfg(test)]
+impl TestProxyConfigGuard {
+    pub(crate) fn set(mode: ProxyMode) -> Self {
+        clear_locus_injected_proxy_env();
+        let saved = proxy_config_override()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        set_proxy_config_override(Some(ProxyConfig {
+            mode,
+            manual: ManualProxyConfig::default(),
+        }));
+        Self { saved }
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestProxyConfigGuard {
+    fn drop(&mut self) {
+        clear_locus_injected_proxy_env();
+        set_proxy_config_override(self.saved.clone());
+    }
+}
+
 #[cfg(test)]
 fn system_proxy_config_override() -> &'static Mutex<Option<SystemProxyConfig>> {
     static OVERRIDE: OnceLock<Mutex<Option<SystemProxyConfig>>> = OnceLock::new();

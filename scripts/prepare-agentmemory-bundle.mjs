@@ -61,6 +61,7 @@ function agentmemoryIndexCandidates() {
     path.join(process.env.APPDATA || "", "npm", "node_modules", "@agentmemory", "agentmemory"),
     path.join(process.env.LOCALAPPDATA || "", "npm", "node_modules", "@agentmemory", "agentmemory"),
     path.join(process.env.HOME || process.env.USERPROFILE || "", ".agentmemory", "node_modules", "@agentmemory", "agentmemory"),
+    path.join(process.env.LOCALAPPDATA || "", "npm-cache", "_npx", "ba4b5775a0ab44e2", "node_modules", "@agentmemory", "agentmemory"),
   ].filter(Boolean);
   for (const root of extraRoots) {
     candidates.push(path.join(root, "dist", "index.mjs"));
@@ -80,6 +81,210 @@ function isPreToolObserveApplied(source) {
   return source.includes('payload.hookType === "pre_tool_use"');
 }
 
+function isSyntheticPreToolHydrateApplied(source) {
+  return source.includes("/* locus-synthetic-pre-tool-hydrate */");
+}
+
+function isCompressHydrateApplied(source) {
+  return source.includes("/* locus-compress-hydrate */");
+}
+
+function isObserveSkipEmptyPreToolApplied(source) {
+  return (
+    source.includes("/* locus-observe-skip-empty-pre-tool */") &&
+    source.includes("payloadData.toolName")
+  );
+}
+
+function isPreToolObserveCamelApplied(source) {
+  return source.includes('d["tool_name"] || d["toolName"]');
+}
+
+function isApiObserveGuardApplied(source) {
+  return source.includes("/* locus-api-observe-guard */");
+}
+
+function isPreToolGuardV5Applied(source) {
+  return source.includes("/* locus-pre-tool-guard-v5 */");
+}
+
+function isPreToolGuardV6Applied(source) {
+  return source.includes("/* locus-pre-tool-guard-v6 */");
+}
+
+const PRE_TOOL_GUARD_V5_HELPERS = `/* locus-pre-tool-guard-v5 */
+function locusNormalizeHookType(hookType) {
+\tif (typeof hookType !== "string") return "";
+\tconst s = hookType.trim().toLowerCase().replace(/-/g, "_");
+\tif (s === "pretooluse" || s === "pre_tool_use") return "pre_tool_use";
+\treturn hookType.trim();
+}
+function locusEmptyPreToolToolName(name) {
+\tif (typeof name !== "string") return true;
+\tconst trimmed = name.trim();
+\tif (!trimmed) return true;
+\tconst n = trimmed.toLowerCase().replace(/-/g, "_").replace(/\\s+/g, "_");
+\tconst noise = ["pre_tool_use", "pretooluse", "pre_tool", "notification", "hook", "tool_call", "tool_use", "pre_tool_use_hook", "pretooluse_hook"];
+\tif (noise.includes(n)) return true;
+\tif (n.includes("pretool") || n === "pre") return true;
+\tif (n.includes("hook") && !n.includes("webhook")) return true;
+\treturn false;
+}
+function locusResolvePreToolName(raw) {
+\t/* locus-pre-tool-guard-v6 */
+\tlet toolName = typeof raw?.toolName === "string" ? raw.toolName.trim() : "";
+\tlet payload = null;
+\tif (raw?.raw && typeof raw.raw === "object" && !Array.isArray(raw.raw)) payload = raw.raw;
+\telse if (raw?.data && typeof raw.data === "object" && !Array.isArray(raw.data)) payload = raw.data;
+\tif (!toolName && payload) {
+\t\tif (typeof payload.tool_name === "string") toolName = payload.tool_name.trim();
+\t\telse if (typeof payload.toolName === "string") toolName = payload.toolName.trim();
+\t}
+\treturn toolName;
+}
+function locusShouldSkipPreToolObserve(payload, raw) {
+\tconst hook = locusNormalizeHookType(payload?.hookType);
+\tif (hook !== "pre_tool_use") return false;
+\treturn locusEmptyPreToolToolName(locusResolvePreToolName(raw));
+}
+`;
+
+function patchAgentmemoryPreToolGuardV5(source) {
+  let next = source;
+  if (!isPreToolGuardV5Applied(next)) {
+    const registerNeedle = "function registerObserveFunction(sdk, kv, dedupMap, maxObservationsPerSession) {";
+    if (next.includes(registerNeedle)) {
+      next = next.replace(registerNeedle, `${PRE_TOOL_GUARD_V5_HELPERS}${registerNeedle}`);
+    }
+  }
+
+  const observeSkipOld = `\t\t/* locus-observe-skip-empty-pre-tool */
+\t\tif (payload.hookType === "pre_tool_use") {
+\t\t\tif (raw.raw && typeof raw.raw === "object" && !Array.isArray(raw.raw)) {
+\t\t\t\tconst payloadData = raw.raw;
+\t\t\t\tif (!raw.toolName && typeof payloadData.tool_name === "string") raw.toolName = payloadData.tool_name;
+\t\t\t\tif (!raw.toolName && typeof payloadData.toolName === "string") raw.toolName = payloadData.toolName;
+\t\t\t}
+\t\t\tconst resolvedToolName = typeof raw.toolName === "string" ? raw.toolName.trim() : "";
+\t\t\tif (!resolvedToolName || resolvedToolName === payload.hookType) {
+\t\t\t\tlogger.info("Skipping empty pre_tool_use observation", { sessionId: payload.sessionId });
+\t\t\t\treturn { success: true, skipped: true, reason: "empty_pre_tool_use" };
+\t\t\t}
+\t\t}`;
+  const observeSkipNew = `\t\t/* locus-observe-skip-empty-pre-tool */
+\t\tif (locusShouldSkipPreToolObserve(payload, raw)) {
+\t\t\tlogger.info("Skipping empty pre_tool_use observation", { sessionId: payload.sessionId });
+\t\t\treturn { success: true, skipped: true, reason: "empty_pre_tool_use" };
+\t\t}`;
+  if (next.includes(observeSkipOld)) {
+    next = next.replace(observeSkipOld, observeSkipNew);
+  }
+
+  const apiGuardOld = `\t\t/* locus-api-observe-guard */
+\t\tif (hookType === "pre_tool_use") {
+\t\t\tconst data = body.data;
+\t\t\tlet toolName = "";
+\t\t\tif (data && typeof data === "object" && !Array.isArray(data)) {
+\t\t\t\tif (typeof data.tool_name === "string") toolName = data.tool_name.trim();
+\t\t\t\telse if (typeof data.toolName === "string") toolName = data.toolName.trim();
+\t\t\t}
+\t\t\tif (!toolName || toolName === hookType) {
+\t\t\t\treturn {
+\t\t\t\t\tstatus_code: 201,
+\t\t\t\t\tbody: { success: true, skipped: true, reason: "empty_pre_tool_use" }
+\t\t\t\t};
+\t\t\t}
+\t\t}`;
+  const apiGuardNew = `\t\t/* locus-api-observe-guard */
+\t\tif (locusNormalizeHookType(hookType) === "pre_tool_use") {
+\t\t\tconst data = body.data;
+\t\t\tlet toolName = "";
+\t\t\tif (data && typeof data === "object" && !Array.isArray(data)) {
+\t\t\t\tif (typeof data.tool_name === "string") toolName = data.tool_name.trim();
+\t\t\t\telse if (typeof data.toolName === "string") toolName = data.toolName.trim();
+\t\t\t}
+\t\t\tif (locusEmptyPreToolToolName(toolName)) {
+\t\t\t\treturn {
+\t\t\t\t\tstatus_code: 201,
+\t\t\t\t\tbody: { success: true, skipped: true, reason: "empty_pre_tool_use" }
+\t\t\t\t};
+\t\t\t}
+\t\t}`;
+  if (next.includes(apiGuardOld)) {
+    next = next.replace(apiGuardOld, apiGuardNew);
+  }
+
+  const compressSkipOld = `\t\tif (data.raw.hookType === "pre_tool_use" && (!data.raw.toolName || data.raw.toolName === data.raw.hookType)) {
+\t\t\tlogger.info("Skipping LLM compression for empty pre_tool_use hook", { obsId: data.observationId, sessionId: data.sessionId });
+\t\t\treturn { success: true, skipped: true, reason: "empty_pre_tool_use" };
+\t\t}`;
+  const compressSkipNew = `\t\tif (locusShouldSkipPreToolObserve({ hookType: data.raw.hookType }, data.raw)) {
+\t\t\ttry {
+\t\t\t\tawait kv.delete(KV.observations(data.sessionId), data.observationId);
+\t\t\t} catch (err) {
+\t\t\t\tlogger.warn("Failed to delete empty pre_tool_use observation", {
+\t\t\t\t\tobsId: data.observationId,
+\t\t\t\t\tsessionId: data.sessionId,
+\t\t\t\t\terror: err instanceof Error ? err.message : String(err)
+\t\t\t\t});
+\t\t\t}
+\t\t\tlogger.info("Skipping LLM compression for empty pre_tool_use hook", { obsId: data.observationId, sessionId: data.sessionId });
+\t\t\treturn { success: true, skipped: true, reason: "empty_pre_tool_use" };
+\t\t}`;
+  if (next.includes(compressSkipOld)) {
+    next = next.replace(compressSkipOld, compressSkipNew);
+  }
+
+  const eventObserveNeedle = `sdk.registerFunction("event::observation", async (data) => sdk.trigger({
+\t\tfunction_id: "mem::observe",
+\t\tpayload: data
+\t}));`;
+  const eventObserveReplacement = `sdk.registerFunction("event::observation", async (data) => {
+\t\t/* locus-event-observe-guard */
+\t\tif (locusShouldSkipPreToolObserve(data, data)) {
+\t\t\treturn { success: true, skipped: true, reason: "empty_pre_tool_use" };
+\t\t}
+\t\treturn sdk.trigger({
+\t\t\tfunction_id: "mem::observe",
+\t\t\tpayload: data
+\t\t});
+\t});`;
+  if (!next.includes("/* locus-event-observe-guard */") && next.includes(eventObserveNeedle)) {
+    next = next.replace(eventObserveNeedle, eventObserveReplacement);
+  }
+
+  return next === source ? null : next;
+}
+
+function patchAgentmemoryPreToolGuardV6(source) {
+  let next = source;
+  const resolveOld = `function locusResolvePreToolName(raw) {
+\tlet toolName = typeof raw?.toolName === "string" ? raw.toolName.trim() : "";
+\tif (!toolName && raw?.raw && typeof raw.raw === "object" && !Array.isArray(raw.raw)) {
+\t\tconst d = raw.raw;
+\t\tif (typeof d.tool_name === "string") toolName = d.tool_name.trim();
+\t\telse if (typeof d.toolName === "string") toolName = d.toolName.trim();
+\t}
+\treturn toolName;
+}`;
+  const resolveNew = `function locusResolvePreToolName(raw) {
+\t/* locus-pre-tool-guard-v6 */
+\tlet toolName = typeof raw?.toolName === "string" ? raw.toolName.trim() : "";
+\tlet payload = null;
+\tif (raw?.raw && typeof raw.raw === "object" && !Array.isArray(raw.raw)) payload = raw.raw;
+\telse if (raw?.data && typeof raw.data === "object" && !Array.isArray(raw.data)) payload = raw.data;
+\tif (!toolName && payload) {
+\t\tif (typeof payload.tool_name === "string") toolName = payload.tool_name.trim();
+\t\telse if (typeof payload.toolName === "string") toolName = payload.toolName.trim();
+\t}
+\treturn toolName;
+}`;
+  if (!isPreToolGuardV6Applied(next) && next.includes(resolveOld)) {
+    next = next.replace(resolveOld, resolveNew);
+  }
+  return next === source ? null : next;
+}
+
 function patchAgentmemoryIndexFile(indexPath) {
   if (!existsSync(indexPath)) {
     return false;
@@ -91,18 +296,177 @@ function patchAgentmemoryIndexFile(indexPath) {
   source = source.replace(/\/\* locus-replay-v2 \*\/-raw\s*\n(?=function rawFromCompressed)/, "");
   source = source.replace(/\/\* locus-replay-v2 \*\/-body\s*\n(?=function bodyFor)/, "");
 
-  if (isReplayPatchApplied(source) && isReplayHydrateApplied(source) && isPreToolObserveApplied(source) && source.includes("locus-observations-hydrate") && source === original) {
+  if (
+    isReplayPatchApplied(source) &&
+    isReplayHydrateApplied(source) &&
+    isPreToolObserveApplied(source) &&
+    isSyntheticPreToolHydrateApplied(source) &&
+    isCompressHydrateApplied(source) &&
+    isObserveSkipEmptyPreToolApplied(source) &&
+    isPreToolObserveCamelApplied(source) &&
+    isApiObserveGuardApplied(source) &&
+    isPreToolGuardV5Applied(source) &&
+    isPreToolGuardV6Applied(source) &&
+    source.includes("locus-observations-hydrate") &&
+    source === original
+  ) {
     return false;
+  }
+
+  const v5 = patchAgentmemoryPreToolGuardV5(source);
+  if (v5) {
+    source = v5;
+  }
+  const v6 = patchAgentmemoryPreToolGuardV6(source);
+  if (v6) {
+    source = v6;
   }
 
   const observeNeedle = `\t\t\tif (payload.hookType === "prompt_submit") raw.userPrompt = d["prompt"];`;
   const observeReplacement = `\t\t\tif (payload.hookType === "pre_tool_use") {
-\t\t\t\traw.toolName = d["tool_name"];
-\t\t\t\traw.toolInput = d["tool_input"];
+\t\t\t\traw.toolName = d["tool_name"] || d["toolName"];
+\t\t\t\traw.toolInput = d["tool_input"] ?? d["toolInput"];
 \t\t\t}
 \t\t\tif (payload.hookType === "prompt_submit") raw.userPrompt = d["prompt"];`;
-  if (!isPreToolObserveApplied(source) && source.includes(observeNeedle)) {
-    source = source.replace(observeNeedle, observeReplacement);
+  if (source.includes(observeNeedle)) {
+    if (!isPreToolObserveApplied(source)) {
+      source = source.replace(observeNeedle, observeReplacement);
+    } else if (!isPreToolObserveCamelApplied(source)) {
+      source = source.replace(
+        `\t\t\tif (payload.hookType === "pre_tool_use") {
+\t\t\t\traw.toolName = d["tool_name"];
+\t\t\t\traw.toolInput = d["tool_input"];
+\t\t\t}`,
+        `\t\t\tif (payload.hookType === "pre_tool_use") {
+\t\t\t\traw.toolName = d["tool_name"] || d["toolName"];
+\t\t\t\traw.toolInput = d["tool_input"] ?? d["toolInput"];
+\t\t\t}`,
+      );
+    }
+  }
+
+  const observeSkipNeedle = `\t\t} else if (typeof sanitizedRaw === "string") {
+\t\t\textractedImage = extractImage(sanitizedRaw);
+\t\t\tif (extractedImage) raw.modality = "image";
+\t\t}
+\t\tconst pendingImageData = extractedImage;`;
+  const observeSkipReplacement = `\t\t} else if (typeof sanitizedRaw === "string") {
+\t\t\textractedImage = extractImage(sanitizedRaw);
+\t\t\tif (extractedImage) raw.modality = "image";
+\t\t}
+\t\t/* locus-observe-skip-empty-pre-tool */
+\t\tif (payload.hookType === "pre_tool_use") {
+\t\t\tif (raw.raw && typeof raw.raw === "object" && !Array.isArray(raw.raw)) {
+\t\t\t\tconst payloadData = raw.raw;
+\t\t\t\tif (!raw.toolName && typeof payloadData.tool_name === "string") raw.toolName = payloadData.tool_name;
+\t\t\t\tif (!raw.toolName && typeof payloadData.toolName === "string") raw.toolName = payloadData.toolName;
+\t\t\t}
+\t\t\tconst resolvedToolName = typeof raw.toolName === "string" ? raw.toolName.trim() : "";
+\t\t\tif (!resolvedToolName || resolvedToolName === payload.hookType) {
+\t\t\t\tlogger.info("Skipping empty pre_tool_use observation", { sessionId: payload.sessionId });
+\t\t\t\treturn { success: true, skipped: true, reason: "empty_pre_tool_use" };
+\t\t\t}
+\t\t}
+\t\tconst pendingImageData = extractedImage;`;
+  if (!isObserveSkipEmptyPreToolApplied(source) && source.includes(observeSkipNeedle)) {
+    source = source.replace(observeSkipNeedle, observeSkipReplacement);
+  }
+
+  const apiObserveNeedle = `\t\tconst payload = {
+\t\t\thookType,
+\t\t\tsessionId,
+\t\t\tproject,
+\t\t\tcwd,
+\t\t\ttimestamp,
+\t\t\tdata: body.data
+\t\t};
+\t\treturn {
+\t\t\tstatus_code: 201,
+\t\t\tbody: await sdk.trigger({
+\t\t\t\tfunction_id: "mem::observe",
+\t\t\t\tpayload
+\t\t\t})
+\t\t};`;
+  const apiObserveReplacement = `\t\t/* locus-api-observe-guard */
+\t\tif (hookType === "pre_tool_use") {
+\t\t\tconst data = body.data;
+\t\t\tlet toolName = "";
+\t\t\tif (data && typeof data === "object" && !Array.isArray(data)) {
+\t\t\t\tif (typeof data.tool_name === "string") toolName = data.tool_name.trim();
+\t\t\t\telse if (typeof data.toolName === "string") toolName = data.toolName.trim();
+\t\t\t}
+\t\t\tif (!toolName || toolName === hookType) {
+\t\t\t\treturn {
+\t\t\t\t\tstatus_code: 201,
+\t\t\t\t\tbody: { success: true, skipped: true, reason: "empty_pre_tool_use" }
+\t\t\t\t};
+\t\t\t}
+\t\t}
+\t\tconst payload = {
+\t\t\thookType,
+\t\t\tsessionId,
+\t\t\tproject,
+\t\t\tcwd,
+\t\t\ttimestamp,
+\t\t\tdata: body.data
+\t\t};
+\t\treturn {
+\t\t\tstatus_code: 201,
+\t\t\tbody: await sdk.trigger({
+\t\t\t\tfunction_id: "mem::observe",
+\t\t\t\tpayload
+\t\t\t})
+\t\t};`;
+  if (!isApiObserveGuardApplied(source) && source.includes(apiObserveNeedle)) {
+    source = source.replace(apiObserveNeedle, apiObserveReplacement);
+  }
+
+  const syntheticNeedle = `function buildSyntheticCompression(raw) {
+\tconst toolName = raw.toolName ?? raw.hookType;
+\tconst inputStr = stringifyForNarrative(raw.toolInput);`;
+  const syntheticReplacement = `function buildSyntheticCompression(raw) {
+\t/* locus-synthetic-pre-tool-hydrate */
+\tlet toolName = raw.toolName;
+\tlet toolInput = raw.toolInput;
+\tif ((!toolName || toolName === raw.hookType) && raw.raw && typeof raw.raw === "object" && !Array.isArray(raw.raw)) {
+\t\tconst payload = raw.raw;
+\t\tif (typeof payload.tool_name === "string" && payload.tool_name.trim()) toolName = payload.tool_name.trim();
+\t\telse if (typeof payload.toolName === "string" && payload.toolName.trim()) toolName = payload.toolName.trim();
+\t\tif (toolInput === void 0 && payload.tool_input !== void 0) toolInput = payload.tool_input;
+\t\telse if (toolInput === void 0 && payload.toolInput !== void 0) toolInput = payload.toolInput;
+\t}
+\tconst resolvedToolName = toolName && toolName !== raw.hookType ? toolName : toolName ?? raw.hookType;
+\tconst inputStr = stringifyForNarrative(toolInput);`;
+  if (!isSyntheticPreToolHydrateApplied(source) && source.includes(syntheticNeedle)) {
+    source = source.replace(syntheticNeedle, syntheticReplacement);
+    source = source.replace(
+      "\t\ttitle: truncate$2(toolName || \"observation\", 80),",
+      "\t\ttitle: truncate$2(resolvedToolName || \"observation\", 80),",
+    );
+    source = source.replace(
+      "\t\ttype: inferType(toolName, raw.hookType),",
+      "\t\ttype: inferType(resolvedToolName, raw.hookType),",
+    );
+  }
+
+  const compressNeedle = `\t\tconst prompt = buildCompressionPrompt({
+\t\t\thookType: data.raw.hookType,
+\t\t\ttoolName: data.raw.toolName,`;
+  const compressReplacement = `\t\t/* locus-compress-hydrate */
+\t\tif (data.raw.raw && typeof data.raw.raw === "object" && !Array.isArray(data.raw.raw)) {
+\t\t\tconst payload = data.raw.raw;
+\t\t\tif (!data.raw.toolName && typeof payload.tool_name === "string") data.raw.toolName = payload.tool_name;
+\t\t\tif (data.raw.toolInput === void 0 && payload.tool_input !== void 0) data.raw.toolInput = payload.tool_input;
+\t\t}
+\t\tif (data.raw.hookType === "pre_tool_use" && (!data.raw.toolName || data.raw.toolName === data.raw.hookType)) {
+\t\t\tlogger.info("Skipping LLM compression for empty pre_tool_use hook", { obsId: data.observationId, sessionId: data.sessionId });
+\t\t\treturn { success: true, skipped: true, reason: "empty_pre_tool_use" };
+\t\t}
+\t\tconst prompt = buildCompressionPrompt({
+\t\t\thookType: data.raw.hookType,
+\t\t\ttoolName: data.raw.toolName,`;
+  if (!isCompressHydrateApplied(source) && source.includes(compressNeedle)) {
+    source = source.replace(compressNeedle, compressReplacement);
   }
 
   const bodyForReplacement = `${marker}
@@ -334,6 +698,151 @@ function patchAgentmemoryViewerFile(viewerPath) {
   return true;
 }
 
+function patchAgentmemoryViewerV3(viewerPath) {
+  let source = readFileSync(viewerPath, "utf8");
+  const original = source;
+  const noiseFnNeedle = `    function locusIsHookNoiseObservation(o) {
+      if (!o) return true;
+      var hydrated = typeof locusHydrateObservation === 'function' ? locusHydrateObservation(o) : o;
+      var tool = locusResolveToolName(hydrated);
+      if (tool) return false;
+      var text = ((hydrated.title || '') + ' ' + (hydrated.narrative || '') + ' ' + (hydrated.subtitle || '')).toLowerCase();
+      if (!text.trim()) return hydrated.hookType === 'pre_tool_use';
+      var markers = [
+        'pre-tool-use hook', 'pre_tool_use hook', 'pretooluse hook', 'hook fired before tool execution with no payload',
+        'hook notification', 'hook event lifecycle',
+        'hook event with no', 'no tool details', 'no associated tool', 'minimal hook notification',
+        'no actionable content', 'standalone hook firing', 'bare hook trigger'
+      ];
+      return markers.some(function(m) { return text.indexOf(m) >= 0; });
+    }`;
+  const noiseFnReplacement = `    /* locus-viewer-timeline-v3 */
+    function locusIsHookNoiseObservation(o) {
+      if (!o) return true;
+      var hydrated = typeof locusHydrateObservation === 'function' ? locusHydrateObservation(o) : o;
+      var tool = locusResolveToolName(hydrated);
+      if (tool) return false;
+      var realToolTypes = ['file_read','file_write','file_edit','command_run','search','web_fetch','subagent','error','decision','discovery','task','image'];
+      if (hydrated.type && realToolTypes.indexOf(hydrated.type) >= 0) return false;
+      if (hydrated.hookType === 'post_tool_use' || hydrated.hookType === 'post_tool_failure') return false;
+      var text = ((hydrated.title || '') + ' ' + (hydrated.narrative || '') + ' ' + (hydrated.subtitle || '')).toLowerCase();
+      if (!text.trim()) return hydrated.hookType === 'pre_tool_use';
+      var markers = [
+        'pre-tool-use hook', 'pre_tool_use hook', 'pretooluse hook', 'hook fired before tool execution with no payload',
+        'hook notification', 'hook event lifecycle',
+        'hook event with no', 'no tool details', 'no associated tool', 'minimal hook notification',
+        'no actionable content', 'standalone hook firing', 'bare hook trigger'
+      ];
+      return markers.some(function(m) { return text.indexOf(m) >= 0; });
+    }`;
+  if (source.includes(noiseFnNeedle)) {
+    source = source.replace(noiseFnNeedle, noiseFnReplacement);
+    if (source !== original) {
+      writeFileSync(viewerPath, source);
+      return true;
+    }
+    return false;
+  }
+  if (source.includes("realToolTypes")) {
+    return false;
+  }
+  if (!source.includes("function locusResolveToolName(o)")) {
+    return false;
+  }
+
+  const noiseFn = `    /* locus-viewer-timeline-v3 */
+    function locusIsHookNoiseObservation(o) {
+      if (!o) return true;
+      var hydrated = typeof locusHydrateObservation === 'function' ? locusHydrateObservation(o) : o;
+      var tool = locusResolveToolName(hydrated);
+      if (tool) return false;
+      var realToolTypes = ['file_read','file_write','file_edit','command_run','search','web_fetch','subagent','error','decision','discovery','task','image'];
+      if (hydrated.type && realToolTypes.indexOf(hydrated.type) >= 0) return false;
+      if (hydrated.hookType === 'post_tool_use' || hydrated.hookType === 'post_tool_failure') return false;
+      var text = ((hydrated.title || '') + ' ' + (hydrated.narrative || '') + ' ' + (hydrated.subtitle || '')).toLowerCase();
+      if (!text.trim()) return hydrated.hookType === 'pre_tool_use';
+      var markers = [
+        'pre-tool-use hook', 'pre_tool_use hook', 'pretooluse hook', 'hook fired before tool execution with no payload',
+        'hook notification', 'hook event lifecycle',
+        'hook event with no', 'no tool details', 'no associated tool', 'minimal hook notification',
+        'no actionable content', 'standalone hook firing', 'bare hook trigger'
+      ];
+      return markers.some(function(m) { return text.indexOf(m) >= 0; });
+    }
+`;
+
+  source = source.replace(
+    "function locusResolveToolName(o) {",
+    `${noiseFn}
+    function locusResolveToolName(o) {`,
+  );
+
+  source = source.replace(
+    "var obs = state.timeline.observations.map(function(o) { return locusHydrateObservation(o); });",
+    "var obs = state.timeline.observations.map(function(o) { return locusHydrateObservation(o); }).filter(function(o) { return !locusIsHookNoiseObservation(o); });",
+  );
+
+  source = source.replace(
+    "state.timeline.observations = ((result && result.observations) || []).map(function(o) { return locusHydrateObservation(o); });",
+    "state.timeline.observations = ((result && result.observations) || []).map(function(o) { return locusHydrateObservation(o); }).filter(function(o) { return !locusIsHookNoiseObservation(o); });",
+  );
+
+  if (source === original) {
+    return false;
+  }
+  writeFileSync(viewerPath, source);
+  return true;
+}
+
+function patchAgentmemoryViewerV4(viewerPath) {
+  let source = readFileSync(viewerPath, "utf8");
+  const original = source;
+  if (source.includes("/* locus-viewer-timeline-v4 */")) {
+    return false;
+  }
+
+  const loadNeedle =
+    "state.timeline.observations = ((result && result.observations) || []).map(function(o) { return locusHydrateObservation(o); }).filter(function(o) { return !locusIsHookNoiseObservation(o); });";
+  const loadReplacement = `      /* locus-viewer-timeline-v4 */
+      var rawObs = (result && result.observations) || [];
+      state.timeline.observationsRawCount = rawObs.length;
+      state.timeline.observations = rawObs.map(function(o) { return locusHydrateObservation(o); }).filter(function(o) { return !locusIsHookNoiseObservation(o); });`;
+
+  const emptyNeedle = `      if (paged.length === 0) {
+        html += '<div class="empty-state"><div class="empty-icon">&#128337;</div><p>No observations' + (obs.length > 0 ? ' match the filter (' + obs.length + ' total)' : ' for this session') + '</p></div>';
+        content.innerHTML = html;
+        return;
+      }`;
+  const emptyReplacement = `      /* locus-viewer-timeline-v4 */
+      if (paged.length === 0) {
+        var rawTotal = (state.timeline.observationsRawCount != null) ? state.timeline.observationsRawCount : obs.length;
+        var hiddenNoise = rawTotal > obs.length ? (rawTotal - obs.length) : 0;
+        var emptyMsg = 'No observations for this session';
+        if (rawTotal > 0 && obs.length === 0) {
+          emptyMsg = hiddenNoise > 0
+            ? ('All ' + rawTotal + ' observations are empty hook noise (hidden). Approve pending tools in Locus, then retry.')
+            : ('All ' + rawTotal + ' observations were hidden by filters. Lower the importance threshold or clear the type filter.');
+        } else if (obs.length > 0) {
+          emptyMsg = 'No observations match the filter (' + obs.length + ' total)';
+        }
+        html += '<div class="empty-state"><div class="empty-icon">&#128337;</div><p>' + esc(emptyMsg) + '</p></div>';
+        content.innerHTML = html;
+        return;
+      }`;
+
+  if (!source.includes(loadNeedle) || !source.includes(emptyNeedle)) {
+    return false;
+  }
+  source = source.replace(loadNeedle, loadReplacement);
+  source = source.replace(emptyNeedle, emptyReplacement);
+
+  if (source === original) {
+    return false;
+  }
+  writeFileSync(viewerPath, source);
+  return true;
+}
+
 function patchAgentmemoryViewerV2(viewerPath) {
   let source = readFileSync(viewerPath, "utf8");
   const original = source;
@@ -397,6 +906,14 @@ function patchAgentmemoryViewer() {
     if (patchAgentmemoryViewerV2(viewerPath)) {
       patched += 1;
       console.log(`[locus] Patched agentmemory viewer timeline (v2): ${path.relative(repoRoot, viewerPath)}`);
+    }
+    if (patchAgentmemoryViewerV3(viewerPath)) {
+      patched += 1;
+      console.log(`[locus] Patched agentmemory viewer timeline (v3): ${path.relative(repoRoot, viewerPath)}`);
+    }
+    if (patchAgentmemoryViewerV4(viewerPath)) {
+      patched += 1;
+      console.log(`[locus] Patched agentmemory viewer timeline (v4): ${path.relative(repoRoot, viewerPath)}`);
     }
   }
 }

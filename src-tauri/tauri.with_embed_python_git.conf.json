@@ -8,7 +8,9 @@
       "./gen/ort-runtime": "ort-runtime/",
       "./gen/codegraph-bundle": "codegraph-bundle/",
       "./gen/agentmemory-bundle": "agentmemory-bundle/",
+      "./gen/lua53": "lua53/",
       "./gen/rtk": "rtk/",
+      "./gen/headroom-bundle": "headroom-bundle/",
       "./gen/managed-python": "managed-python/",
       "./gen/managed-git": "managed-git/"
     }

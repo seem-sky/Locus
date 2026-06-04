@@ -1,7 +1,7 @@
 import { hydrateChatMessageIntent, parseUserIntentMeta } from "./chatInputIntents";
 import { sortedAssistantRenderParts } from "./assistantRenderParts";
 import { resolveToolCallDisplayShape } from "./toolCallBatches";
-import { normalizeExecutionMeta } from "./rtkExecutionMeta";
+import { normalizeExecutionMeta } from "./headroomExecutionMeta";
 import type { StreamEvent, ChatMessage, TokenUsage, TodoItem, ToolCallDisplay, ToolCallInfo, PendingQuestion, PendingToolConfirm, ImageAttachment, AssetRefAttachment, ToolCallProgress, AssistantRenderPart, ToolExecutionMeta } from "../types";
 
 export interface StreamState {
@@ -170,9 +170,14 @@ function resolveToolCallDoneExecutionMeta(
   const existingMeta = normalizeExecutionMeta(existing);
   if (existingMeta) return existingMeta;
 
-  if (existing?.progress?.state === "rtk" && existing.progress.info) {
+  if (existing?.progress?.state === "headroom" || existing?.progress?.state === "rtk") {
+    if (!existing.progress.info) return undefined;
     try {
-      return { rtk: JSON.parse(existing.progress.info) as ToolExecutionMeta["rtk"] };
+      const parsed = JSON.parse(existing.progress.info) as Record<string, unknown>;
+      if (parsed && ("rewrite" in parsed || "compress" in parsed)) {
+        return { headroom: parsed as unknown as NonNullable<ToolExecutionMeta["headroom"]> };
+      }
+      return { rtk: parsed as unknown as ToolExecutionMeta["rtk"] };
     } catch {
       return undefined;
     }

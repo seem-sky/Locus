@@ -15,6 +15,7 @@ const OBSERVATION_HOOK_MARKERS: &[&str] = &[
     "PostToolUseFailure",
     "post_tool_failure",
     "PreToolUse",
+    "pretooluse",
     "pre_tool_use",
     "SessionStart",
     "session_start",
@@ -34,6 +35,9 @@ const OBSERVATION_HOOK_MARKERS: &[&str] = &[
 const OBSERVATION_HOOK_NARRATIVE_MARKERS: &[&str] = &[
     "pre-tool-use hook",
     "pre_tool_use hook",
+    "pretooluse hook",
+    "hook fired before tool execution with no payload",
+    "about to execute a tool. however, the observation contains no details",
     "post-tool-use failure hook",
     "post_tool_failure hook",
     "posttoolusefailure hook",
@@ -46,6 +50,15 @@ const OBSERVATION_HOOK_NARRATIVE_MARKERS: &[&str] = &[
     "no details provided",
     "no tool call content or payload",
     "hook lifecycle event",
+    "hook notification",
+    "hook event lifecycle",
+    "hook event with no",
+    "minimal hook notification",
+    "no actionable content",
+    "no associated tool",
+    "no tool details",
+    "standalone hook firing",
+    "bare hook trigger",
     "observation payload",
     "pre-compact hook",
     "pre_compact hook",
@@ -165,6 +178,15 @@ pub fn should_include_memory_content(content: &str) -> bool {
 /// Pattern API / cross-session summaries that describe hook lifecycle noise, not project facts.
 pub fn is_memory_pattern_noise(value: &str) -> bool {
     is_observation_hook_noise(value)
+}
+
+/// Skip pre_tool_use observations that carry no tool identity (avoids empty hook cards in agentmemory).
+pub fn should_observe_pre_tool_use(tool_name: &str, _tool_input: &serde_json::Value) -> bool {
+    let name = tool_name.trim();
+    if name.is_empty() {
+        return false;
+    }
+    !is_observation_hook_noise(name)
 }
 
 pub fn should_observe_tool_failure(tool_output: &str) -> bool {
@@ -557,9 +579,26 @@ mod tests {
             "A pre_tool_use hook event was triggered. No associated tool invocation details."
         ));
         assert!(is_observation_hook_noise(
+            "Hook notification for incoming tool execution. No tool details or payload available."
+        ));
+        assert!(is_observation_hook_noise(
             "Recurring error: posttoolusefailure hook triggered with no details"
         ));
         assert!(!is_observation_hook_noise("所有会话使用简体中文"));
+    }
+
+    #[test]
+    fn pre_tool_use_skips_empty_or_hook_noise_names() {
+        assert!(!should_observe_pre_tool_use("", &serde_json::json!({})));
+        assert!(!should_observe_pre_tool_use("   ", &serde_json::json!({"path": "a"})));
+        assert!(!should_observe_pre_tool_use("pre_tool_use", &serde_json::json!({})));
+        assert!(!should_observe_pre_tool_use("PreToolUse", &serde_json::json!({})));
+        assert!(!should_observe_pre_tool_use("notification", &serde_json::json!({})));
+        assert!(should_observe_pre_tool_use("read", &serde_json::json!({})));
+        assert!(should_observe_pre_tool_use(
+            "read",
+            &serde_json::json!({"path": "README.md"}),
+        ));
     }
 
     #[test]

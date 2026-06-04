@@ -1569,6 +1569,28 @@ impl SessionStore {
         .map_err(|e| format!("Failed to query active session run: {}", e))
     }
 
+    /// Root session plus all descendant sessions (subagents), depth-first stable order.
+    pub fn list_session_tree_ids(&self, root_session_id: &str) -> Result<Vec<String>, String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let mut stmt = conn
+            .prepare(
+                "WITH RECURSIVE descendants(id) AS (
+                    SELECT ?1
+                    UNION ALL
+                    SELECT sessions.id
+                    FROM sessions
+                    JOIN descendants ON sessions.parent_session_id = descendants.id
+                 )
+                 SELECT id FROM descendants",
+            )
+            .map_err(|e| format!("Failed to prepare session tree query: {}", e))?;
+        let rows = stmt
+            .query_map(params![root_session_id], |row| row.get::<_, String>(0))
+            .map_err(|e| format!("Failed to query session tree: {}", e))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to read session tree: {}", e))
+    }
+
     pub fn active_descendant_runs(
         &self,
         root_session_id: &str,

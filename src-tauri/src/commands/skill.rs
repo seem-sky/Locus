@@ -1949,6 +1949,9 @@ fn configure_skill_process_env(
     if let Some(python) = python {
         path = crate::python_runtime::prepend_python_to_path(path, &python.path);
     }
+    if let Some(lua) = crate::lua_runtime::resolve_bundled_lua() {
+        path = crate::lua_runtime::prepend_lua_to_path(path, &lua);
+    }
     if let Some(path) = path {
         cmd.env("PATH", path);
     }

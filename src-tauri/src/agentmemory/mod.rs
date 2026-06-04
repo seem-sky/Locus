@@ -20,8 +20,11 @@ use crate::memory::models::{
     MemoryRetrieveOptions, MemoryScope,
 };
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
+
+use crate::session::models::MessageRole;
+use crate::session::store::SessionStore;
 
 use mapping::{
     build_concepts, category_to_agent_type, entry_belongs_to_workspace, entry_from_remember_response,
@@ -528,17 +531,25 @@ impl AgentMemoryState {
         tool_name: &str,
         tool_input: &serde_json::Value,
     ) {
+        if !mapping::should_observe_pre_tool_use(tool_name, tool_input) {
+            return;
+        }
         let project = normalize_project_path(working_dir);
         if project.is_empty() {
             return;
         }
         let data = serde_json::json!({
-            "tool_name": tool_name,
+            "tool_name": tool_name.trim(),
             "tool_input": tool_input,
         });
         let cwd = normalize_project_path(working_dir);
         let cwd_ref = if cwd.is_empty() { working_dir } else { cwd.as_str() };
-        let _ = self.client.observe("pre_tool_use", session_id, &project, cwd_ref, data);
+        if let Err(error) = self.client.observe("pre_tool_use", session_id, &project, cwd_ref, data)
+        {
+            eprintln!(
+                "[agentmemory] observe pre_tool_use failed session={session_id}: {error}"
+            );
+        }
     }
 
     pub fn observe_tool_use(
@@ -562,7 +573,79 @@ impl AgentMemoryState {
         let (hook, data) = mapping::observe_tool_payload(tool_name, tool_input, tool_output, is_error);
         let cwd = normalize_project_path(working_dir);
         let cwd_ref = if cwd.is_empty() { working_dir } else { cwd.as_str() };
-        let _ = self.client.observe(hook, session_id, &project, cwd_ref, data);
+        if let Err(error) = self.client.observe(hook, session_id, &project, cwd_ref, data) {
+            eprintln!(
+                "[agentmemory] observe {hook} failed session={session_id} tool={tool_name}: {error}"
+            );
+        }
+    }
+
+    /// Backfill agentmemory timeline from persisted Locus tool results (parent + subagent sessions).
+    pub fn replay_tool_observations_from_session_tree(
+        &self,
+        store: &SessionStore,
+        root_session_id: &str,
+        working_dir: &str,
+    ) -> Result<usize, String> {
+        if working_dir.trim().is_empty() {
+            return Ok(0);
+        }
+        let _ = self.ensure_ready();
+        let session_ids = store.list_session_tree_ids(root_session_id)?;
+        let mut replayed = 0usize;
+        for source_session_id in session_ids {
+            let messages = store.get_messages(&source_session_id)?;
+            let mut tool_calls: HashMap<String, (String, serde_json::Value)> = HashMap::new();
+            for message in &messages {
+                if message.role != MessageRole::Assistant {
+                    continue;
+                }
+                let Some(calls) = message.tool_calls.as_ref() else {
+                    continue;
+                };
+                for call in calls {
+                    let args = serde_json::from_str::<serde_json::Value>(&call.arguments)
+                        .unwrap_or_else(|_| serde_json::json!({ "raw": call.arguments }));
+                    tool_calls.insert(call.id.clone(), (call.name.clone(), args));
+                }
+            }
+            for message in messages {
+                if message.role != MessageRole::Tool {
+                    continue;
+                }
+                let Some(tool_call_id) = message.tool_call_id.as_ref() else {
+                    continue;
+                };
+                let Some((tool_name, tool_input)) = tool_calls.get(tool_call_id) else {
+                    continue;
+                };
+                let output = message.content.trim();
+                if output.is_empty()
+                    || output == crate::session::history::INTERRUPTED_TOOL_RESULT
+                {
+                    continue;
+                }
+                let is_error = output.starts_with("Error:")
+                    || output.starts_with("error:")
+                    || output.contains("\"isError\":true")
+                    || output.contains("\"is_error\":true");
+                self.observe_tool_use(
+                    root_session_id,
+                    working_dir,
+                    tool_name,
+                    tool_input,
+                    output,
+                    is_error,
+                );
+                replayed += 1;
+            }
+        }
+        if replayed > 0 {
+            eprintln!(
+                "[agentmemory] replayed {replayed} tool observations into session {root_session_id}"
+            );
+        }
+        Ok(replayed)
     }
 
     pub fn ensure_session_started(

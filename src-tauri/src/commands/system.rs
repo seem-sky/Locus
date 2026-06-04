@@ -27,6 +27,20 @@ pub fn save_proxy_config(
 }
 
 #[tauri::command]
+pub fn get_headroom_settings_status() -> crate::headroom::HeadroomSettingsStatus {
+    crate::headroom::headroom_settings_status()
+}
+
+#[tauri::command]
+pub fn save_headroom_settings(
+    settings: crate::headroom::HeadroomSettings,
+) -> Result<crate::headroom::HeadroomSettingsStatus, crate::error::AppError> {
+    crate::headroom::save_headroom_settings(settings)
+        .map(|_| crate::headroom::headroom_settings_status())
+        .map_err(crate::error::AppError::from)
+}
+
+#[tauri::command]
 pub async fn get_python_runtime_state(
     app_handle: AppHandle,
     refresh: Option<bool>,

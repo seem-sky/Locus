@@ -1,5 +1,5 @@
 import type { AssistantRenderPart, ChatMessage, ImageAttachment, ToolCallDisplay, ToolCallInfo } from "../types";
-import { normalizeExecutionMeta } from "./rtkExecutionMeta";
+import { normalizeExecutionMeta } from "./headroomExecutionMeta";
 
 const INTERRUPTED_TOOL_RESULT = "工具执行被用户中止，未返回结果。";
 const GENERIC_ARGUMENT_ALIAS_GROUPS: Array<readonly [string, readonly string[]]> = [

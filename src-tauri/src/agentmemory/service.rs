@@ -123,6 +123,7 @@ impl AgentMemoryService {
         }
         if resolved.using_bundled_runtime {
             reclaim_all_agentmemory_workers();
+            reclaim_foreign_agentmemory_workers(&resolved.bundle_root);
         }
 
         let mut guard = self.child.lock().map_err(|e| e.to_string())?;
@@ -291,7 +292,6 @@ fn reclaim_all_agentmemory_workers() {
 
 /// Stop foreign agentmemory worker processes (e.g. global npm installs) so the bundled
 /// runtime is the sole handler on the shared iii engine.
-#[allow(dead_code)]
 fn reclaim_foreign_agentmemory_workers(bundle_root: &Path) {
     let bundle_cli = bundle_root
         .join("node_modules")

@@ -1848,7 +1848,7 @@ const ASSETS_LUA_CANONICAL_SEGMENT: &str = "Assets.Lua";
 fn is_assets_lua_mispath_segment_start(text: &str, idx: usize) -> bool {
     if idx > 0 {
         match text.as_bytes().get(idx - 1) {
-            Some(b'/') | Some(b'\\') | Some(b':') => {}
+            Some(b'/') | Some(b'\\') | Some(b':') | Some(b' ') | Some(b'"') | Some(b'\'') => {}
             _ => return false,
         }
     }
@@ -2833,6 +2833,7 @@ pub async fn reset_all_config(
     if let Ok(pdir) = persistent_config_dir() {
         for file in [
             "config.json",
+            "headroom.json",
             "last_model.txt",
             "last_effort.txt",
             "model_defaults.json",
@@ -2845,6 +2846,7 @@ pub async fn reset_all_config(
                 let _ = std::fs::remove_file(&path);
             }
         }
+        crate::headroom::reset_headroom_settings();
     }
 
     if let Some(webview) = app_handle.webview_windows().values().next() {
