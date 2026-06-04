@@ -1,7 +1,7 @@
 import { computed, ref, type Ref } from "vue";
 import type { CommandDef } from "./chatInputIntents";
 import { useCommandRegistry } from "./useCommandRegistry";
-import type { KnowledgeDocument } from "../types";
+import type { KnowledgeDocument, SkillIntentItem } from "../types";
 import type { SkillManifest } from "../types";
 
 export const QUICK_CHAT_SKILLS_STORAGE_KEY = "locus:quickChatSkillPins";
@@ -18,7 +18,7 @@ export const DEFAULT_QUICK_CHAT_SKILL_DIR_NAMES = [
 ] as const;
 
 export interface QuickChatSkillPin {
-  source: SkillManifest["source"];
+  source: SkillIntentItem["source"];
   dirName: string;
 }
 
@@ -50,7 +50,7 @@ export function loadQuickChatSkillPins(): QuickChatSkillPin[] | null {
     return parsed
       .filter((item) =>
         item
-        && (item.source === "app" || item.source === "project")
+        && (item.source === "app" || item.source === "project" || item.source === "pluginApp" || item.source === "pluginProject")
         && typeof item.dirName === "string"
         && item.dirName.trim(),
       )

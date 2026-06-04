@@ -189,8 +189,10 @@ function normalizeSkillIntent(value: unknown): SkillIntentItem | null {
   if (!isObject(value)) return null;
   const source =
     typeof value.source === "string" &&
-    ["app", "project", "pluginApp", "pluginProject"].includes(value.source)
-      ? value.source
+    (["app", "project", "pluginApp", "pluginProject"] as const).includes(
+      value.source as SkillIntentItem["source"],
+    )
+      ? (value.source as SkillIntentItem["source"])
       : null;
   if (!source || typeof value.dirName !== "string" || typeof value.name !== "string") return null;
   const dirName = value.dirName.trim();

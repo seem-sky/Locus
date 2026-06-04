@@ -102,7 +102,7 @@ export interface UnityConnectionStatus {
 
 export interface SkillIntentItem {
   dirName: string;
-  source: "app" | "project";
+  source: "app" | "project" | "pluginApp" | "pluginProject";
   name: string;
 }
 
@@ -147,29 +147,6 @@ export type AssistantRenderPart =
       order: RenderOrderKey;
       message: ChatMessage;
     };
-
-export interface UnityConnectionStatus {
-  connected: boolean;
-  editorStatus: string;
-  scenePath?: string | null;
-  editorProcessState: UnityEditorProcessState;
-  editorProcessId?: number | null;
-  editorProcessPath?: string | null;
-  editorProjectPath?: string | null;
-  processCheckedAtMs?: number | null;
-  processLastError?: string | null;
-  pipeName: string;
-  latencyMs?: number | null;
-  reconnectAttempts: number;
-  lastError?: string | null;
-  checkedAtMs: number;
-}
-
-export interface SkillIntentItem {
-  dirName: string;
-  source: "app" | "project";
-  name: string;
-}
 
 export interface UserIntentMeta {
   kind: "user_intent_v1";
@@ -1372,6 +1349,10 @@ export interface KnowledgeDocumentEditOperation {
 }
 
 export interface KnowledgeDocumentPatch {
+  id?: string;
+  type?: KnowledgeDocumentType;
+  title?: string;
+  injectMode?: KnowledgeInjectMode;
   inheritInjectMode?: boolean;
   summaryEnabled?: boolean;
   commandEnabled?: boolean;
