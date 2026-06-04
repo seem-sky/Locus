@@ -34,6 +34,9 @@ src-tauri/gen/codegraph-bundle/node.exe
 src-tauri/gen/codegraph-bundle/lib/
 src-tauri/gen/codegraph-bundle/bin/
 src-tauri/gen/codegraph-bundle/manifest.json
+src-tauri/gen/headroom-proxy-bundle/lib/
+src-tauri/gen/headroom-proxy-bundle/manifest.json
+src-tauri/gen/headroom-proxy-bundle/version.txt
 src-tauri/gen/agentmemory-bundle/node_modules/
 src-tauri/gen/agentmemory-bundle/bin/
 src-tauri/gen/agentmemory-bundle/manifest.json

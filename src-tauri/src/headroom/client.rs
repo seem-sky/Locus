@@ -1,16 +1,19 @@
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::process_util::suppress_command_window;
+use crate::process_util::{kill_process_tree, suppress_command_window};
 use crate::session::models::ChatMessage;
 
 use super::messages::{apply_compressed_messages, to_headroom_openai_messages};
+use super::proxy_client::HeadroomProxyClient;
 use super::{HeadroomCompressMeta, HeadroomRewriteMeta};
 
 const DEFAULT_MODEL: &str = "gpt-4o";
+const COMPRESS_SCRIPT_TIMEOUT: Duration = Duration::from_secs(45);
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -251,9 +254,17 @@ fn run_compress_script(payload: &Value) -> Result<CompressResponse, HeadroomComp
                 .unwrap_or(0)
         });
 
-    if crate::headroom::settings::proxy_autostart_wanted() {
-        if let Err(error) = super::ensure_proxy_ready() {
-            return Err(skipped_meta(original_chars, false, Some(error)));
+    if crate::headroom::settings::uses_local_proxy_endpoint() {
+        let client = HeadroomProxyClient::from_settings();
+        if !client.health().available {
+            return Err(skipped_meta(
+                original_chars,
+                true,
+                Some(format!(
+                    "headroom proxy is not listening at {} (open Headroom settings and refresh, or restart Locus)",
+                    client.base_url()
+                )),
+            ));
         }
     }
 
@@ -314,12 +325,8 @@ fn run_compress_script(payload: &Value) -> Result<CompressResponse, HeadroomComp
         let _ = stdin.write_all(payload.to_string().as_bytes());
     }
 
-    let output = child.wait_with_output().map_err(|error| {
-        skipped_meta(
-            original_chars,
-            false,
-            Some(format!("Headroom compress process failed: {error}")),
-        )
+    let output = wait_child_output_with_timeout(child, COMPRESS_SCRIPT_TIMEOUT).map_err(|error| {
+        skipped_meta(original_chars, true, Some(error))
     })?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -356,6 +363,47 @@ fn run_compress_script(payload: &Value) -> Result<CompressResponse, HeadroomComp
     }
 
     Ok(parsed)
+}
+
+fn wait_child_output_with_timeout(
+    mut child: Child,
+    timeout: Duration,
+) -> Result<std::process::Output, String> {
+    use std::io::Read;
+
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let mut stdout = Vec::new();
+                let mut stderr = Vec::new();
+                if let Some(mut out) = child.stdout.take() {
+                    let _ = out.read_to_end(&mut stdout);
+                }
+                if let Some(mut err) = child.stderr.take() {
+                    let _ = err.read_to_end(&mut stderr);
+                }
+                return Ok(std::process::Output {
+                    status,
+                    stdout,
+                    stderr,
+                });
+            }
+            Ok(None) => {
+                if started.elapsed() >= timeout {
+                    kill_process_tree(&mut child);
+                    return Err(format!(
+                        "Headroom compress timed out after {}s (proxy may be overloaded; retry or restart Locus)",
+                        timeout.as_secs()
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(error) => {
+                return Err(format!("Headroom compress process failed: {error}"));
+            }
+        }
+    }
 }
 
 fn skipped_meta(

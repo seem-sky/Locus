@@ -108,6 +108,10 @@ export function getHeadroomSettingsStatus(): Promise<HeadroomSettingsStatus> {
   return ipcInvoke<HeadroomSettingsStatus>("get_headroom_settings_status");
 }
 
+export function ensureHeadroomProxy(): Promise<void> {
+  return ipcInvoke<void>("ensure_headroom_proxy");
+}
+
 export function saveHeadroomSettings(settings: HeadroomSettings): Promise<HeadroomSettingsStatus> {
   return ipcInvoke<HeadroomSettingsStatus>("save_headroom_settings", { settings });
 }

@@ -112,6 +112,10 @@ function isPreToolGuardV6Applied(source) {
   return source.includes("/* locus-pre-tool-guard-v6 */");
 }
 
+function isPreToolGuardV7Applied(source) {
+  return source.includes("/* locus-pre-tool-guard-v7 */");
+}
+
 const PRE_TOOL_GUARD_V5_HELPERS = `/* locus-pre-tool-guard-v5 */
 function locusNormalizeHookType(hookType) {
 \tif (typeof hookType !== "string") return "";
@@ -145,7 +149,8 @@ function locusResolvePreToolName(raw) {
 function locusShouldSkipPreToolObserve(payload, raw) {
 \tconst hook = locusNormalizeHookType(payload?.hookType);
 \tif (hook !== "pre_tool_use") return false;
-\treturn locusEmptyPreToolToolName(locusResolvePreToolName(raw));
+\t// Locus records tool results via post_tool_use; pre_tool_use only produces hook-noise cards.
+\treturn true;
 }
 `;
 
@@ -285,6 +290,94 @@ function patchAgentmemoryPreToolGuardV6(source) {
   return next === source ? null : next;
 }
 
+function patchAgentmemoryPreToolGuardV7(source) {
+  let next = source;
+  if (isPreToolGuardV7Applied(next)) {
+    return null;
+  }
+
+  const skipOldVariants = [
+    `function locusShouldSkipPreToolObserve(payload, raw) {
+\tconst hook = locusNormalizeHookType(payload?.hookType);
+\tif (hook !== "pre_tool_use") return false;
+\tconst toolName = locusResolvePreToolName(raw);
+\tif (locusEmptyPreToolToolName(toolName)) return true;
+\treturn false;
+}`,
+    `function locusShouldSkipPreToolObserve(payload, raw) {
+\tconst hook = locusNormalizeHookType(payload?.hookType);
+\tif (hook !== "pre_tool_use") return false;
+\treturn true;
+}`,
+  ];
+  const skipNew = `function locusShouldSkipPreToolObserve(payload, raw) {
+\t/* locus-pre-tool-guard-v7 */
+\tconst hook = locusNormalizeHookType(payload?.hookType);
+\tif (hook !== "pre_tool_use") return false;
+\treturn true;
+}`;
+  for (const old of skipOldVariants) {
+    if (next.includes(old)) {
+      next = next.replace(old, skipNew);
+      break;
+    }
+  }
+
+  const apiGuardPartial = `\t\t/* locus-api-observe-guard */
+\t\tif (locusNormalizeHookType(hookType) === "pre_tool_use") {
+\t\t\tconst data = body.data;
+\t\t\tlet toolName = "";
+\t\t\tif (data && typeof data === "object" && !Array.isArray(data)) {
+\t\t\t\tif (typeof data.tool_name === "string") toolName = data.tool_name.trim();
+\t\t\t\telse if (typeof data.toolName === "string") toolName = data.toolName.trim();
+\t\t\t}
+\t\t\tif (locusEmptyPreToolToolName(toolName)) {
+\t\t\t\treturn {
+\t\t\t\t\tstatus_code: 201,
+\t\t\t\t\tbody: { success: true, skipped: true, reason: "empty_pre_tool_use" }
+\t\t\t\t};
+\t\t\t}
+\t\t}`;
+  const apiGuardAllPre = `\t\t/* locus-api-observe-guard-v7 */
+\t\tif (locusNormalizeHookType(hookType) === "pre_tool_use") {
+\t\t\treturn {
+\t\t\t\tstatus_code: 201,
+\t\t\t\tbody: { success: true, skipped: true, reason: "pre_tool_use_disabled" }
+\t\t\t};
+\t\t}`;
+  if (next.includes(apiGuardPartial)) {
+    next = next.replace(apiGuardPartial, apiGuardAllPre);
+  }
+
+  const legacyApiGuard = `\t\t/* locus-api-observe-guard */
+\t\tif (hookType === "pre_tool_use") {
+\t\t\tconst data = body.data;
+\t\t\tlet toolName = "";
+\t\t\tif (data && typeof data === "object" && !Array.isArray(data)) {
+\t\t\t\tif (typeof data.tool_name === "string") toolName = data.tool_name.trim();
+\t\t\t\telse if (typeof data.toolName === "string") toolName = data.toolName.trim();
+\t\t\t}
+\t\t\tif (!toolName || toolName === hookType) {
+\t\t\t\treturn {
+\t\t\t\t\tstatus_code: 201,
+\t\t\t\t\tbody: { success: true, skipped: true, reason: "empty_pre_tool_use" }
+\t\t\t\t};
+\t\t\t}
+\t\t}`;
+  if (next.includes(legacyApiGuard)) {
+    next = next.replace(legacyApiGuard, apiGuardAllPre);
+  }
+
+  if (!isPreToolGuardV7Applied(next) && next.includes("function locusShouldSkipPreToolObserve")) {
+    next = next.replace(
+      "function locusShouldSkipPreToolObserve(payload, raw) {",
+      "function locusShouldSkipPreToolObserve(payload, raw) {\n\t/* locus-pre-tool-guard-v7 */",
+    );
+  }
+
+  return next === source ? null : next;
+}
+
 function patchAgentmemoryIndexFile(indexPath) {
   if (!existsSync(indexPath)) {
     return false;
@@ -307,6 +400,7 @@ function patchAgentmemoryIndexFile(indexPath) {
     isApiObserveGuardApplied(source) &&
     isPreToolGuardV5Applied(source) &&
     isPreToolGuardV6Applied(source) &&
+    isPreToolGuardV7Applied(source) &&
     source.includes("locus-observations-hydrate") &&
     source === original
   ) {
@@ -320,6 +414,10 @@ function patchAgentmemoryIndexFile(indexPath) {
   const v6 = patchAgentmemoryPreToolGuardV6(source);
   if (v6) {
     source = v6;
+  }
+  const v7 = patchAgentmemoryPreToolGuardV7(source);
+  if (v7) {
+    source = v7;
   }
 
   const observeNeedle = `\t\t\tif (payload.hookType === "prompt_submit") raw.userPrompt = d["prompt"];`;
@@ -843,6 +941,52 @@ function patchAgentmemoryViewerV4(viewerPath) {
   return true;
 }
 
+const LOCUS_VIEWER_NOISE_FN_V5 = `    /* locus-viewer-timeline-v5 */
+    function locusIsHookNoiseObservation(o) {
+      if (!o) return true;
+      var hydrated = typeof locusHydrateObservation === 'function' ? locusHydrateObservation(o) : o;
+      if (hydrated.hookType === 'pre_tool_use') return true;
+      if (hydrated.hookType === 'post_tool_use' || hydrated.hookType === 'post_tool_failure') return false;
+      var realToolTypes = ['file_read','file_write','file_edit','command_run','search','web_fetch','subagent','error','decision','discovery','task','image'];
+      if (hydrated.type && realToolTypes.indexOf(hydrated.type) >= 0) return false;
+      var text = ((hydrated.title || '') + ' ' + (hydrated.narrative || '') + ' ' + (hydrated.subtitle || '')).toLowerCase();
+      var markers = [
+        'pre-tool-use hook', 'pre_tool_use hook', 'pretooluse hook', 'hook fired before tool execution with no payload',
+        'hook notification', 'hook event lifecycle', 'hook triggered', 'hook fired',
+        'hook event with no', 'no tool details', 'no associated tool', 'minimal hook notification',
+        'no actionable content', 'standalone hook firing', 'bare hook trigger', 'pretooluse', 'pre tool use hook'
+      ];
+      if (markers.some(function(m) { return text.indexOf(m) >= 0; })) return true;
+      var tool = locusResolveToolName(hydrated);
+      if (tool) return false;
+      if (!text.trim()) return true;
+      return false;
+    }`;
+
+function patchAgentmemoryViewerV5(viewerPath) {
+  let source = readFileSync(viewerPath, "utf8");
+  const original = source;
+  if (source.includes("/* locus-viewer-timeline-v5 */")) {
+    return false;
+  }
+  const v3Start = source.indexOf("/* locus-viewer-timeline-v3 */");
+  const fnStart = source.indexOf("function locusIsHookNoiseObservation(o)");
+  if (fnStart < 0) {
+    return false;
+  }
+  const fnEnd = source.indexOf("\n    function ", fnStart + 1);
+  if (fnEnd < 0) {
+    return false;
+  }
+  const blockStart = v3Start >= 0 && v3Start < fnStart ? v3Start : fnStart;
+  source = source.slice(0, blockStart) + LOCUS_VIEWER_NOISE_FN_V5 + source.slice(fnEnd);
+  if (source === original) {
+    return false;
+  }
+  writeFileSync(viewerPath, source);
+  return true;
+}
+
 function patchAgentmemoryViewerV2(viewerPath) {
   let source = readFileSync(viewerPath, "utf8");
   const original = source;
@@ -914,6 +1058,10 @@ function patchAgentmemoryViewer() {
     if (patchAgentmemoryViewerV4(viewerPath)) {
       patched += 1;
       console.log(`[locus] Patched agentmemory viewer timeline (v4): ${path.relative(repoRoot, viewerPath)}`);
+    }
+    if (patchAgentmemoryViewerV5(viewerPath)) {
+      patched += 1;
+      console.log(`[locus] Patched agentmemory viewer timeline (v5): ${path.relative(repoRoot, viewerPath)}`);
     }
   }
 }

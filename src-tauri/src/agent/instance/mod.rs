@@ -8476,31 +8476,7 @@ impl AgentInstance {
                     }
                 }
 
-                if self.has_selected_working_dir() {
-                    let memory_store: tauri::State<
-                        '_,
-                        std::sync::Arc<crate::agentmemory::AgentMemoryState>,
-                    > = app_handle.state();
-                    let memory_store = memory_store.inner().clone();
-                    let session_id = self.agentmemory_session_id().to_string();
-                    let working_dir = self.working_dir.clone();
-                    for (tc, args) in &prepared {
-                        let memory_store = memory_store.clone();
-                        let session_id = session_id.clone();
-                        let working_dir = working_dir.clone();
-                        let tool_name = tc.name.clone();
-                        let tool_input = args.clone();
-                        let _ = tauri::async_runtime::spawn_blocking(move || {
-                            memory_store.observe_pre_tool_use(
-                                &session_id,
-                                &working_dir,
-                                &tool_name,
-                                &tool_input,
-                            );
-                        })
-                        .await;
-                    }
-                }
+                // pre_tool_use observations compress into empty hook cards; post_tool_use has real data.
 
                 let has_unity_recompile = prepared.iter().any(|(tc, _)| tc.name == "unity_recompile");
                 let results = if has_unity_recompile {

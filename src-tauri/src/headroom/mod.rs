@@ -2,6 +2,7 @@ mod client;
 mod messages;
 mod proxy_client;
 mod proxy_service;
+pub mod resolve;
 mod rewrite;
 mod settings;
 
@@ -14,7 +15,7 @@ pub use settings::{
     context_compress_enabled, init as init_headroom_settings, min_compress_chars,
     proxy_autostart_wanted, reset_to_defaults as reset_headroom_settings,
     save as save_headroom_settings, status as headroom_settings_status, uses_local_proxy_endpoint,
-    HeadroomSettings, HeadroomSettingsStatus,
+    HeadroomProxyRuntimeStatus, HeadroomProxySource, HeadroomSettings, HeadroomSettingsStatus,
 };
 pub use rewrite::{
     augment_path_with_headroom_rtk, grep_tool_native_meta, rewrite_bash_with_meta, rewrite_with_meta,
@@ -25,7 +26,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 const SETUP_HINT: &str =
-    "RTK compresses supported CLI commands; run `headroom proxy` for LLM context Library compress before auto-compact";
+    "RTK compresses supported CLI commands; bundled headroom proxy autostarts for Library compress before auto-compact";
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]

@@ -1,7 +1,7 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from "vue";
+import { computed, onMounted, onUnmounted, ref } from "vue";
 import { t } from "../../i18n";
-import { getHeadroomSettingsStatus, saveHeadroomSettings } from "../../services/system";
+import { ensureHeadroomProxy, getHeadroomSettingsStatus, saveHeadroomSettings } from "../../services/system";
 import type { HeadroomSettings, HeadroomSettingsStatus } from "../../types";
 import BaseButton from "../ui/BaseButton.vue";
 import BaseSwitch from "../ui/BaseSwitch.vue";
@@ -10,14 +10,16 @@ const status = ref<HeadroomSettingsStatus | null>(null);
 const draft = ref<HeadroomSettings>(defaultSettings());
 const loading = ref(false);
 const saving = ref(false);
+const proxyStarting = ref(false);
 const error = ref<string | null>(null);
 const saveError = ref<string | null>(null);
+let proxyPollTimer: ReturnType<typeof setInterval> | null = null;
 
 function defaultSettings(): HeadroomSettings {
   return {
     enabled: true,
     contextCompressEnabled: true,
-    baseUrl: "http://localhost:8787",
+    baseUrl: "http://127.0.0.1:8787",
     apiKey: "",
     rtkPath: "",
     minCompressChars: 2000,
@@ -33,12 +35,70 @@ function applyStatus(next: HeadroomSettingsStatus) {
   draft.value = cloneSettings(next.settings);
 }
 
+function shouldEnsureLocalProxy(next: HeadroomSettingsStatus): boolean {
+  const proxy = next.proxy;
+  if (!proxy.autostartEnabled || proxy.running) {
+    return false;
+  }
+  return proxy.source === "bundled"
+    || proxy.source === "external"
+    || proxy.source === "notConfigured";
+}
+
+function stopProxyPolling() {
+  if (proxyPollTimer) {
+    clearInterval(proxyPollTimer);
+    proxyPollTimer = null;
+  }
+}
+
+function startProxyPolling() {
+  stopProxyPolling();
+  proxyPollTimer = setInterval(() => {
+    void refreshProxyStatusOnly();
+  }, 3000);
+}
+
+async function refreshProxyStatusOnly() {
+  try {
+    const next = await getHeadroomSettingsStatus();
+    applyStatus(next);
+    if (next.proxy.running) {
+      proxyStarting.value = false;
+      stopProxyPolling();
+    }
+  } catch {
+    // Keep polling; transient IPC errors should not block the panel.
+  }
+}
+
+function ensureLocalProxyInBackground() {
+  if (proxyStarting.value) {
+    return;
+  }
+  proxyStarting.value = true;
+  startProxyPolling();
+  void ensureHeadroomProxy()
+    .catch(() => undefined)
+    .finally(() => {
+      proxyStarting.value = false;
+      void refreshProxyStatusOnly();
+    });
+}
+
 async function loadStatus() {
   loading.value = true;
   error.value = null;
   saveError.value = null;
   try {
-    applyStatus(await getHeadroomSettingsStatus());
+    const next = await getHeadroomSettingsStatus();
+    applyStatus(next);
+    if (shouldEnsureLocalProxy(next)) {
+      ensureLocalProxyInBackground();
+    } else {
+      stopProxyPolling();
+      proxyStarting.value = false;
+    }
   } catch (err) {
     error.value = err instanceof Error ? err.message : String(err);
   } finally {
@@ -50,7 +110,11 @@ async function persistDraft() {
   saving.value = true;
   saveError.value = null;
   try {
-    applyStatus(await saveHeadroomSettings(draft.value));
+    const next = await saveHeadroomSettings(draft.value);
+    applyStatus(next);
+    if (shouldEnsureLocalProxy(next)) {
+      ensureLocalProxyInBackground();
+    }
   } catch (err) {
     saveError.value = err instanceof Error ? err.message : String(err);
   } finally {
@@ -90,6 +154,52 @@ const contextLibraryStatusLabel = computed(() => {
   return t("settings.headroom.statusContextUnavailable");
 });
 
+const proxySourceLabel = computed(() => {
+  const proxy = status.value?.proxy;
+  if (!proxy) return "";
+  const key = `settings.headroom.proxySource.${proxy.source}`;
+  const label = t(key);
+  if (proxy.runtimeDetail) {
+    return `${label} (${proxy.runtimeDetail})`;
+  }
+  return label;
+});
+
+const proxyRunningLabel = computed(() => {
+  if (proxyStarting.value) {
+    return t("settings.headroom.proxyStarting");
+  }
+  const proxy = status.value?.proxy;
+  if (!proxy) return "";
+  if (proxy.source === "disabled" || proxy.source === "cloud") {
+    return proxy.running
+      ? t("settings.headroom.proxyReachable")
+      : t("settings.headroom.proxyUnreachable");
+  }
+  return proxy.running
+    ? t("settings.headroom.proxyRunningYes")
+    : t("settings.headroom.proxyRunningNo");
+});
+
+const proxyAutostartLabel = computed(() => {
+  const proxy = status.value?.proxy;
+  if (!proxy) return "";
+  if (proxy.source === "cloud" || proxy.source === "disabled") {
+    return t("settings.headroom.proxyAutostartNa");
+  }
+  return proxy.autostartEnabled
+    ? t("settings.headroom.proxyAutostartOn")
+    : t("settings.headroom.proxyAutostartOff");
+});
+
+const proxyBundleLabel = computed(() => {
+  const proxy = status.value?.proxy;
+  if (!proxy) return "";
+  return proxy.bundlePresent
+    ? t("settings.headroom.proxyBundlePresent")
+    : t("settings.headroom.proxyBundleMissing");
+});
+
 const advancedDirty = computed(() => {
   if (!status.value) return false;
   const saved = status.value.settings;
@@ -103,6 +213,10 @@ const advancedDirty = computed(() => {
 
 onMounted(() => {
   void loadStatus();
+});
+
+onUnmounted(() => {
+  stopProxyPolling();
 });
 </script>
 
@@ -130,6 +244,24 @@ onMounted(() => {
           <dd>{{ libraryStatusLabel }}</dd>
           <dt>{{ t("settings.headroom.contextStatus") }}</dt>
           <dd>{{ contextLibraryStatusLabel }}</dd>
+          <dt>{{ t("settings.headroom.proxyStatus") }}</dt>
+          <dd>{{ proxySourceLabel }}</dd>
+          <dt>{{ t("settings.headroom.proxyRunning") }}</dt>
+          <dd>{{ proxyRunningLabel }}</dd>
+          <dt>{{ t("settings.headroom.proxyEndpoint") }}</dt>
+          <dd class="headroom-mono">{{ status.proxy.endpoint }}</dd>
+          <template v-if="status.proxy.source === 'bundled' || status.proxy.source === 'external'">
+            <dt>{{ t("settings.headroom.proxyAutostart") }}</dt>
+            <dd>{{ proxyAutostartLabel }}</dd>
+          </template>
+          <template v-if="status.proxy.source === 'bundled' || status.proxy.source === 'notConfigured'">
+            <dt>{{ t("settings.headroom.proxyBundle") }}</dt>
+            <dd>{{ proxyBundleLabel }}</dd>
+          </template>
+          <template v-if="status.proxy.error">
+            <dt>{{ t("settings.headroom.proxyError") }}</dt>
+            <dd class="headroom-error-inline">{{ status.proxy.error }}</dd>
+          </template>
         </dl>
       </section>
 
@@ -273,6 +405,18 @@ onMounted(() => {
 
 .headroom-grid dt {
   color: var(--text-secondary);
+}
+
+.headroom-mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  word-break: break-all;
+}
+
+.headroom-error-inline {
+  color: var(--danger, #e5484d);
+  font-size: 12px;
+  word-break: break-word;
 }
 
 .headroom-toggle-row {

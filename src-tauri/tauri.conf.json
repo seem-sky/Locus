@@ -52,6 +52,7 @@
       "./gen/lua53": "lua53/",
       "./gen/rtk": "rtk/",
       "./gen/headroom-bundle": "headroom-bundle/",
+      "./gen/headroom-proxy-bundle": "headroom-proxy-bundle/",
       "../agent": "agent/",
       "../knowledge": "knowledge/",
       "../skills": "skills/",

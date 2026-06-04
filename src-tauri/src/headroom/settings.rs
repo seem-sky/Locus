@@ -2,9 +2,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{OnceLock, RwLock};
 
 use serde::{Deserialize, Serialize};
+use tauri::AppHandle;
 
 const HEADROOM_CONFIG_FILE: &str = "headroom.json";
-const DEFAULT_BASE_URL: &str = "http://localhost:8787";
+const DEFAULT_BASE_URL: &str = "http://127.0.0.1:8787";
 const DEFAULT_MIN_COMPRESS_CHARS: u32 = 2000;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -26,10 +27,35 @@ pub struct HeadroomSettings {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+pub enum HeadroomProxySource {
+    Disabled,
+    Cloud,
+    Bundled,
+    External,
+    NotConfigured,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct HeadroomProxyRuntimeStatus {
+    pub source: HeadroomProxySource,
+    pub running: bool,
+    pub health_status: String,
+    pub endpoint: String,
+    pub runtime_detail: String,
+    pub autostart_enabled: bool,
+    pub bundle_present: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct HeadroomSettingsStatus {
     pub settings: HeadroomSettings,
     pub library_available: bool,
     pub context_library_available: bool,
+    pub proxy: HeadroomProxyRuntimeStatus,
 }
 
 impl Default for HeadroomSettings {
@@ -99,12 +125,101 @@ pub fn reset_to_defaults() {
     apply_process_env(defaults);
 }
 
-pub fn status() -> HeadroomSettingsStatus {
+pub fn status(app_handle: Option<&AppHandle>) -> HeadroomSettingsStatus {
     let settings = current();
     HeadroomSettingsStatus {
         library_available: super::library_available(),
         context_library_available: super::context_library_available(),
+        proxy: proxy_runtime_status(app_handle),
         settings,
+    }
+}
+
+pub fn proxy_runtime_status(app_handle: Option<&AppHandle>) -> HeadroomProxyRuntimeStatus {
+    let endpoint = base_url();
+    let bundle_present = super::resolve::bundled_proxy_lib_present();
+    let health = super::proxy_client::HeadroomProxyClient::from_settings().health();
+    let running = health.available;
+    let health_status = health.status;
+    let mut error = health.error;
+
+    if !enabled() {
+        return HeadroomProxyRuntimeStatus {
+            source: HeadroomProxySource::Disabled,
+            running: false,
+            health_status: "n/a".to_string(),
+            endpoint,
+            runtime_detail: String::new(),
+            autostart_enabled: false,
+            bundle_present,
+            error: None,
+        };
+    }
+
+    if !uses_local_proxy_endpoint() {
+        return HeadroomProxyRuntimeStatus {
+            source: HeadroomProxySource::Cloud,
+            running,
+            health_status,
+            endpoint,
+            runtime_detail: String::new(),
+            autostart_enabled: proxy_autostart_wanted(),
+            bundle_present,
+            error,
+        };
+    }
+
+    let autostart_enabled = proxy_autostart_wanted();
+    match super::resolve::resolve_headroom_proxy(app_handle) {
+        Ok(resolved) => {
+            let source = if resolved.using_bundled_runtime {
+                HeadroomProxySource::Bundled
+            } else {
+                HeadroomProxySource::External
+            };
+            let runtime_detail = if resolved.using_bundled_runtime {
+                resolved
+                    .bundle_version
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or_else(|| {
+                        super::resolve::read_bundle_version_from_root(&resolved.working_dir)
+                            .unwrap_or_else(|| "bundled".to_string())
+                    })
+            } else if resolved.prefix_args.is_empty() {
+                resolved.program.display().to_string()
+            } else {
+                format!(
+                    "{} {}",
+                    resolved.program.display(),
+                    resolved.prefix_args.join(" ")
+                )
+            };
+            HeadroomProxyRuntimeStatus {
+                source,
+                running,
+                health_status,
+                endpoint,
+                runtime_detail,
+                autostart_enabled,
+                bundle_present,
+                error,
+            }
+        }
+        Err(resolve_error) => {
+            if error.is_none() {
+                error = Some(resolve_error);
+            }
+            HeadroomProxyRuntimeStatus {
+                source: HeadroomProxySource::NotConfigured,
+                running,
+                health_status,
+                endpoint,
+                runtime_detail: String::new(),
+                autostart_enabled,
+                bundle_present,
+                error,
+            }
+        }
     }
 }
 
@@ -293,8 +408,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn uses_local_proxy_endpoint_detects_loopback() {
+    fn proxy_endpoint_classification() {
+        std::env::set_var("HEADROOM_BASE_URL", "http://localhost:8787");
         assert!(uses_local_proxy_endpoint());
+
+        std::env::set_var("HEADROOM_BASE_URL", "https://api.headroom.example");
+        assert!(!uses_local_proxy_endpoint());
+        assert_eq!(
+            proxy_runtime_status(None).source,
+            HeadroomProxySource::Cloud
+        );
+
+        std::env::remove_var("HEADROOM_BASE_URL");
     }
 
     #[test]

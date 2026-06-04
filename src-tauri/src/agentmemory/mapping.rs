@@ -180,13 +180,9 @@ pub fn is_memory_pattern_noise(value: &str) -> bool {
     is_observation_hook_noise(value)
 }
 
-/// Skip pre_tool_use observations that carry no tool identity (avoids empty hook cards in agentmemory).
-pub fn should_observe_pre_tool_use(tool_name: &str, _tool_input: &serde_json::Value) -> bool {
-    let name = tool_name.trim();
-    if name.is_empty() {
-        return false;
-    }
-    !is_observation_hook_noise(name)
+/// Locus records tool activity via `post_tool_use` and session-tree replay; pre_tool_use only creates hook-noise cards.
+pub fn should_observe_pre_tool_use(_tool_name: &str, _tool_input: &serde_json::Value) -> bool {
+    false
 }
 
 pub fn should_observe_tool_failure(tool_output: &str) -> bool {
@@ -588,14 +584,14 @@ mod tests {
     }
 
     #[test]
-    fn pre_tool_use_skips_empty_or_hook_noise_names() {
+    fn pre_tool_use_never_observed_from_locus() {
         assert!(!should_observe_pre_tool_use("", &serde_json::json!({})));
         assert!(!should_observe_pre_tool_use("   ", &serde_json::json!({"path": "a"})));
         assert!(!should_observe_pre_tool_use("pre_tool_use", &serde_json::json!({})));
         assert!(!should_observe_pre_tool_use("PreToolUse", &serde_json::json!({})));
         assert!(!should_observe_pre_tool_use("notification", &serde_json::json!({})));
-        assert!(should_observe_pre_tool_use("read", &serde_json::json!({})));
-        assert!(should_observe_pre_tool_use(
+        assert!(!should_observe_pre_tool_use("read", &serde_json::json!({})));
+        assert!(!should_observe_pre_tool_use(
             "read",
             &serde_json::json!({"path": "README.md"}),
         ));

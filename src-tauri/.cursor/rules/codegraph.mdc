@@ -3,13 +3,13 @@ description: CodeGraph MCP usage guide — when to use which tool
 alwaysApply: true
 ---
 <!-- CODEGRAPH_START -->
-## CodeGraph preferred, grep secondary
+## CodeGraph
 
-This project has a CodeGraph MCP server (`codegraph_*` tools) configured. **Default to CodeGraph first** for any structural question (where is X, who calls Y, what would change). `grep` is a secondary fallback for **literal text only** (string contents, log messages, comments, regex over content) — it must not be used to look up symbols, call relationships, or blast radius.
+This project has a CodeGraph MCP server (`codegraph_*` tools) configured. CodeGraph is a tree-sitter-parsed knowledge graph of every symbol, edge, and file. Reads are sub-millisecond and return structural information grep cannot.
 
 ### When to prefer codegraph over native search
 
-Use codegraph for **structural** questions — what calls what, what would break, where is X defined, what is X's signature. Use native `grep` / `read` only for **literal text** queries (string contents, comments, log messages) or after you already have a specific file open.
+Use codegraph for **structural** questions — what calls what, what would break, where is X defined, what is X's signature. Use native grep/read only for **literal text** queries (string contents, comments, log messages) or after you already have a specific file open.
 
 | Question | Tool |
 |---|---|
@@ -26,7 +26,6 @@ Use codegraph for **structural** questions — what calls what, what would break
 
 ### Rules of thumb
 
-- **Default to CodeGraph first.** For any structural question, call `codegraph_*` before `grep`. `grep` is for literal text only.
 - **Answer directly — don't delegate exploration.** For "how does X work" / architecture questions, answer with 2-3 codegraph calls: `codegraph_context` first, then ONE `codegraph_explore` for the source of the symbols it surfaces. For a specific **flow** ("how does X reach Y") start with `codegraph_trace` from→to — one call returns the whole path with dynamic hops bridged — then ONE `codegraph_explore` for the bodies; don't rebuild the path with `codegraph_search` + `codegraph_callers`. Codegraph IS the pre-built index, so spawning a separate file-reading sub-task/agent — or running a grep + read loop — repeats work codegraph already did and costs more for the same answer.
 - **Trust codegraph results.** They come from a full AST parse. Do NOT re-verify them with grep — that's slower, less accurate, and wastes context.
 - **Don't grep first** when looking up a symbol by name. `codegraph_search` is faster and returns kind + location + signature in one call.

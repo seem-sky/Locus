@@ -272,10 +272,34 @@ pub(super) fn grep() -> ToolDef {
                 let compress_meta = if rewrite_meta.rewritten {
                     None
                 } else {
-                    let (compressed, meta) = crate::headroom::compress_tool_output(
-                        &output,
-                        ctx.llm_model.as_deref(),
-                    );
+                    let output_for_compress = output.clone();
+                    let model = ctx.llm_model.clone();
+                    let (compressed, meta) = tokio::task::spawn_blocking(move || {
+                        crate::headroom::compress_tool_output(
+                            &output_for_compress,
+                            model.as_deref(),
+                        )
+                    })
+                    .await
+                    .unwrap_or_else(|error| {
+                        (
+                            output.clone(),
+                            crate::headroom::HeadroomCompressMeta {
+                                enabled: crate::headroom::enabled(),
+                                available: false,
+                                compressed: false,
+                                original_chars: output.chars().count(),
+                                compressed_chars: None,
+                                tokens_before: None,
+                                tokens_after: None,
+                                tokens_saved: None,
+                                compression_ratio: None,
+                                transforms_applied: Vec::new(),
+                                ccr_hashes: Vec::new(),
+                                error: Some(error.to_string()),
+                            },
+                        )
+                    });
                     if meta.compressed {
                         output = compressed;
                     }

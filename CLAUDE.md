@@ -77,10 +77,12 @@ Locus integrates [Headroom](https://github.com/chopratejas/headroom) in three la
 **headroom-ai (bash fallback + Library context compress):**
 
 ```bash
-headroom proxy          # default http://localhost:8787 (Locus autostarts when Headroom enabled + local base URL)
+headroom proxy          # default http://localhost:8787 (Locus autostarts bundled proxy when enabled + local base URL)
 # or: export HEADROOM_API_KEY=hr_... with https://api.headroom.ai (no local proxy)
 # LOCUS_HEADROOM_PROXY_AUTOSTART=0 to disable proxy autostart
-# LOCUS_HEADROOM_CLI=/path/to/headroom if not on PATH
+# bun run headroom:proxy:bundle — ships headroom-ai[proxy] in resources/headroom-proxy-bundle/
+# LOCUS_HEADROOM_CLI=/path/to/headroom overrides bundled proxy
+# LOCUS_HEADROOM_PROXY_BUNDLE=/path/to/headroom-proxy-bundle
 bun install             # dev: headroom-ai npm dependency
 bun run headroom:bundle # packaged builds
 ```

@@ -27,17 +27,31 @@ pub fn save_proxy_config(
 }
 
 #[tauri::command]
-pub fn get_headroom_settings_status() -> crate::headroom::HeadroomSettingsStatus {
-    crate::headroom::headroom_settings_status()
+pub fn get_headroom_settings_status(
+    app_handle: AppHandle,
+) -> crate::headroom::HeadroomSettingsStatus {
+    crate::headroom::headroom_settings_status(Some(&app_handle))
+}
+
+#[tauri::command]
+pub async fn ensure_headroom_proxy() -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(crate::headroom::ensure_proxy_ready)
+        .await
+        .map_err(|error| format!("headroom proxy ensure task failed: {error}"))?
 }
 
 #[tauri::command]
 pub fn save_headroom_settings(
+    app_handle: AppHandle,
     settings: crate::headroom::HeadroomSettings,
 ) -> Result<crate::headroom::HeadroomSettingsStatus, crate::error::AppError> {
-    crate::headroom::save_headroom_settings(settings)
-        .map(|_| crate::headroom::headroom_settings_status())
-        .map_err(crate::error::AppError::from)
+    crate::headroom::save_headroom_settings(settings).map_err(crate::error::AppError::from)?;
+    if crate::headroom::proxy_autostart_wanted() {
+        std::thread::spawn(|| {
+            let _ = crate::headroom::ensure_proxy_ready();
+        });
+    }
+    Ok(crate::headroom::headroom_settings_status(Some(&app_handle)))
 }
 
 #[tauri::command]

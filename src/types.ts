@@ -565,10 +565,29 @@ export interface HeadroomSettings {
   minCompressChars: number;
 }
 
+export type HeadroomProxySource =
+  | "disabled"
+  | "cloud"
+  | "bundled"
+  | "external"
+  | "notConfigured";
+
+export interface HeadroomProxyRuntimeStatus {
+  source: HeadroomProxySource;
+  running: boolean;
+  healthStatus: string;
+  endpoint: string;
+  runtimeDetail: string;
+  autostartEnabled: boolean;
+  bundlePresent: boolean;
+  error?: string;
+}
+
 export interface HeadroomSettingsStatus {
   settings: HeadroomSettings;
   libraryAvailable: boolean;
   contextLibraryAvailable: boolean;
+  proxy: HeadroomProxyRuntimeStatus;
 }
 
 export interface AuthUrlInfo {

@@ -1,18 +1,23 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-use super::proxy_client::{HeadroomProxyClient, HeadroomProxyHealth};
+use tauri::AppHandle;
 
-const STARTUP_POLL_MS: u64 = 400;
-const STARTUP_MAX_ATTEMPTS: u32 = 75;
+use super::proxy_client::{HeadroomProxyClient, HeadroomProxyHealth};
+use super::resolve::{self, ResolvedHeadroomProxy};
+
+const STARTUP_POLL_MS: u64 = 500;
+const STARTUP_MAX_ATTEMPTS: u32 = 240;
+const BUNDLED_STARTUP_MAX_ATTEMPTS: u32 = 360;
 
 static GLOBAL_PROXY_STATE: OnceLock<std::sync::Arc<HeadroomProxyState>> = OnceLock::new();
 
 pub struct HeadroomProxyState {
     service: HeadroomProxyService,
     client: HeadroomProxyClient,
+    app_handle: Mutex<Option<AppHandle>>,
 }
 
 impl HeadroomProxyState {
@@ -20,6 +25,13 @@ impl HeadroomProxyState {
         Self {
             service: HeadroomProxyService::from_env(),
             client: HeadroomProxyClient::from_settings(),
+            app_handle: Mutex::new(None),
+        }
+    }
+
+    pub fn set_app_handle(&self, handle: AppHandle) {
+        if let Ok(mut guard) = self.app_handle.lock() {
+            *guard = Some(handle);
         }
     }
 
@@ -44,7 +56,12 @@ impl HeadroomProxyState {
             return Ok(());
         }
         let client = HeadroomProxyClient::from_settings();
-        self.service.ensure_running(&client)
+        let app_handle = self
+            .app_handle
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone());
+        self.service.ensure_running(&client, app_handle.as_ref())
     }
 }
 
@@ -87,7 +104,11 @@ impl HeadroomProxyService {
         matches!(child.try_wait(), Ok(None))
     }
 
-    pub fn ensure_running(&self, client: &HeadroomProxyClient) -> Result<(), String> {
+    pub fn ensure_running(
+        &self,
+        client: &HeadroomProxyClient,
+        app_handle: Option<&AppHandle>,
+    ) -> Result<(), String> {
         let health = client.health();
         if health.available {
             if self.locus_managed_process_alive() {
@@ -111,11 +132,15 @@ impl HeadroomProxyService {
             ));
         }
 
-        self.start(client)?;
-        self.wait_for_health(client)
+        self.start(client, app_handle)?;
+        self.wait_for_health(client, app_handle)
     }
 
-    pub fn start(&self, client: &HeadroomProxyClient) -> Result<(), String> {
+    pub fn start(
+        &self,
+        client: &HeadroomProxyClient,
+        app_handle: Option<&AppHandle>,
+    ) -> Result<(), String> {
         self.reap_exited_child();
         if client.health().available && self.locus_managed_process_alive() {
             return Ok(());
@@ -123,16 +148,20 @@ impl HeadroomProxyService {
 
         self.stop()?;
 
-        let program = resolve_headroom_cli()?;
+        let resolved = resolve::resolve_headroom_proxy(app_handle)?;
         let mut guard = self.child.lock().map_err(|error| error.to_string())?;
 
-        let mut cmd = std::process::Command::new(&program);
+        let mut cmd = build_proxy_command(&resolved)?;
         crate::process_util::suppress_command_window(&mut cmd);
         crate::network::apply_proxy_env_to_command(&mut cmd);
         crate::process_util::set_new_process_group(&mut cmd);
-        cmd.arg("proxy").stdout(Stdio::null());
+        cmd.current_dir(&resolved.working_dir);
+        cmd.stdout(Stdio::null());
 
         if let Some(log_path) = self.service_log_path() {
+            if let Some(parent) = log_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
             if let Ok(log_file) = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
@@ -141,15 +170,17 @@ impl HeadroomProxyService {
                 cmd.stderr(Stdio::from(log_file));
             }
             eprintln!(
-                "[Locus] starting headroom proxy at {} (log: {})",
+                "[Locus] starting headroom proxy at {} (bundled={}, log: {})",
                 client.base_url(),
+                resolved.using_bundled_runtime,
                 log_path.display()
             );
         } else {
             cmd.stderr(Stdio::null());
             eprintln!(
-                "[Locus] starting headroom proxy at {}",
-                client.base_url()
+                "[Locus] starting headroom proxy at {} (bundled={})",
+                client.base_url(),
+                resolved.using_bundled_runtime
             );
         }
 
@@ -168,11 +199,26 @@ impl HeadroomProxyService {
         Ok(())
     }
 
-    fn wait_for_health(&self, client: &HeadroomProxyClient) -> Result<(), String> {
-        for _ in 0..STARTUP_MAX_ATTEMPTS {
+    fn wait_for_health(
+        &self,
+        client: &HeadroomProxyClient,
+        app_handle: Option<&AppHandle>,
+    ) -> Result<(), String> {
+        let bundled = super::resolve::resolve_headroom_proxy(app_handle)
+            .map(|resolved| resolved.using_bundled_runtime)
+            .unwrap_or(false);
+        let max_attempts = if bundled {
+            BUNDLED_STARTUP_MAX_ATTEMPTS
+        } else {
+            STARTUP_MAX_ATTEMPTS
+        };
+        for attempt in 0..max_attempts {
             if client.health().available {
                 eprintln!("[Locus] headroom proxy ready at {}", client.base_url());
                 return Ok(());
+            }
+            if attempt == 0 || (attempt + 1) % 20 == 0 {
+                self.reap_exited_child();
             }
             std::thread::sleep(Duration::from_millis(STARTUP_POLL_MS));
         }
@@ -182,8 +228,9 @@ impl HeadroomProxyService {
             .map(|path| format!(" See log: {}", path.display()))
             .unwrap_or_default();
         Err(format!(
-            "headroom proxy failed to become healthy at {}{log_hint}. Install CLI: pip install 'headroom-ai[proxy]'",
-            client.base_url()
+            "headroom proxy failed to become healthy at {}{log_hint}. {}",
+            client.base_url(),
+            resolve::HEADROOM_PROXY_BUNDLE_HINT
         ))
     }
 
@@ -214,50 +261,52 @@ impl Drop for HeadroomProxyService {
     }
 }
 
-fn resolve_headroom_cli() -> Result<PathBuf, String> {
-    if let Ok(raw) = std::env::var("LOCUS_HEADROOM_CLI") {
-        let trimmed = raw.trim();
-        if !trimmed.is_empty() {
-            let path = PathBuf::from(trimmed);
-            if path.is_file() {
-                return Ok(path);
-            }
-            return Err(format!(
-                "LOCUS_HEADROOM_CLI is not a file: {}",
-                path.display()
-            ));
+fn build_proxy_command(resolved: &ResolvedHeadroomProxy) -> Result<std::process::Command, String> {
+    #[cfg(windows)]
+    let program = crate::process_util::windows_command_path(&resolved.program);
+    #[cfg(not(windows))]
+    let program = resolved.program.clone();
+
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(&resolved.prefix_args);
+
+    if resolved.using_bundled_runtime {
+        let lib_dir = resolved.working_dir.join("lib");
+        apply_bundled_python_env(&mut cmd, &resolved.program, &lib_dir)?;
+    }
+
+    Ok(cmd)
+}
+
+fn apply_bundled_python_env(
+    cmd: &mut std::process::Command,
+    python: &Path,
+    lib_dir: &Path,
+) -> Result<(), String> {
+    cmd.env("PYTHONNOUSERSITE", "1");
+    cmd.env("PYTHONPATH", lib_dir.as_os_str());
+
+    if python
+        .to_string_lossy()
+        .replace('\\', "/")
+        .contains("managed-python")
+    {
+        if let Some(home) = python.parent() {
+            cmd.env("PYTHONHOME", home.as_os_str());
         }
     }
 
-    for name in headroom_cli_names() {
-        if let Some(path) = find_on_path(name) {
-            return Ok(path);
-        }
+    if let Some(path) = prepend_path_env(lib_dir) {
+        cmd.env("PATH", path);
     }
 
-    Err(
-        "headroom CLI not found on PATH (install: pip install 'headroom-ai[proxy]', or set LOCUS_HEADROOM_CLI)"
-            .to_string(),
-    )
+    Ok(())
 }
 
-fn find_on_path(name: &str) -> Option<PathBuf> {
-    let path_var = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path_var) {
-        let candidate = dir.join(name);
-        if candidate.is_file() {
-            return Some(candidate);
-        }
+fn prepend_path_env(extra: &Path) -> Option<std::ffi::OsString> {
+    let mut paths = vec![extra.to_path_buf()];
+    if let Ok(existing) = std::env::var("PATH") {
+        paths.extend(std::env::split_paths(&existing));
     }
-    None
-}
-
-#[cfg(windows)]
-fn headroom_cli_names() -> [&'static str; 2] {
-    ["headroom.exe", "headroom"]
-}
-
-#[cfg(not(windows))]
-fn headroom_cli_names() -> [&'static str; 1] {
-    ["headroom"]
+    std::env::join_paths(paths).ok()
 }

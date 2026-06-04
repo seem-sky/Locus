@@ -418,7 +418,8 @@ pub fn run() {
                 tool::builtins::codegraph::set_managed_codegraph_resource_dir(resource_dir.clone());
                 lua_runtime::set_managed_lua_resource_dir(resource_dir.clone());
                 rtk_runtime::set_managed_rtk_resource_dir(resource_dir.clone());
-                crate::agentmemory::resolve::set_managed_agentmemory_resource_dir(resource_dir);
+                crate::agentmemory::resolve::set_managed_agentmemory_resource_dir(resource_dir.clone());
+                headroom::resolve::set_managed_headroom_proxy_resource_dir(resource_dir);
             }
             commands::restore_saved_git_override(&app.handle().clone());
 
@@ -923,6 +924,7 @@ pub fn run() {
             memory_store.set_export_root(data_dir.join("agentmemory"));
             let memory_store_for_startup = memory_store.clone();
             app.manage(memory_store);
+            headroom_proxy_state.set_app_handle(app.handle().clone());
             app.manage(headroom_proxy_state);
             app.manage(undo_manager);
             app.manage(view_automation_store);
@@ -1344,6 +1346,7 @@ pub fn run() {
             commands::get_proxy_status,
             commands::save_proxy_config,
             commands::get_headroom_settings_status,
+            commands::ensure_headroom_proxy,
             commands::save_headroom_settings,
             commands::get_python_runtime_state,
             commands::save_python_runtime_selection,
