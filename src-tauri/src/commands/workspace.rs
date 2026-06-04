@@ -336,6 +336,8 @@ pub async fn set_working_dir(
     watcher_tuning: State<'_, crate::asset_db::watcher::WatcherTuningState>,
     knowledge_index_state: State<'_, Arc<crate::knowledge_index::KnowledgeIndexState>>,
     app_knowledge_dir: State<'_, crate::commands::AppKnowledgeDir>,
+    registry: State<'_, crate::AgentDefRegistryState>,
+    app_agent_dir: State<'_, crate::AppAgentDir>,
     app_handle: AppHandle,
 ) -> Result<String, AppError> {
     let switch_started_at = Instant::now();
@@ -433,6 +435,8 @@ pub async fn set_working_dir(
         *wid = Some(ws_id.clone());
     }
     switch_timer.mark("workspace_id_state_committed");
+    super::plugin::reload_agent_registry(&registry, &app_agent_dir, &canonical).await;
+    switch_timer.mark("agent_registry_reloaded");
 
     // Update all sessions with workspace_id = NULL to have the new workspace_id.
     // This ensures sessions created before workspace was set are properly associated.

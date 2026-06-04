@@ -967,6 +967,8 @@ export interface SkillManifest {
   hasL0?: boolean;
   hasL1?: boolean;
   hasL2?: boolean;
+  pluginId?: string | null;
+  pluginScope?: "app" | "project" | string | null;
 }
 
 export interface SkillConfig {
@@ -1362,11 +1364,14 @@ export interface KnowledgeCatalogStats {
 export type KnowledgeDocumentSection = "summary" | "maintenanceRules" | "body";
 export type KnowledgeTargetKind = "document" | "directory";
 
+export interface KnowledgeDocumentEditOperation {
+  section: KnowledgeDocumentSection;
+  oldString: string;
+  newString: string;
+  replaceAll?: boolean;
+}
+
 export interface KnowledgeDocumentPatch {
-  id?: string;
-  type?: KnowledgeDocumentType;
-  title?: string;
-  injectMode?: KnowledgeInjectMode;
   inheritInjectMode?: boolean;
   summaryEnabled?: boolean;
   commandEnabled?: boolean;
@@ -1383,6 +1388,7 @@ export interface KnowledgeDocumentPatch {
   summary?: string | null;
   body?: string | null;
   maintenanceRules?: string | null;
+  edits?: KnowledgeDocumentEditOperation[];
 }
 
 export interface KnowledgeDocumentCreateInput extends KnowledgeDocumentPatch {
@@ -1461,6 +1467,7 @@ export interface KnowledgeMutationResult {
 export interface KnowledgeDocumentListInput {
   type?: KnowledgeDocumentType;
   pathPrefix?: string;
+  includeHidden?: boolean;
   limit?: number;
   cursor?: string | null;
 }
@@ -1475,6 +1482,7 @@ export interface KnowledgeDocumentQueryInput {
   limit?: number;
   types?: KnowledgeDocumentType[];
   pathPrefix?: string;
+  includeHidden?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -2701,9 +2709,15 @@ export type AssetSearchSource = "assetDb" | "filesystem";
 export interface AssetSearchResult {
   path: string;
   name: string;
+  guid?: string;
+  fileId?: number;
+  objectKey?: string;
   root: AssetSearchRoot;
   kind: string;
   typeLabel?: string;
+  typeSearch?: string;
+  isSubAsset?: boolean;
+  targetId?: string;
   matchScore: number;
   source: AssetSearchSource;
 }

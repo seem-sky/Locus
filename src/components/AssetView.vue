@@ -46,6 +46,7 @@ const {
   searchTruncated,
   searchHasFallback,
   searching,
+  selectedSearchKey,
   runFilenameSearch,
   updateSearchScope,
   selectFromSearchResult,
@@ -233,6 +234,7 @@ function handleEmbeddedPreview(node: AssetExplorerNode) {
               :has-fallback="searchHasFallback"
               :truncated="searchTruncated"
               :selected-path="selectedAssetPath"
+              :selected-key="selectedSearchKey"
               @select="selectFromSearchResult"
             />
 
@@ -324,6 +326,7 @@ function handleEmbeddedPreview(node: AssetExplorerNode) {
               :has-fallback="searchHasFallback"
               :truncated="searchTruncated"
               :selected-path="selectedAssetPath"
+              :selected-key="selectedSearchKey"
               @select="selectFromSearchResult"
             />
 

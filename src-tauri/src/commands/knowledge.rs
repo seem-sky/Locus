@@ -7,7 +7,7 @@ use futures::TryFutureExt;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
 
-use crate::agent::definition::{canonical_agent_id, AgentDefRegistry};
+use crate::agent::definition::canonical_agent_id;
 use crate::binary_cache::BinaryCache;
 use crate::error::{AppError, ErrorSeverity};
 use crate::feishu_docs::{
@@ -33,6 +33,7 @@ use crate::unity_docs::{
     self, UnityManagedDirectoryStat, UnityReferenceImportState, UnityReferenceImportStatus,
 };
 use crate::workspace::Workspace;
+use crate::AgentDefRegistryState;
 
 #[derive(Clone)]
 pub struct AppKnowledgeDir(pub Arc<Option<std::path::PathBuf>>);
@@ -1204,6 +1205,7 @@ pub async fn knowledge_query(
     limit: Option<usize>,
     types: Option<Vec<String>>,
     path_prefix: Option<String>,
+    include_hidden: Option<bool>,
     workspace: State<'_, Arc<Workspace>>,
     app_knowledge_dir: State<'_, AppKnowledgeDir>,
     knowledge_index_state: State<'_, Arc<KnowledgeIndexState>>,
@@ -1256,6 +1258,7 @@ pub async fn knowledge_query(
         parsed_types.as_deref(),
         normalized_prefix.as_deref(),
         limit.unwrap_or(5),
+        include_hidden.unwrap_or(false),
         knowledge_index_state.inner().clone(),
     )
     .await
@@ -1889,6 +1892,7 @@ pub async fn knowledge_delete_feishu_reference_docs(
 pub async fn knowledge_list(
     doc_type: Option<String>,
     path_prefix: Option<String>,
+    include_hidden: Option<bool>,
     workspace: State<'_, Arc<Workspace>>,
     app_knowledge_dir: State<'_, AppKnowledgeDir>,
     knowledge_index_state: State<'_, Arc<KnowledgeIndexState>>,
@@ -1920,9 +1924,10 @@ pub async fn knowledge_list(
             .map(|item| item.path.clone())
             .collect::<HashSet<_>>();
         items.extend(
-            super::skill::list_skill_package_knowledge_items_sync(
+            super::skill::list_skill_package_knowledge_items_sync_with_hidden(
                 &working_dir,
                 resolved_prefix.as_deref(),
+                include_hidden.unwrap_or(false),
             )
             .into_iter()
             .filter(|item| !existing_paths.contains(&item.path)),
@@ -1933,6 +1938,12 @@ pub async fn knowledge_list(
                 .cmp(b.doc_type.as_str())
                 .then(a.path.cmp(&b.path))
                 .then(a.title.cmp(&b.title))
+        });
+    }
+    if !include_hidden.unwrap_or(false) {
+        items.retain(|item| {
+            item.inject_mode != KnowledgeInjectMode::None
+                && item_model_recall_allowed(&working_dir, item).unwrap_or(false)
         });
     }
     enrich_knowledge_list_items(
@@ -2043,6 +2054,18 @@ fn enrich_knowledge_list_items(
             );
         }
     }
+}
+
+fn item_model_recall_allowed(working_dir: &str, item: &KnowledgeListItem) -> Result<bool, String> {
+    if item.doc_type != KnowledgeType::Skill {
+        return Ok(true);
+    }
+    if let Some(allowed) =
+        super::skill::skill_package_virtual_path_allows_model_recall_sync(working_dir, &item.path)?
+    {
+        return Ok(allowed);
+    }
+    Ok(knowledge_store::list_item_allows_model_recall(item))
 }
 
 #[tauri::command]
@@ -2718,8 +2741,11 @@ fn resolve_knowledge_reveal_path(
                         let virtual_path =
                             normalize_knowledge_directory_path(raw_path).map_err(AppError::from)?;
                         if let Some(package_path) =
-                            super::skill::resolve_skill_package_document_path_sync(&virtual_path)
-                                .map_err(AppError::from)?
+                            super::skill::resolve_skill_package_document_path_sync_for_working_dir(
+                                working_dir,
+                                &virtual_path,
+                            )
+                            .map_err(AppError::from)?
                         {
                             return canonicalize_existing_path(&package_path);
                         }
@@ -2756,8 +2782,11 @@ fn resolve_knowledge_reveal_path(
         match kind {
             KnowledgeTargetKind::Document => {
                 if let Some(package_path) =
-                    super::skill::resolve_skill_package_document_path_sync(&normalized_path)
-                        .map_err(AppError::from)?
+                    super::skill::resolve_skill_package_document_path_sync_for_working_dir(
+                        working_dir,
+                        &normalized_path,
+                    )
+                    .map_err(AppError::from)?
                 {
                     return canonicalize_existing_path(&package_path);
                 }
@@ -2765,7 +2794,10 @@ fn resolve_knowledge_reveal_path(
             KnowledgeTargetKind::Directory => {
                 if !normalized_path.contains('/') {
                     if let Ok(package_root) =
-                        super::skill::resolve_skill_package_root_sync(&normalized_path)
+                        super::skill::resolve_skill_package_root_sync_for_working_dir(
+                            working_dir,
+                            &normalized_path,
+                        )
                     {
                         return canonicalize_existing_path(&package_root);
                     }
@@ -3300,11 +3332,12 @@ pub async fn set_agent_tool_direct_load(
     agent_id: String,
     tool_name: String,
     direct_load: bool,
-    registry: State<'_, Arc<AgentDefRegistry>>,
+    registry: State<'_, AgentDefRegistryState>,
     tool_registry: State<'_, Arc<ToolRegistry>>,
     workspace: State<'_, Arc<Workspace>>,
 ) -> Result<(), AppError> {
     let agent_id = canonical_agent_id(&agent_id).to_string();
+    let registry = registry.0.read().await;
     let def = registry
         .get(&agent_id)
         .ok_or_else(|| format!("Agent '{}' not found", agent_id))?;

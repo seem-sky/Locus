@@ -1,0 +1,29 @@
+{
+  "description": "Trace the path from one symbol to another through call edges. Returns the full call chain showing how `from` reaches `to`, including intermediate hops. Use to understand how components connect or trace data/control flow.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "from": {
+        "type": "string",
+        "description": "Starting symbol (e.g. 'ToolRegistry::execute', 'main')"
+      },
+      "to": {
+        "type": "string",
+        "description": "Target symbol to reach (e.g. 'run_codegraph', 'send_message')"
+      },
+      "path": {
+        "type": "string",
+        "description": "Project root directory. Defaults to the current working directory when omitted."
+      },
+      "depth": {
+        "type": "integer",
+        "description": "Maximum traversal depth (default 5)"
+      },
+      "limit": {
+        "type": "integer",
+        "description": "Maximum results (default 10)"
+      }
+    },
+    "required": ["from", "to"]
+  }
+}

@@ -4,6 +4,7 @@ mod filesystem;
 mod knowledge;
 mod lua_gc_analyze;
 mod misc;
+mod plugin;
 mod search;
 mod shell;
 mod skill;
@@ -51,6 +52,7 @@ pub fn register_all(registry: &mut ToolRegistry) {
     registry.register_builtin(skill::skill_create_tool());
     registry.register_builtin(skill::skill_reload_tool());
     registry.register_builtin(skill::skill_list_tool());
+    registry.register_builtin_with_load_mode(plugin::plugin_export(), ToolLoadMode::Skill);
     registry.register_builtin_with_load_mode(view::view_create(), ToolLoadMode::Skill);
     registry.register_builtin_with_load_mode(view::view_list(), ToolLoadMode::Skill);
     registry.register_builtin_with_load_mode(view::view_reload(), ToolLoadMode::Skill);

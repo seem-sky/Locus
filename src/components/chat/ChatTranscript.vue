@@ -1512,6 +1512,15 @@ function shouldKeepToolItemExpanded(itemId: string) {
   return nonCollapsibleToolItemIds.value.has(itemId);
 }
 
+function markdownUnityPreviewStateScope(segment: { key: string; itemId?: string }) {
+  return [
+    props.variant,
+    props.sessionKey?.trim() || "__draft__",
+    segment.itemId ?? "__transient__",
+    segment.key,
+  ].join(":");
+}
+
 type HistoryRenderSegment =
   | { type: "thinking"; key: string; part: AssistantRenderPart; itemId: string; content: string; duration?: number }
   | { type: "toolCalls"; key: string; part: Extract<AssistantRenderPart, { kind: "toolCall" }>; itemId: string; itemIds: string[]; toolCalls: ToolCallDisplay[] }
@@ -2618,6 +2627,7 @@ function openImage(src: string) {
                   :data-chat-message-id="segment.itemId"
                   data-chat-message-role="assistant"
                   :content="segment.content"
+                  :unity-preview-state-scope="markdownUnityPreviewStateScope(segment)"
                   enable-file-refs
                   @open-image="openImage"
                 />
@@ -2795,6 +2805,7 @@ function openImage(src: string) {
                   data-render-part-scope="transient"
                   :data-render-part-key="segment.key"
                   :content="segment.content"
+                  :unity-preview-state-scope="markdownUnityPreviewStateScope(segment)"
                   cursor
                   enable-file-refs
                   @open-image="openImage"

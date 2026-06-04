@@ -36,6 +36,7 @@ import { isUnityReferenceImportWindowLocation } from "./services/unityReferenceI
 import { isReferenceExternalImportWindowLocation } from "./services/referenceExternalImportWindow";
 import { isCollabSearchWindowLocation } from "./services/collabSearchWindow";
 import { isChatDiffReviewWindowLocation } from "./services/chatDiffReviewWindow";
+import { isLocusAssetInspectorWindowLocation } from "./services/locusAssetInspectorWindow";
 import { isViewContentWindowLocation, isViewHostWindowLocation } from "./services/view";
 import { isAgentGraphToolWindowLocation } from "./services/agentGraphTool";
 import {
@@ -58,6 +59,7 @@ const isUnityReferenceImportWindow = isUnityReferenceImportWindowLocation();
 const isReferenceExternalImportWindow = isReferenceExternalImportWindowLocation();
 const isCollabSearchWindow = isCollabSearchWindowLocation();
 const isChatDiffReviewWindow = isChatDiffReviewWindowLocation();
+const isLocusAssetInspectorWindow = isLocusAssetInspectorWindowLocation();
 const isViewHostWindow = isViewHostWindowLocation();
 const isViewContentWindow = isViewContentWindowLocation();
 const isAgentGraphToolWindow = isAgentGraphToolWindowLocation();
@@ -70,6 +72,7 @@ const isStandaloneWindow = isUnityEmbedWindow
   || isReferenceExternalImportWindow
   || isCollabSearchWindow
   || isChatDiffReviewWindow
+  || isLocusAssetInspectorWindow
   || isViewHostWindow
   || isViewContentWindow
   || isAgentGraphToolWindow;
@@ -81,6 +84,7 @@ const UnityReferenceImportProgressWindow = defineAsyncComponent(() => import("./
 const ReferenceExternalImportWindow = defineAsyncComponent(() => import("./components/ReferenceExternalImportWindow.vue"));
 const CollabSearchWindow = defineAsyncComponent(() => import("./components/CollabSearchWindow.vue"));
 const ChatDiffReviewWindow = defineAsyncComponent(() => import("./components/ChatDiffReviewWindow.vue"));
+const LocusAssetInspectorWindow = defineAsyncComponent(() => import("./components/LocusAssetInspectorWindow.vue"));
 const ViewHostWindow = defineAsyncComponent(() => import("./components/ViewHostWindow.vue"));
 const AgentGraphToolWindow = defineAsyncComponent(() => import("./components/AgentGraphToolWindow.vue"));
 const UnityEmbeddedSessionView = defineAsyncComponent(() => import("./components/UnityEmbeddedSessionView.vue"));
@@ -182,6 +186,14 @@ const assetView = createLazyViewState(
   () => import("./components/AssetView.vue"),
   "loadAssetView",
 );
+const viewPackageView = createLazyViewState(
+  () => import("./components/ViewPackageView.vue"),
+  "loadViewPackageView",
+);
+const pluginView = createLazyViewState(
+  () => import("./components/PluginView.vue"),
+  "loadPluginView",
+);
 const agentView = createLazyViewState(
   () => import("./components/AgentView.vue"),
   "loadAgentView",
@@ -210,6 +222,14 @@ const knowledgeViewError = knowledgeView.error;
 const assetViewComponent = assetView.component;
 const assetViewLoading = assetView.loading;
 const assetViewError = assetView.error;
+
+const viewPackageViewComponent = viewPackageView.component;
+const viewPackageViewLoading = viewPackageView.loading;
+const viewPackageViewError = viewPackageView.error;
+
+const pluginViewComponent = pluginView.component;
+const pluginViewLoading = pluginView.loading;
+const pluginViewError = pluginView.error;
 
 const agentViewComponent = agentView.component;
 const agentViewLoading = agentView.loading;
@@ -241,6 +261,16 @@ watch(() => uiStore.knowledgeMounted, (mounted) => {
 watch(() => uiStore.assetMounted, (mounted) => {
   if (!mounted) return;
   void assetView.ensureLoaded();
+}, { immediate: true });
+
+watch(() => uiStore.viewMounted, (mounted) => {
+  if (!mounted) return;
+  void viewPackageView.ensureLoaded();
+}, { immediate: true });
+
+watch(() => uiStore.pluginsMounted, (mounted) => {
+  if (!mounted) return;
+  void pluginView.ensureLoaded();
 }, { immediate: true });
 
 watch(() => uiStore.agentMounted, (mounted) => {
@@ -757,6 +787,7 @@ watch(() => projectStore.workingDir, () => {
   <ReferenceExternalImportWindow v-else-if="isReferenceExternalImportWindow" />
   <CollabSearchWindow v-else-if="isCollabSearchWindow" />
   <ChatDiffReviewWindow v-else-if="isChatDiffReviewWindow" />
+  <LocusAssetInspectorWindow v-else-if="isLocusAssetInspectorWindow" />
   <ViewHostWindow v-else-if="isViewContentWindow" embedded />
   <ViewHostWindow v-else-if="isViewHostWindow" />
   <AgentGraphToolWindow v-else-if="isAgentGraphToolWindow" />
@@ -798,6 +829,16 @@ watch(() => projectStore.workingDir, () => {
           :class="{ active: uiStore.activeTab === 'asset' }"
           @click="uiStore.setTab('asset')"
         >{{ t("app.tab.asset") }}</button>
+        <button
+          class="tab-item"
+          :class="{ active: uiStore.activeTab === 'views' }"
+          @click="uiStore.setTab('views')"
+        >{{ t("app.tab.views") }}</button>
+        <button
+          class="tab-item"
+          :class="{ active: uiStore.activeTab === 'plugins' }"
+          @click="uiStore.setTab('plugins')"
+        >{{ t("app.tab.plugins") }}</button>
         <button
           class="tab-item"
           :class="{ active: uiStore.activeTab === 'agent' }"
@@ -978,6 +1019,34 @@ watch(() => projectStore.workingDir, () => {
           :class="{ 'is-loading': assetViewLoading, 'is-error': !!assetViewError }"
         >
           {{ assetViewError || t("common.loading") }}
+        </div>
+
+        <component
+          :is="viewPackageViewComponent"
+          v-if="uiStore.viewMounted && viewPackageViewComponent"
+          v-show="uiStore.activeTab === 'views'"
+          :working-dir="projectStore.workingDir"
+        />
+        <div
+          v-else-if="uiStore.viewMounted && uiStore.activeTab === 'views'"
+          class="tab-loading-state"
+          :class="{ 'is-loading': viewPackageViewLoading, 'is-error': !!viewPackageViewError }"
+        >
+          {{ viewPackageViewError || t("common.loading") }}
+        </div>
+
+        <component
+          :is="pluginViewComponent"
+          v-if="uiStore.pluginsMounted && pluginViewComponent"
+          v-show="uiStore.activeTab === 'plugins'"
+          :working-dir="projectStore.workingDir"
+        />
+        <div
+          v-else-if="uiStore.pluginsMounted && uiStore.activeTab === 'plugins'"
+          class="tab-loading-state"
+          :class="{ 'is-loading': pluginViewLoading, 'is-error': !!pluginViewError }"
+        >
+          {{ pluginViewError || t("common.loading") }}
         </div>
 
         <component
