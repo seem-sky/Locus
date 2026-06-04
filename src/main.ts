@@ -3,6 +3,7 @@ import { createPinia } from "pinia";
 import App from "./App.vue";
 import "./assets/hljs-theme.css";
 import "./styles/typography.css";
+import "./styles/code-preview.css";
 import "./styles/asset-icons.css";
 import { initDebugConsole } from "./services/debugConsole";
 import { bootstrapLocale } from "./i18n";

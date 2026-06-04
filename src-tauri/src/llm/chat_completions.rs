@@ -152,11 +152,29 @@ where
     let mut raw_response = String::new();
     let mut state = ChatStreamState::new();
 
-    while let Some(chunk) = stream.next().await {
-        let chunk = match chunk {
-            Ok(c) => c,
-            Err(e) => {
+    const CHUNK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
+    loop {
+        let chunk_result = tokio::time::timeout(CHUNK_TIMEOUT, stream.next()).await;
+
+        let chunk = match chunk_result {
+            Ok(Some(Ok(c))) => c,
+            Ok(Some(Err(e))) => {
                 return Err(format!("Stream read error: {}", e));
+            }
+            Ok(None) => break,
+            Err(_) => {
+                eprintln!(
+                    "[{}] Stream chunk read timed out after {}s (raw_response_len={}, pending_buffer_len={})",
+                    tag,
+                    CHUNK_TIMEOUT.as_secs(),
+                    raw_response.len(),
+                    buffer.len()
+                );
+                return Err(format!(
+                    "Stream read timed out after {}s",
+                    CHUNK_TIMEOUT.as_secs()
+                ));
             }
         };
 

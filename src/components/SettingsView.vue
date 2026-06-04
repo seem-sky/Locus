@@ -54,7 +54,9 @@ const {
   modelDefaults, modelSaveMsg, saveModelDefaults,
   permSaveMsg, toolList, approvalBehaviorList, toolPermissions,
   fileToolWorkspaceBoundary, fileToolWorkspaceBoundaryReady, fileToolWorkspaceBoundaryBusy,
+  workflowToolWhitelist, workflowWhitelistReady, workflowWhitelistBusy,
   setToolPermission, setFileToolWorkspaceBoundaryEnabled,
+  removeWorkflowWhitelistTool, removeWorkflowWhitelistBashCommand, clearWorkflowToolWhitelist,
   customEndpoints, editingEndpoint, isAddingEndpoint, customEndpointSaving, testStatus, testResult,
   startAddEndpoint, startEditEndpoint, cancelEditEndpoint, saveEndpoint, deleteEndpoint, testEndpoint,
 } = useSettingsState(emit);
@@ -294,10 +296,16 @@ watch(
           :file-workspace-boundary-enabled="fileToolWorkspaceBoundary"
           :file-workspace-boundary-ready="fileToolWorkspaceBoundaryReady"
           :file-workspace-boundary-busy="fileToolWorkspaceBoundaryBusy"
+          :workflow-tool-whitelist="workflowToolWhitelist"
+          :workflow-whitelist-ready="workflowWhitelistReady"
+          :workflow-whitelist-busy="workflowWhitelistBusy"
           :perm-save-msg="permSaveMsg"
           @set-global-permission-mode="chatStore.setToolPermissionMode"
           @set-permission="setToolPermission"
           @set-file-workspace-boundary="setFileToolWorkspaceBoundaryEnabled"
+          @remove-workflow-whitelist-tool="removeWorkflowWhitelistTool"
+          @remove-workflow-whitelist-bash="removeWorkflowWhitelistBashCommand"
+          @clear-workflow-tool-whitelist="clearWorkflowToolWhitelist"
         />
       </template>
 

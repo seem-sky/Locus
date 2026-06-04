@@ -11,6 +11,8 @@ import {
   getCachedDebugMode,
   getDebugMode,
   getFileToolWorkspaceBoundary,
+  getWorkflowToolWhitelist,
+  saveWorkflowToolWhitelist,
   setFileToolWorkspaceBoundary,
   saveToolPermissionMode,
   setDebugMode,
@@ -71,6 +73,24 @@ describe("permissions service", () => {
     expect(ipcInvokeMock).toHaveBeenCalledTimes(1);
     expect(ipcInvokeMock).toHaveBeenCalledWith("set_file_tool_workspace_boundary", {
       value: true,
+    });
+  });
+
+  it("loads and saves the workflow tool whitelist payload", async () => {
+    ipcInvokeMock.mockResolvedValueOnce({
+      tools: ["custom_tool"],
+      bashCommands: ["npm test"],
+    });
+
+    await expect(getWorkflowToolWhitelist()).resolves.toEqual({
+      tools: ["custom_tool"],
+      bashCommands: ["npm test"],
+    });
+    expect(ipcInvokeMock).toHaveBeenCalledWith("get_workflow_tool_whitelist");
+
+    await saveWorkflowToolWhitelist({ tools: [], bashCommands: ["git status"] });
+    expect(ipcInvokeMock).toHaveBeenCalledWith("save_workflow_tool_whitelist", {
+      value: { tools: [], bashCommands: ["git status"] },
     });
   });
 });

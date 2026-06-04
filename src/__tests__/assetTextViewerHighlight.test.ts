@@ -16,6 +16,8 @@ describe("AssetTextViewer highlighting", () => {
     expect(source).toContain("hljs.highlight(props.snippet, { language }).value");
     expect(source).toContain('class="atv-pre hljs"');
     expect(source).toContain('v-html="line || \' \'"');
-    expect(source).toContain("font-family: var(--font-mono-editor);");
+    expect(source).toContain("code-preview-surface");
+    expect(source).toContain("useCodePreviewSelectionMenu");
+    expect(source).toContain("CodePreviewSelectionMenu");
   });
 });

@@ -26,7 +26,12 @@ export const useUiStore = defineStore("ui", () => {
   const nativeWindowWidth = ref<number | null>(null);
   const nativeWindowHeight = ref<number | null>(null);
   const showOnboarding = ref(false);
-  const pendingChatPrefill = ref<{ id: number; text: string; draft?: UserMessageDraft | null } | null>(null);
+  const pendingChatPrefill = ref<{
+    id: number;
+    text: string;
+    draft?: UserMessageDraft | null;
+    append?: boolean;
+  } | null>(null);
   const pendingKnowledgeSelection = ref<{
     id: number;
     dashboard: "design" | "memory" | "skill" | "reference";
@@ -211,6 +216,14 @@ export const useUiStore = defineStore("ui", () => {
     };
   }
 
+  function stageChatPrefillAppend(text: string) {
+    pendingChatPrefill.value = {
+      id: Date.now(),
+      text,
+      append: true,
+    };
+  }
+
   function stageChatDraftPrefill(draft: UserMessageDraft) {
     pendingChatPrefill.value = {
       id: Date.now(),
@@ -301,6 +314,7 @@ export const useUiStore = defineStore("ui", () => {
     openSettingsCategory,
     clearSettingsCategoryHint,
     stageChatPrefill,
+    stageChatPrefillAppend,
     stageChatDraftPrefill,
     clearPendingChatPrefill,
     stageKnowledgeSelection,

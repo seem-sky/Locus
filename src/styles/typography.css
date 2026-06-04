@@ -15,4 +15,8 @@
   --font-mono-block: var(--font-stack-mono);
   --font-mono-editor: var(--font-stack-mono);
   --font-mono-display: var(--font-stack-mono);
+
+  --code-preview-font-size: 12px;
+  --code-preview-line-height: 1.5;
+  --code-preview-letter-spacing: 0em;
 }

@@ -19,6 +19,9 @@ import UnityHierarchyPane from "./UnityHierarchyPane.vue";
 import UnityInspectorPane from "./UnityInspectorPane.vue";
 import BinaryPreviewHost from "./BinaryPreviewHost.vue";
 import LucideIcon from "../icons/LucideIcon.vue";
+import CodePreviewSelectionMenu from "../code/CodePreviewSelectionMenu.vue";
+import { langFromPath } from "../../hljs";
+import { useCodePreviewSelectionMenu } from "../../composables/useCodePreviewSelectionMenu";
 
 const props = withDefaults(
   defineProps<{
@@ -77,6 +80,18 @@ const semanticLoading = ref(false);
 const semanticError = ref<string | null>(null);
 const activeInspector = ref<SemanticTargetInspector | null>(props.payload.semantic?.inspector ?? null);
 const inspectorCache = ref(new Map<string, SemanticTargetInspector>());
+
+const {
+  menu: selectionMenu,
+  closeMenu: closeSelectionMenu,
+  handleContextMenu,
+  copySelection,
+  sendToComposer,
+} = useCodePreviewSelectionMenu(() => ({
+  filePath: props.payload.filePath,
+  language: langFromPath(props.payload.filePath) ?? undefined,
+  lineOffset: 1,
+}));
 
 /* ── On-demand text diff for large files ── */
 const lazyText = ref<TextDiff | null>(null);
@@ -647,7 +662,12 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div class="diff-viewer" :class="{ compact }" @scroll="onTextScroll">
+  <div
+    class="diff-viewer code-preview-surface"
+    :class="{ compact }"
+    @scroll="onTextScroll"
+    @contextmenu="handleContextMenu"
+  >
     <div v-if="payload.isBinary" class="diff-binary-shell">
       <div v-if="payload.binaryPreview" class="diff-binary-preview">
         <BinaryPreviewHost
@@ -883,6 +903,13 @@ onUnmounted(() => {
         </button>
       </div>
     </template>
+    <CodePreviewSelectionMenu
+      v-if="selectionMenu"
+      :menu="selectionMenu"
+      @close="closeSelectionMenu"
+      @copy="copySelection"
+      @send-to-composer="sendToComposer"
+    />
   </div>
 </template>
 
@@ -893,14 +920,15 @@ onUnmounted(() => {
   flex-direction: column;
   height: 100%;
   font-family: var(--font-mono-editor);
-  font-size: 13px;
-  line-height: 1.5;
+  font-size: var(--code-preview-font-size);
+  line-height: var(--code-preview-line-height);
+  letter-spacing: var(--code-preview-letter-spacing);
   overflow: auto;
 }
 
 .diff-viewer.compact {
-  font-size: 11px;
-  line-height: 1.4;
+  font-size: calc(var(--code-preview-font-size) - 1px);
+  line-height: calc(var(--code-preview-line-height) - 0.1);
   max-height: 220px;
 }
 

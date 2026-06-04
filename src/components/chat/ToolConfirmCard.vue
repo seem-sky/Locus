@@ -1,6 +1,6 @@
 
 <script setup lang="ts">
-import { computed } from "vue";
+import { computed, ref, watch } from "vue";
 import type {
   BasicToolConfirmDisplay,
   KnowledgeToolConfirmPreview,
@@ -11,6 +11,7 @@ import { t } from "../../i18n";
 import BaseButton from "../ui/BaseButton.vue";
 import KnowledgeToolConfirmCard from "./KnowledgeToolConfirmCard.vue";
 import ToolConfirmFeedbackForm from "./ToolConfirmFeedbackForm.vue";
+import { encodeToolConfirmAllow } from "./toolConfirmAnswer";
 import {
   editorStatusLabelForToolConfirm,
   titleForUnityEditorStatusChange,
@@ -92,6 +93,32 @@ function formatToolArgs(raw: string): string {
   }
 }
 
+const addToWorkflowWhitelist = ref(false);
+
+watch(
+  () => props.toolConfirm.questionId,
+  () => {
+    addToWorkflowWhitelist.value = false;
+  },
+);
+
+const showWorkflowWhitelistOption = computed(() => {
+  const display = basicDisplay.value;
+  if (!display?.workflowWhitelistOffered) return false;
+  return true;
+});
+
+const workflowWhitelistHint = computed(() => {
+  if (!showWorkflowWhitelistOption.value) return "";
+  return basicDisplay.value?.toolName === "bash"
+    ? t("chat.toolConfirm.workflowWhitelistHintBash")
+    : t("chat.toolConfirm.workflowWhitelistHint");
+});
+
+function submitAllow() {
+  emit("answer", encodeToolConfirmAllow(addToWorkflowWhitelist.value));
+}
+
 const unityStatusRows = computed(() => {
   const display = unityStatusChangeDisplay.value;
   if (!display) return [];
@@ -157,8 +184,20 @@ const unityStatusRows = computed(() => {
       </div>
     </template>
     <ToolConfirmFeedbackForm v-if="basicDisplay" @submit="emit('answer', $event)" />
+    <label
+      v-if="showWorkflowWhitelistOption"
+      class="tool-confirm-whitelist"
+    >
+      <input
+        v-model="addToWorkflowWhitelist"
+        type="checkbox"
+        class="tool-confirm-whitelist-input"
+      />
+      <span class="tool-confirm-whitelist-text">{{ t("chat.toolConfirm.workflowWhitelist") }}</span>
+      <span v-if="workflowWhitelistHint" class="tool-confirm-whitelist-hint">{{ workflowWhitelistHint }}</span>
+    </label>
     <div class="tool-confirm-actions">
-      <BaseButton class="tool-confirm-btn" variant="primary" size="md" @click="emit('answer', 'allow')">{{ allowLabel }}</BaseButton>
+      <BaseButton class="tool-confirm-btn" variant="primary" size="md" @click="submitAllow">{{ allowLabel }}</BaseButton>
       <BaseButton class="tool-confirm-btn" size="md" @click="emit('answer', 'deny')">{{ denyLabel }}</BaseButton>
     </div>
   </div>
@@ -238,6 +277,37 @@ const unityStatusRows = computed(() => {
 
 .tool-confirm-card.is-unity-status-change .tool-confirm-actions {
   justify-content: flex-end;
+}
+
+.tool-confirm-whitelist {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: 6px 8px;
+  margin-bottom: 10px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid color-mix(in srgb, var(--border-color) 88%, transparent);
+  background: color-mix(in srgb, var(--panel-bg) 92%, var(--sidebar-bg) 8%);
+  cursor: pointer;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.tool-confirm-whitelist-input {
+  margin-top: 2px;
+  flex-shrink: 0;
+}
+
+.tool-confirm-whitelist-text {
+  color: var(--text-color);
+  font-weight: 500;
+}
+
+.tool-confirm-whitelist-hint {
+  flex: 1 1 100%;
+  color: var(--text-secondary);
+  font-size: 11px;
 }
 
 .tool-confirm-workflow-note {

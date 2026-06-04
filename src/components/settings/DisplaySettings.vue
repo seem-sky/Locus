@@ -16,7 +16,14 @@ import BaseSegmented from "../ui/BaseSegmented.vue";
 import BaseSwitch from "../ui/BaseSwitch.vue";
 
 const { mainPreference, unityEmbedPreference, setThemePreference } = useTheme();
-const { state: display, set: setDisplay, setFont, setShowThinkingProcess } = useDisplaySettings();
+const {
+  state: display,
+  set: setDisplay,
+  setFont,
+  setCodePreview,
+  resetCodePreview,
+  setShowThinkingProcess,
+} = useDisplaySettings();
 const notificationStore = useNotificationStore();
 const viewOpenInExistingWindow = ref(true);
 const viewOpenInExistingWindowReady = ref(false);
@@ -52,6 +59,34 @@ const fontSlots: { slot: FontSlot; labelKey: string; mono: boolean }[] = [
 ];
 
 const systemFonts = ref<string[]>([]);
+
+const codePreviewFontSizeLabel = computed(
+  () => `${display.codePreview.fontSize}px`,
+);
+const codePreviewLineHeightLabel = computed(
+  () => String(display.codePreview.lineHeight),
+);
+const codePreviewLetterSpacingLabel = computed(
+  () => `${display.codePreview.letterSpacing}em`,
+);
+
+function onCodePreviewFontSizeInput(event: Event) {
+  const target = event.target as HTMLInputElement | null;
+  if (!target) return;
+  setCodePreview("fontSize", Number(target.value));
+}
+
+function onCodePreviewLineHeightInput(event: Event) {
+  const target = event.target as HTMLInputElement | null;
+  if (!target) return;
+  setCodePreview("lineHeight", Number(target.value));
+}
+
+function onCodePreviewLetterSpacingInput(event: Event) {
+  const target = event.target as HTMLInputElement | null;
+  if (!target) return;
+  setCodePreview("letterSpacing", Number(target.value));
+}
 
 onMounted(async () => {
   void refreshViewOpenInExistingWindow();
@@ -335,6 +370,75 @@ async function updateViewWindowsAboveMain(value: boolean) {
       </template>
     </div>
   </div>
+
+  <div class="settings-section">
+    <div class="section-label">{{ t("settings.display.codePreviewTitle") }}</div>
+    <p class="section-desc">{{ t("settings.display.codePreviewDesc") }}</p>
+
+    <div class="choice-row">
+      <span class="choice-label">{{ t("settings.display.codePreviewFontSize") }}</span>
+      <div class="code-preview-slider-row">
+        <input
+          class="code-preview-slider"
+          type="range"
+          min="10"
+          max="24"
+          step="1"
+          :value="display.codePreview.fontSize"
+          :style="{ '--slider-percent': `${((display.codePreview.fontSize - 10) / 14) * 100}%` }"
+          :aria-label="t('settings.display.codePreviewFontSize')"
+          @input="onCodePreviewFontSizeInput"
+        />
+        <span class="code-preview-slider-value">{{ codePreviewFontSizeLabel }}</span>
+      </div>
+    </div>
+
+    <div class="choice-row">
+      <span class="choice-label">{{ t("settings.display.codePreviewLineHeight") }}</span>
+      <div class="code-preview-slider-row">
+        <input
+          class="code-preview-slider"
+          type="range"
+          min="1"
+          max="2.5"
+          step="0.05"
+          :value="display.codePreview.lineHeight"
+          :style="{ '--slider-percent': `${((display.codePreview.lineHeight - 1) / 1.5) * 100}%` }"
+          :aria-label="t('settings.display.codePreviewLineHeight')"
+          @input="onCodePreviewLineHeightInput"
+        />
+        <span class="code-preview-slider-value">{{ codePreviewLineHeightLabel }}</span>
+      </div>
+    </div>
+
+    <div class="choice-row">
+      <span class="choice-label">{{ t("settings.display.codePreviewLetterSpacing") }}</span>
+      <div class="code-preview-slider-row">
+        <input
+          class="code-preview-slider"
+          type="range"
+          min="-0.05"
+          max="0.2"
+          step="0.005"
+          :value="display.codePreview.letterSpacing"
+          :style="{ '--slider-percent': `${((display.codePreview.letterSpacing + 0.05) / 0.25) * 100}%` }"
+          :aria-label="t('settings.display.codePreviewLetterSpacing')"
+          @input="onCodePreviewLetterSpacingInput"
+        />
+        <span class="code-preview-slider-value">{{ codePreviewLetterSpacingLabel }}</span>
+      </div>
+    </div>
+
+    <div class="code-preview-sample-wrap">
+      <pre class="code-preview-sample code-preview-surface hljs"><code>local function greet(name)
+  return "hello, " .. name
+end</code></pre>
+    </div>
+
+    <button type="button" class="code-preview-reset" @click="resetCodePreview">
+      {{ t("settings.display.codePreviewReset") }}
+    </button>
+  </div>
 </template>
 
 <style scoped>
@@ -429,5 +533,89 @@ async function updateViewWindowsAboveMain(value: boolean) {
 
 .font-select:focus {
   border-color: var(--accent-color);
+}
+
+.code-preview-slider-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.code-preview-slider {
+  --slider-percent: 50%;
+  -webkit-appearance: none;
+  appearance: none;
+  flex: 1;
+  min-width: 120px;
+  height: 4px;
+  border-radius: 999px;
+  background: linear-gradient(
+    to right,
+    var(--accent-color) 0 var(--slider-percent),
+    var(--border-color) var(--slider-percent) 100%
+  );
+  cursor: pointer;
+  outline: none;
+}
+
+.code-preview-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  border: 2px solid var(--panel-bg);
+  border-radius: 50%;
+  background: var(--accent-color);
+}
+
+.code-preview-slider::-moz-range-thumb {
+  width: 14px;
+  height: 14px;
+  border: 2px solid var(--panel-bg);
+  border-radius: 50%;
+  background: var(--accent-color);
+}
+
+.code-preview-slider-value {
+  width: 52px;
+  color: var(--text-secondary);
+  font-size: 12px;
+  text-align: right;
+  flex-shrink: 0;
+}
+
+.code-preview-sample-wrap {
+  margin-top: 10px;
+  width: min(560px, 100%);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  background: var(--panel-bg);
+  overflow: hidden;
+}
+
+.code-preview-sample {
+  margin: 0;
+  padding: 10px 12px;
+  color: var(--text-color);
+  white-space: pre;
+  overflow: auto;
+}
+
+.code-preview-reset {
+  margin-top: 10px;
+  padding: 6px 12px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.code-preview-reset:hover {
+  border-color: var(--border-strong);
+  color: var(--text-color);
+  background: var(--hover-bg);
 }
 </style>

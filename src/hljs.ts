@@ -11,6 +11,7 @@ import yaml from "highlight.js/lib/languages/yaml";
 import python from "highlight.js/lib/languages/python";
 import markdown from "highlight.js/lib/languages/markdown";
 import diff from "highlight.js/lib/languages/diff";
+import lua from "highlight.js/lib/languages/lua";
 
 hljs.registerLanguage("csharp", csharp);
 hljs.registerLanguage("cs", csharp);
@@ -33,6 +34,7 @@ hljs.registerLanguage("py", python);
 hljs.registerLanguage("markdown", markdown);
 hljs.registerLanguage("md", markdown);
 hljs.registerLanguage("diff", diff);
+hljs.registerLanguage("lua", lua);
 
 export function langFromPath(filePath: string): string | null {
   const ext = filePath.split(".").pop()?.toLowerCase();
@@ -58,6 +60,7 @@ export function langFromPath(filePath: string): string | null {
     md: "markdown",
     diff: "diff",
     patch: "diff",
+    lua: "lua",
   };
   return map[ext] ?? null;
 }

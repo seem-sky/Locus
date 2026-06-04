@@ -1502,6 +1502,16 @@ async function applyPrefill(text: string) {
   syncOperatorState();
 }
 
+async function appendPrefill(text: string) {
+  if (!text) return;
+  const pad = props.modelValue.trim() ? "\n\n" : "";
+  const cursor = appendDraftText(`${pad}${text}`);
+  await nextTick();
+  autoResizeTextarea();
+  focusComposerSelection(cursor);
+  syncOperatorState();
+}
+
 async function applyDraftPrefill(draft: UserMessageDraft) {
   resetDraft();
   await applyUserMessageDraft(draft);
@@ -2243,6 +2253,7 @@ defineExpose({
   },
   resetDraft,
   applyPrefill,
+  appendPrefill,
   applyDraftPrefill,
   addAssetRefs,
 });

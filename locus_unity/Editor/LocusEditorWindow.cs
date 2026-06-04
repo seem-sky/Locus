@@ -1,3 +1,13 @@
+/***************************************************************
+ * @Author         : seem.sky@gmail.com
+ * @Email          : seem.sky@gmail.com
+ * @Description    :
+ * @FilePath       : \locus_unity\Editor\LocusEditorWindow.cs
+ * @Date           : 2026-05-20 11:02:15
+ * @LastEditTime   : 2026-06-03 13:42:53
+ * @LastEditors    : seem.sky@gmail.com seem.sky@gmail.com
+***************************************************************/
+
 using UnityEngine;
 using UnityEditor;
 
@@ -137,6 +147,25 @@ namespace Locus
             public string kind;
             public string name;
             public string typeLabel;
+            public string source;
+        }
+
+        [Serializable]
+        internal sealed class ConsoleTextEntryDto
+        {
+            public string title;
+            public string text;
+            public string source;
+            public string level;
+        }
+
+        [Serializable]
+        internal sealed class ConsoleTextControlMessage
+        {
+            public string type;
+            public string text;
+            public ConsoleTextEntryDto[] entries;
+            public string title;
             public string source;
         }
 
@@ -284,6 +313,47 @@ namespace Locus
             }
         }
 
+        internal static bool SendConsolePayload(string payloadJson, out string error)
+        {
+            if (string.IsNullOrEmpty(payloadJson))
+            {
+                error = "Console payload is empty.";
+                return false;
+            }
+
+            string pipeName = GetControlPipeName();
+            try
+            {
+                WritePipeLineOnce(pipeName, payloadJson);
+                error = "";
+                return true;
+            }
+            catch (Exception ex)
+            {
+                error = ex.Message ?? ex.GetType().Name;
+                return false;
+            }
+        }
+
+        internal static bool SendConsoleTextEntries(
+            string text,
+            ConsoleTextEntryDto[] entries,
+            string title,
+            string source,
+            out string error)
+        {
+            ConsoleTextControlMessage message = new ConsoleTextControlMessage
+            {
+                type = "consoleText",
+                text = text ?? "",
+                entries = entries,
+                title = title ?? "",
+                source = string.IsNullOrEmpty(source) ? "unity-console" : source
+            };
+            string json = JsonUtility.ToJson(message);
+            return SendConsolePayload(json, out error);
+        }
+
         [MenuItem("Assets/Send to Locus", false, 0)]
         private static void SendSelectedAssetsToLocusMenu()
         {
@@ -306,6 +376,42 @@ namespace Locus
         private static bool ValidateSendSelectedGameObjectsToLocusMenu()
         {
             return BuildSelectedAssetRefs().Length > 0;
+        }
+
+        [MenuItem("Window/Locus Console/Send All to Locus", false, 100)]
+        private static void SendConsoleAllToLocusMenu()
+        {
+            LocusConsoleIntegration.SendAllToLocus();
+        }
+
+        [MenuItem("Window/Locus Console/Send Selected to Locus", false, 101)]
+        private static void SendConsoleSelectedToLocusMenu()
+        {
+            LocusConsoleIntegration.SendSelectedToLocus();
+        }
+
+        [MenuItem("Window/Locus Console/Send Selected to Locus %&c", false, 102)]
+        private static void SendConsoleSelectedToLocusShortcut()
+        {
+            LocusConsoleIntegration.SendSelectedToLocus();
+        }
+
+        [MenuItem("Window/Locus Console/Show Console Toolbar", false, 200)]
+        private static void ShowConsoleToolbarMenu()
+        {
+            LocusConsoleToolbarWindow.ShowToolbar();
+        }
+
+        [MenuItem("Window/Locus Console/Hide Console Toolbar", false, 201)]
+        private static void HideConsoleToolbarMenu()
+        {
+            LocusConsoleToolbarWindow.HideToolbar();
+        }
+
+        [MenuItem("Window/Locus Console/Hide Console Toolbar", true)]
+        private static bool ValidateHideConsoleToolbarMenu()
+        {
+            return LocusConsoleToolbarWindow.IsToolbarOpen();
         }
 
         private static void SendSelectedRefsToLocus()
@@ -1228,6 +1334,7 @@ namespace Locus
                 rect.height - 38f);
             Rect statusRect = new Rect(inner.x, titleRect.yMax + 8f, inner.width, 34f);
             Rect pipeRect = new Rect(inner.x, statusRect.yMax + 10f, inner.width, 18f);
+            Rect consoleHintRect = new Rect(inner.x, pipeRect.yMax + 4f, inner.width, 16f);
             GUIStyle executablePathStyle = new GUIStyle(EditorStyles.miniLabel)
             {
                 wordWrap = true,
@@ -1241,21 +1348,28 @@ namespace Locus
                     executablePathStyle.CalcHeight(new GUIContent(executablePathText), inner.width));
             Rect executablePathRect = new Rect(
                 inner.x,
-                pipeRect.yMax + 8f,
+                consoleHintRect.yMax + 4f,
                 inner.width,
                 executablePathHeight);
             float buttonY = string.IsNullOrEmpty(executablePathText)
-                ? pipeRect.yMax + 12f
+                ? executablePathRect.yMax + 4f
                 : executablePathRect.yMax + 10f;
             Rect buttonRect = new Rect(
                 inner.x,
                 buttonY,
                 Mathf.Min(116f, inner.width),
                 24f);
+            float consoleToolbarButtonY = buttonRect.yMax + 8f;
+            Rect consoleToolbarButtonRect = new Rect(
+                inner.x,
+                consoleToolbarButtonY,
+                Mathf.Min(176f, inner.width),
+                22f);
 
             GUI.Label(titleRect, _windowTitle, EditorStyles.boldLabel);
             GUI.Label(statusRect, _statusMessage, EditorStyles.wordWrappedLabel);
             EditorGUI.SelectableLabel(pipeRect, GetFullControlPipeName(), EditorStyles.miniLabel);
+            EditorGUI.SelectableLabel(consoleHintRect, ConsoleShortcutHint, EditorStyles.miniLabel);
             if (!string.IsNullOrEmpty(executablePathText))
                 EditorGUI.SelectableLabel(executablePathRect, executablePathText, executablePathStyle);
 
@@ -1266,6 +1380,35 @@ namespace Locus
                     if (GUI.Button(buttonRect, _desktopLaunchInFlight ? "启动中..." : "启动 Locus"))
                         StartLocusDesktop();
                 }
+            }
+
+            if (GUI.Button(consoleToolbarButtonRect, ConsoleToolbarButtonLabel))
+            {
+                if (LocusConsoleToolbarWindow.IsToolbarOpen())
+                    LocusConsoleToolbarWindow.HideToolbar();
+                else
+                    LocusConsoleToolbarWindow.ShowToolbar();
+            }
+        }
+
+        private static string ConsoleShortcutHint
+        {
+            get
+            {
+                string shortcut = Application.platform == RuntimePlatform.OSXEditor
+                    ? "Cmd+Opt+C"
+                    : "Ctrl+Alt+C";
+                return "Tip: focus Unity Console, press " + shortcut + " to send selected entries to Locus.";
+            }
+        }
+
+        private static string ConsoleToolbarButtonLabel
+        {
+            get
+            {
+                return LocusConsoleToolbarWindow.IsToolbarOpen()
+                    ? "Hide Locus Console Toolbar"
+                    : "Show Locus Console Toolbar";
             }
         }
 

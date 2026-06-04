@@ -1,8 +1,14 @@
+pub mod actions;
+pub mod advanced;
 pub mod client;
 pub mod llm_env;
 pub mod mapping;
 pub mod resolve;
 pub mod service;
+
+pub use actions::{
+    AgentMemoryAction, CreateAgentMemoryActionRequest, UpdateAgentMemoryActionRequest,
+};
 
 pub use client::{AgentMemoryClient, AgentMemoryHealthStatus};
 pub use service::AgentMemoryService;
@@ -10,19 +16,24 @@ pub use service::AgentMemoryService;
 use std::sync::Arc;
 
 use crate::memory::models::{
-    MemoryEntry, MemoryEntryPatch, MemoryListFilter, MemoryRetrieveHit, MemoryRetrieveOptions,
-    MemoryScope,
+    MemoryCategory, MemoryEntry, MemoryEntryPatch, MemoryListFilter, MemoryRetrieveHit,
+    MemoryRetrieveOptions, MemoryScope,
 };
+
+use std::collections::HashSet;
+use std::sync::Mutex;
 
 use mapping::{
     build_concepts, category_to_agent_type, entry_belongs_to_workspace, entry_from_remember_response,
-    entry_matches_filter, extract_search_result_content, normalize_project_path,
+    entry_matches_filter, enrich_targets_for_tool,
+    extract_smart_search_result_content, normalize_project_path, action_project_matches_workspace,
     remote_memory_to_entry, search_result_category,
 };
 
 pub struct AgentMemoryState {
     pub client: AgentMemoryClient,
     pub service: AgentMemoryService,
+    started_sessions: Mutex<HashSet<String>>,
 }
 
 impl AgentMemoryState {
@@ -30,6 +41,7 @@ impl AgentMemoryState {
         Self {
             client: AgentMemoryClient::from_env(),
             service: AgentMemoryService::from_env(),
+            started_sessions: Mutex::new(HashSet::new()),
         }
     }
 
@@ -324,18 +336,17 @@ impl AgentMemoryState {
         }
 
         let project = normalize_project_path(working_dir);
-        let token_budget = options
+        let _token_budget = options
             .token_budget
             .unwrap_or(crate::memory::models::DEFAULT_TOKEN_BUDGET);
         let cwd = normalize_project_path(working_dir);
         let cwd_ref = if cwd.is_empty() { working_dir } else { cwd.as_str() };
-        let body = self.client.search(
+        let body = self.client.smart_search(
             query,
             Some(project.as_str()),
             Some(cwd_ref),
             Some(limit),
-            Some(token_budget),
-            "narrative",
+            None,
         )?;
         let results = body
             .get("results")
@@ -344,7 +355,7 @@ impl AgentMemoryState {
             .unwrap_or_default();
         let mut hits = Vec::new();
         for result in results {
-            let Some(content) = extract_search_result_content(&result) else {
+            let Some(content) = extract_smart_search_result_content(&result) else {
                 continue;
             };
             let score = result
@@ -353,7 +364,7 @@ impl AgentMemoryState {
                 .unwrap_or(0.0) as f32;
             let obs_id = result
                 .get("obsId")
-                .or_else(|| result.get("observation").and_then(|o| o.get("id")))
+                .or_else(|| result.get("id"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
@@ -377,12 +388,6 @@ impl AgentMemoryState {
                     source_session_id: result
                         .get("sessionId")
                         .and_then(|v| v.as_str())
-                        .or_else(|| {
-                            result
-                                .get("observation")
-                                .and_then(|o| o.get("sessionId"))
-                                .and_then(|v| v.as_str())
-                        })
                         .map(str::to_string),
                     linked_doc_path: None,
                 },
@@ -390,6 +395,48 @@ impl AgentMemoryState {
                 keyword_score: score * 0.4,
                 semantic_score: score * 0.6,
             });
+        }
+        if let Some(lessons) = body.get("lessons").and_then(|v| v.as_array()) {
+            for lesson in lessons {
+                let content = lesson
+                    .get("content")
+                    .or_else(|| lesson.get("lesson"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim();
+                if content.is_empty() || !mapping::should_include_memory_content(content) {
+                    continue;
+                }
+                let score = lesson
+                    .get("confidence")
+                    .or_else(|| lesson.get("score"))
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.75) as f32;
+                hits.push(MemoryRetrieveHit {
+                    entry: MemoryEntry {
+                        id: lesson
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("lesson")
+                            .to_string(),
+                        category: MemoryCategory::Reference,
+                        scope: MemoryScope::Project,
+                        content: content.to_string(),
+                        tags: vec!["agentmemory:lesson".to_string()],
+                        pinned: false,
+                        pin_weight: 100,
+                        access_count: 0,
+                        last_accessed_at: 0,
+                        created_at: 0,
+                        updated_at: 0,
+                        source_session_id: None,
+                        linked_doc_path: None,
+                    },
+                    score,
+                    keyword_score: score * 0.3,
+                    semantic_score: score * 0.7,
+                });
+            }
         }
         Ok(hits.into_iter().take(limit).collect())
     }
@@ -409,7 +456,7 @@ impl AgentMemoryState {
         let _ = self.ensure_ready();
 
         let session_context = self
-            .session_start(session_id, working_dir, Some(query))
+            .ensure_session_started(session_id, working_dir, Some(query))
             .ok()
             .flatten()
             .filter(|value| !value.trim().is_empty());
@@ -474,6 +521,26 @@ impl AgentMemoryState {
         Ok(())
     }
 
+    pub fn observe_pre_tool_use(
+        &self,
+        session_id: &str,
+        working_dir: &str,
+        tool_name: &str,
+        tool_input: &serde_json::Value,
+    ) {
+        let project = normalize_project_path(working_dir);
+        if project.is_empty() {
+            return;
+        }
+        let data = serde_json::json!({
+            "tool_name": tool_name,
+            "tool_input": tool_input,
+        });
+        let cwd = normalize_project_path(working_dir);
+        let cwd_ref = if cwd.is_empty() { working_dir } else { cwd.as_str() };
+        let _ = self.client.observe("pre_tool_use", session_id, &project, cwd_ref, data);
+    }
+
     pub fn observe_tool_use(
         &self,
         session_id: &str,
@@ -487,20 +554,37 @@ impl AgentMemoryState {
         if project.is_empty() {
             return;
         }
-        let hook = if is_error {
-            "PostToolUseFailure"
-        } else {
-            "PostToolUse"
-        };
-        let data = serde_json::json!({
-            "toolName": tool_name,
-            "toolInput": tool_input,
-            "toolOutput": tool_output,
-            "isError": is_error,
-        });
+        // agentmemory only extracts tool_name/tool_input/tool_output when hookType is
+        // post_tool_use | post_tool_failure (see @agentmemory/agentmemory mem::observe).
+        if is_error && !mapping::should_observe_tool_failure(tool_output) {
+            return;
+        }
+        let (hook, data) = mapping::observe_tool_payload(tool_name, tool_input, tool_output, is_error);
         let cwd = normalize_project_path(working_dir);
         let cwd_ref = if cwd.is_empty() { working_dir } else { cwd.as_str() };
         let _ = self.client.observe(hook, session_id, &project, cwd_ref, data);
+    }
+
+    pub fn ensure_session_started(
+        &self,
+        session_id: &str,
+        working_dir: &str,
+        title: Option<&str>,
+    ) -> Result<Option<String>, String> {
+        {
+            let guard = self
+                .started_sessions
+                .lock()
+                .map_err(|error| error.to_string())?;
+            if guard.contains(session_id) {
+                return Ok(None);
+            }
+        }
+        let context = self.session_start(session_id, working_dir, title)?;
+        if let Ok(mut guard) = self.started_sessions.lock() {
+            guard.insert(session_id.to_string());
+        }
+        Ok(context)
     }
 
     pub fn observe_user_prompt(
@@ -517,12 +601,125 @@ impl AgentMemoryState {
         let cwd = normalize_project_path(working_dir);
         let cwd_ref = if cwd.is_empty() { working_dir } else { cwd.as_str() };
         let _ = self.client.observe(
-            "UserPromptSubmit",
+            "prompt_submit",
             session_id,
             &project,
             cwd_ref,
             data,
         );
+    }
+
+    pub fn fetch_enrich_context(
+        &self,
+        session_id: &str,
+        working_dir: &str,
+        tool_name: &str,
+        tool_input: &serde_json::Value,
+    ) -> Option<String> {
+        let (files, terms) = enrich_targets_for_tool(tool_name, tool_input);
+        if files.is_empty() {
+            return None;
+        }
+        let _ = self.ensure_ready();
+        let project = normalize_project_path(working_dir);
+        let project_ref = if project.is_empty() {
+            None
+        } else {
+            Some(project.as_str())
+        };
+        self.client
+            .enrich(session_id, project_ref, &files, &terms, tool_name)
+            .ok()
+            .flatten()
+    }
+
+    pub fn fetch_compact_context(
+        &self,
+        session_id: &str,
+        working_dir: &str,
+        token_budget: usize,
+    ) -> Option<String> {
+        let _ = self.ensure_ready();
+        let project = normalize_project_path(working_dir);
+        if project.is_empty() {
+            return None;
+        }
+        self.client
+            .fetch_context(session_id, &project, token_budget)
+            .ok()
+            .flatten()
+    }
+
+    pub fn recall_search(
+        &self,
+        working_dir: &str,
+        query: &str,
+        limit: Option<usize>,
+        format: &str,
+    ) -> Result<serde_json::Value, String> {
+        self.ensure_ready()?;
+        let query = query.trim();
+        if query.is_empty() {
+            return Err("query is required".to_string());
+        }
+        let project = normalize_project_path(working_dir);
+        let cwd = normalize_project_path(working_dir);
+        let cwd_ref = if cwd.is_empty() { working_dir } else { cwd.as_str() };
+        self.client.search(
+            query,
+            Some(project.as_str()),
+            Some(cwd_ref),
+            limit,
+            None,
+            format,
+        )
+    }
+
+    pub fn smart_search_raw(
+        &self,
+        working_dir: &str,
+        query: &str,
+        limit: Option<usize>,
+        expand_ids: Option<Vec<String>>,
+    ) -> Result<serde_json::Value, String> {
+        self.ensure_ready()?;
+        let query = query.trim();
+        if query.is_empty() {
+            return Err("query is required".to_string());
+        }
+        let project = normalize_project_path(working_dir);
+        let cwd = normalize_project_path(working_dir);
+        let cwd_ref = if cwd.is_empty() { working_dir } else { cwd.as_str() };
+        self.client.smart_search(
+            query,
+            Some(project.as_str()),
+            Some(cwd_ref),
+            limit,
+            expand_ids.as_deref(),
+        )
+    }
+
+    pub fn save_memory(
+        &self,
+        working_dir: &str,
+        content: &str,
+        mem_type: Option<&str>,
+        concepts: &[String],
+    ) -> Result<serde_json::Value, String> {
+        self.ensure_ready()?;
+        let content = content.trim();
+        if content.is_empty() {
+            return Err("content is required".to_string());
+        }
+        let project = normalize_project_path(working_dir);
+        let mem_type = mem_type.unwrap_or("fact");
+        self.client.remember(
+            content,
+            mem_type,
+            concepts,
+            Some(project.as_str()),
+            Some("locus"),
+        )
     }
 
     pub fn session_start(
@@ -547,17 +744,223 @@ impl AgentMemoryState {
             .map(str::to_string))
     }
 
-    pub fn session_end(&self, session_id: &str) -> Result<(), String> {
+    pub fn session_end(&self, session_id: &str, working_dir: Option<&str>) -> Result<(), String> {
         if !self.client.health().available {
+            if let Ok(mut guard) = self.started_sessions.lock() {
+                guard.remove(session_id);
+            }
             return Ok(());
         }
         let _ = self.client.session_end(session_id);
-        let _ = self.client.summarize_session(session_id);
+        let summarize_body = self.client.summarize_session(session_id).ok();
+        if let (Some(working_dir), Some(body)) = (
+            working_dir.map(str::trim).filter(|value| !value.is_empty()),
+            summarize_body.as_ref(),
+        ) {
+            self.create_actions_from_session_summary(body, session_id, working_dir);
+        }
+        if session_end_auto_consolidate_enabled() {
+            let _ = self
+                .client
+                .run_consolidate_pipeline(Some("all"), Some(false));
+        }
+        if let Ok(mut guard) = self.started_sessions.lock() {
+            guard.remove(session_id);
+        }
         Ok(())
+    }
+
+    fn create_actions_from_session_summary(
+        &self,
+        summarize_body: &serde_json::Value,
+        session_id: &str,
+        working_dir: &str,
+    ) {
+        let session_tag = format!("locus:session-id:{session_id}");
+        if let Ok(existing) = self.list_actions(working_dir, None) {
+            let already_created = existing
+                .iter()
+                .any(|action| action.tags.iter().any(|tag| tag == &session_tag));
+            if already_created {
+                return;
+            }
+        }
+
+        let Some(batch) =
+            actions::summary_action_batch_from_response(summarize_body, session_id, working_dir)
+        else {
+            return;
+        };
+        match self.create_action(batch.parent) {
+            Ok(parent) => {
+                for mut child in batch.children {
+                    child.parent_id = Some(parent.id.clone());
+                    if let Err(err) = self.create_action(child) {
+                        eprintln!(
+                            "[agentmemory] session summary decision action create failed for {session_id}: {err}"
+                        );
+                    }
+                }
+            }
+            Err(err) => {
+                eprintln!(
+                    "[agentmemory] session summary action create failed for {session_id}: {err}"
+                );
+            }
+        }
+    }
+
+    pub fn list_actions(
+        &self,
+        working_dir: &str,
+        status: Option<&str>,
+    ) -> Result<Vec<actions::AgentMemoryAction>, String> {
+        self.ensure_ready()?;
+        let project = normalize_project_path(working_dir);
+        let body = self.client.list_actions(None, status, None)?;
+        let mut actions = actions::parse_action_list(&body);
+        if !project.is_empty() {
+            actions.retain(|action| {
+                action_project_matches_workspace(action.project.as_deref(), &project)
+            });
+        }
+        Ok(actions)
+    }
+
+    pub fn create_action(
+        &self,
+        request: CreateAgentMemoryActionRequest,
+    ) -> Result<actions::AgentMemoryAction, String> {
+        self.ensure_ready()?;
+        let mut body = serde_json::json!({
+            "title": request.title,
+            "tags": request.tags,
+        });
+        if let Some(description) = request
+            .description
+            .filter(|value| !value.trim().is_empty())
+        {
+            body["description"] = serde_json::json!(description);
+        }
+        if let Some(priority) = request.priority {
+            body["priority"] = serde_json::json!(priority);
+        }
+        if let Some(project) = request.project.filter(|value| !value.trim().is_empty()) {
+            body["project"] = serde_json::json!(project);
+        }
+        if let Some(created_by) = request.created_by.filter(|value| !value.trim().is_empty()) {
+            body["createdBy"] = serde_json::json!(created_by);
+        }
+        if let Some(parent_id) = request.parent_id.filter(|value| !value.trim().is_empty()) {
+            body["parentId"] = serde_json::json!(parent_id);
+        }
+        if !request.requires.is_empty() {
+            let edges: Vec<serde_json::Value> = request
+                .requires
+                .iter()
+                .map(|target_action_id| {
+                    serde_json::json!({
+                        "type": "requires",
+                        "targetActionId": target_action_id,
+                    })
+                })
+                .collect();
+            body["edges"] = serde_json::json!(edges);
+        }
+        let response = self.client.create_action(body)?;
+        actions::parse_action(&response)
+            .or_else(|| {
+                response
+                    .get("action")
+                    .and_then(|value| actions::parse_action(value))
+            })
+            .ok_or_else(|| "agentmemory create action returned no action payload".to_string())
+    }
+
+    pub fn update_action(
+        &self,
+        request: UpdateAgentMemoryActionRequest,
+    ) -> Result<actions::AgentMemoryAction, String> {
+        self.ensure_ready()?;
+        let mut body = serde_json::json!({ "actionId": request.action_id });
+        if let Some(status) = request.status.filter(|value| !value.trim().is_empty()) {
+            body["status"] = serde_json::json!(status);
+        }
+        if let Some(title) = request.title.filter(|value| !value.trim().is_empty()) {
+            body["title"] = serde_json::json!(title);
+        }
+        if let Some(description) = request
+            .description
+            .filter(|value| !value.trim().is_empty())
+        {
+            body["description"] = serde_json::json!(description);
+        }
+        if let Some(priority) = request.priority {
+            body["priority"] = serde_json::json!(priority);
+        }
+        if let Some(result) = request.result.filter(|value| !value.trim().is_empty()) {
+            body["result"] = serde_json::json!(result);
+        }
+        let response = self.client.update_action(body)?;
+        actions::parse_action(&response)
+            .or_else(|| {
+                response
+                    .get("action")
+                    .and_then(|value| actions::parse_action(value))
+            })
+            .ok_or_else(|| "agentmemory update action returned no action payload".to_string())
+    }
+
+    pub fn fetch_frontier(
+        &self,
+        working_dir: &str,
+        limit: Option<usize>,
+    ) -> Result<serde_json::Value, String> {
+        self.ensure_ready()?;
+        let project = normalize_project_path(working_dir);
+        let project_ref = if project.is_empty() {
+            None
+        } else {
+            Some(project.as_str())
+        };
+        self.client.fetch_frontier(project_ref, Some("locus"), limit)
+    }
+
+    pub fn create_action_from_proposal_item(
+        &self,
+        item: &crate::session::models::MemoryProposalItem,
+        working_dir: &str,
+        session_id: &str,
+    ) -> Result<actions::AgentMemoryAction, String> {
+        let request = actions::create_request_from_proposal_item(item, working_dir, session_id);
+        self.create_action(request)
     }
 }
 
 pub type SharedAgentMemoryState = Arc<AgentMemoryState>;
+
+/// Session-end consolidation is opt-out via `LOCUS_AGENTMEMORY_SESSION_END_CONSOLIDATE=0|false`.
+fn session_end_auto_consolidate_enabled() -> bool {
+    match std::env::var("LOCUS_AGENTMEMORY_SESSION_END_CONSOLIDATE")
+        .ok()
+        .map(|value| value.trim().to_ascii_lowercase())
+    {
+        Some(value) if matches!(value.as_str(), "0" | "false" | "no" | "off") => false,
+        _ => true,
+    }
+}
+
+#[cfg(test)]
+mod session_end_tests {
+    use super::session_end_auto_consolidate_enabled;
+
+    #[test]
+    fn session_end_consolidate_respects_opt_out_env() {
+        std::env::set_var("LOCUS_AGENTMEMORY_SESSION_END_CONSOLIDATE", "false");
+        assert!(!session_end_auto_consolidate_enabled());
+        std::env::remove_var("LOCUS_AGENTMEMORY_SESSION_END_CONSOLIDATE");
+    }
+}
 
 fn merge_memory_prompt_blocks(first: Option<&str>, second: Option<&str>) -> Option<String> {
     let first = first.map(str::trim).filter(|value| !value.is_empty());

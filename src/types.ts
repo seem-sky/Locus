@@ -891,6 +891,8 @@ export interface BasicToolConfirmDisplay {
   toolName: string;
   arguments: string;
   workflowNote?: string;
+  /** READ/PLAN ambiguous tool confirm — offer session whitelist. */
+  workflowWhitelistOffered?: boolean;
 }
 
 export type KnowledgeToolConfirmDirectoryMode = "auto" | "approval";

@@ -33,4 +33,14 @@ describe("tool confirm layout", () => {
     expect(labels).toContain("titleForUnityEditorStatusChange");
     expect(zh).toContain('"chat.toolConfirm.unityStatus.title.playing": "请求进入运行状态"');
   });
+
+  it("offers READ/PLAN workflow whitelist on ambiguous tool confirm", () => {
+    const card = read("src/components/chat/ToolConfirmCard.vue");
+    const zh = read("src/language/zh.json");
+
+    expect(card).toContain("workflowWhitelistOffered");
+    expect(card).toContain("encodeToolConfirmAllow");
+    expect(zh).toContain('"chat.toolConfirm.workflowWhitelist"');
+    expect(zh).toContain("持久保存");
+  });
 });

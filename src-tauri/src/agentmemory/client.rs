@@ -24,6 +24,8 @@ pub struct AgentMemoryHealthStatus {
     pub error: Option<String>,
     #[serde(skip)]
     pub orphaned_listener: bool,
+    #[serde(skip)]
+    pub worker_count: usize,
 }
 
 impl AgentMemoryClient {
@@ -132,6 +134,12 @@ impl AgentMemoryClient {
             .unwrap_or("healthy")
             .to_string();
         let available = matches!(status.as_str(), "healthy" | "ok");
+        let worker_count = body
+            .get("health")
+            .and_then(|health| health.get("workers"))
+            .and_then(|workers| workers.as_array())
+            .map(|workers| workers.len())
+            .unwrap_or(0);
         AgentMemoryHealthStatus {
             available,
             status,
@@ -145,6 +153,7 @@ impl AgentMemoryClient {
                 .and_then(|v| u16::try_from(v).ok()),
             error: None,
             orphaned_listener: false,
+            worker_count,
         }
     }
 
@@ -168,6 +177,7 @@ impl AgentMemoryClient {
                             body.to_string().chars().take(200).collect::<String>()
                         )),
                         orphaned_listener: false,
+                        worker_count: 0,
                     };
                 }
                 Err(error) if path == "/agentmemory/health" => {
@@ -178,6 +188,7 @@ impl AgentMemoryClient {
                         viewer_port: None,
                         error: Some(error),
                         orphaned_listener: false,
+                        worker_count: 0,
                     };
                 }
                 Err(_) => continue,
@@ -195,6 +206,7 @@ impl AgentMemoryClient {
                     self.base_url
                 )),
                 orphaned_listener: true,
+                worker_count: 0,
             }
         } else {
             AgentMemoryHealthStatus {
@@ -207,6 +219,7 @@ impl AgentMemoryClient {
                     self.base_url
                 )),
                 orphaned_listener: false,
+                worker_count: 0,
             }
         }
     }
@@ -350,4 +363,317 @@ impl AgentMemoryClient {
         }
         self.send_json(reqwest::Method::POST, "/agentmemory/search", Some(body))
     }
+
+    pub fn smart_search(
+        &self,
+        query: &str,
+        project: Option<&str>,
+        cwd: Option<&str>,
+        limit: Option<usize>,
+        expand_ids: Option<&[String]>,
+    ) -> Result<Value, String> {
+        let mut body = json!({ "query": query });
+        if let Some(project) = project.filter(|value| !value.trim().is_empty()) {
+            body["project"] = json!(project);
+        }
+        if let Some(cwd) = cwd.filter(|value| !value.trim().is_empty()) {
+            body["cwd"] = json!(cwd);
+        }
+        if let Some(limit) = limit {
+            body["limit"] = json!(limit);
+        }
+        if let Some(ids) = expand_ids.filter(|items| !items.is_empty()) {
+            body["expandIds"] = json!(ids);
+        }
+        self.send_json(
+            reqwest::Method::POST,
+            "/agentmemory/smart-search",
+            Some(body),
+        )
+    }
+
+    pub fn fetch_context(
+        &self,
+        session_id: &str,
+        project: &str,
+        token_budget: usize,
+    ) -> Result<Option<String>, String> {
+        let body = self.send_json(
+            reqwest::Method::POST,
+            "/agentmemory/context",
+            Some(json!({
+                "sessionId": session_id,
+                "project": project,
+                "budget": token_budget,
+            })),
+        )?;
+        Ok(body
+            .get("context")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string))
+    }
+
+    pub fn enrich(
+        &self,
+        session_id: &str,
+        project: Option<&str>,
+        files: &[String],
+        terms: &[String],
+        tool_name: &str,
+    ) -> Result<Option<String>, String> {
+        if files.is_empty() {
+            return Ok(None);
+        }
+        let mut body = json!({
+            "sessionId": session_id,
+            "files": files,
+            "terms": terms,
+            "toolName": tool_name,
+        });
+        if let Some(project) = project.filter(|value| !value.trim().is_empty()) {
+            body["project"] = json!(project);
+        }
+        let response = self.send_json(reqwest::Method::POST, "/agentmemory/enrich", Some(body))?;
+        Ok(response
+            .get("context")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string))
+    }
+
+    pub fn list_actions(
+        &self,
+        project: Option<&str>,
+        status: Option<&str>,
+        parent_id: Option<&str>,
+    ) -> Result<serde_json::Value, String> {
+        let mut parts = Vec::new();
+        if let Some(project) = project.filter(|value| !value.trim().is_empty()) {
+            parts.push(format!("project={}", urlencoding_encode(project)));
+        }
+        if let Some(status) = status.filter(|value| !value.trim().is_empty()) {
+            parts.push(format!("status={}", urlencoding_encode(status)));
+        }
+        if let Some(parent_id) = parent_id.filter(|value| !value.trim().is_empty()) {
+            parts.push(format!("parentId={}", urlencoding_encode(parent_id)));
+        }
+        let path = if parts.is_empty() {
+            "/agentmemory/actions".to_string()
+        } else {
+            format!("/agentmemory/actions?{}", parts.join("&"))
+        };
+        self.send_json(reqwest::Method::GET, &path, None)
+    }
+
+    pub fn create_action(&self, body: serde_json::Value) -> Result<serde_json::Value, String> {
+        self.send_json(reqwest::Method::POST, "/agentmemory/actions", Some(body))
+    }
+
+    pub fn update_action(&self, body: serde_json::Value) -> Result<serde_json::Value, String> {
+        self.send_json(
+            reqwest::Method::POST,
+            "/agentmemory/actions/update",
+            Some(body),
+        )
+    }
+
+    pub fn get_action(&self, action_id: &str) -> Result<serde_json::Value, String> {
+        let path = format!(
+            "/agentmemory/actions/get?actionId={}",
+            urlencoding_encode(action_id)
+        );
+        self.send_json(reqwest::Method::GET, &path, None)
+    }
+
+    pub fn fetch_frontier(
+        &self,
+        project: Option<&str>,
+        agent_id: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<serde_json::Value, String> {
+        let mut parts = Vec::new();
+        if let Some(project) = project.filter(|value| !value.trim().is_empty()) {
+            parts.push(format!("project={}", urlencoding_encode(project)));
+        }
+        if let Some(agent_id) = agent_id.filter(|value| !value.trim().is_empty()) {
+            parts.push(format!("agentId={}", urlencoding_encode(agent_id)));
+        }
+        if let Some(limit) = limit {
+            parts.push(format!("limit={limit}"));
+        }
+        let path = if parts.is_empty() {
+            "/agentmemory/frontier".to_string()
+        } else {
+            format!("/agentmemory/frontier?{}", parts.join("&"))
+        };
+        self.send_json(reqwest::Method::GET, &path, None)
+    }
+
+    pub fn list_sessions(&self) -> Result<Value, String> {
+        self.send_json(reqwest::Method::GET, "/agentmemory/sessions", None)
+    }
+
+    pub fn fetch_patterns(&self, project: &str) -> Result<Value, String> {
+        self.send_json(
+            reqwest::Method::POST,
+            "/agentmemory/patterns",
+            Some(json!({ "project": project })),
+        )
+    }
+
+    pub fn fetch_timeline(
+        &self,
+        anchor: &str,
+        project: Option<&str>,
+        before: Option<usize>,
+        after: Option<usize>,
+    ) -> Result<Value, String> {
+        let mut body = json!({ "anchor": anchor });
+        if let Some(project) = project.filter(|value| !value.trim().is_empty()) {
+            body["project"] = json!(project);
+        }
+        if let Some(before) = before {
+            body["before"] = json!(before);
+        }
+        if let Some(after) = after {
+            body["after"] = json!(after);
+        }
+        self.send_json(reqwest::Method::POST, "/agentmemory/timeline", Some(body))
+    }
+
+    pub fn fetch_profile(&self, project: &str) -> Result<Value, String> {
+        let path = format!(
+            "/agentmemory/profile?project={}",
+            urlencoding_encode(project)
+        );
+        self.send_json(reqwest::Method::GET, &path, None)
+    }
+
+    pub fn fetch_file_context(
+        &self,
+        files: &[String],
+        session_id: Option<&str>,
+    ) -> Result<Value, String> {
+        let mut body = json!({ "files": files });
+        if let Some(session_id) = session_id.filter(|value| !value.trim().is_empty()) {
+            body["sessionId"] = json!(session_id);
+        }
+        self.send_json(reqwest::Method::POST, "/agentmemory/file-context", Some(body))
+    }
+
+    pub fn fetch_next(
+        &self,
+        project: Option<&str>,
+        agent_id: Option<&str>,
+    ) -> Result<Value, String> {
+        let mut parts = Vec::new();
+        if let Some(project) = project.filter(|value| !value.trim().is_empty()) {
+            parts.push(format!("project={}", urlencoding_encode(project)));
+        }
+        if let Some(agent_id) = agent_id.filter(|value| !value.trim().is_empty()) {
+            parts.push(format!("agentId={}", urlencoding_encode(agent_id)));
+        }
+        let path = if parts.is_empty() {
+            "/agentmemory/next".to_string()
+        } else {
+            format!("/agentmemory/next?{}", parts.join("&"))
+        };
+        self.send_json(reqwest::Method::GET, &path, None)
+    }
+
+    pub fn run_consolidate_pipeline(
+        &self,
+        tier: Option<&str>,
+        force: Option<bool>,
+    ) -> Result<Value, String> {
+        let mut body = json!({});
+        if let Some(tier) = tier.filter(|value| !value.trim().is_empty()) {
+            body["tier"] = json!(tier);
+        }
+        if let Some(force) = force {
+            body["force"] = json!(force);
+        }
+        self.send_json(
+            reqwest::Method::POST,
+            "/agentmemory/consolidate-pipeline",
+            Some(body),
+        )
+    }
+
+    pub fn graph_query(&self, body: Value) -> Result<Value, String> {
+        self.send_json(reqwest::Method::POST, "/agentmemory/graph/query", Some(body))
+    }
+
+    pub fn graph_stats(&self) -> Result<Value, String> {
+        self.send_json(reqwest::Method::GET, "/agentmemory/graph/stats", None)
+    }
+
+    pub fn evolve_memory(
+        &self,
+        memory_id: &str,
+        new_content: &str,
+        new_title: Option<&str>,
+    ) -> Result<Value, String> {
+        let mut body = json!({
+            "memoryId": memory_id,
+            "newContent": new_content,
+        });
+        if let Some(title) = new_title.filter(|value| !value.trim().is_empty()) {
+            body["newTitle"] = json!(title);
+        }
+        self.send_json(reqwest::Method::POST, "/agentmemory/evolve", Some(body))
+    }
+
+    pub fn list_commits(
+        &self,
+        branch: Option<&str>,
+        repo: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<Value, String> {
+        let mut parts = Vec::new();
+        if let Some(branch) = branch.filter(|value| !value.trim().is_empty()) {
+            parts.push(format!("branch={}", urlencoding_encode(branch)));
+        }
+        if let Some(repo) = repo.filter(|value| !value.trim().is_empty()) {
+            parts.push(format!("repo={}", urlencoding_encode(repo)));
+        }
+        if let Some(limit) = limit {
+            parts.push(format!("limit={limit}"));
+        }
+        let path = if parts.is_empty() {
+            "/agentmemory/commits".to_string()
+        } else {
+            format!("/agentmemory/commits?{}", parts.join("&"))
+        };
+        self.send_json(reqwest::Method::GET, &path, None)
+    }
+
+    pub fn session_by_commit(&self, sha: &str) -> Result<Value, String> {
+        let path = format!(
+            "/agentmemory/session/by-commit?sha={}",
+            urlencoding_encode(sha)
+        );
+        self.send_json(reqwest::Method::GET, &path, None)
+    }
+
+    pub fn list_observations(&self, session_id: &str) -> Result<Value, String> {
+        let path = format!(
+            "/agentmemory/observations?sessionId={}",
+            urlencoding_encode(session_id)
+        );
+        self.send_json(reqwest::Method::GET, &path, None)
+    }
+}
+
+fn urlencoding_encode(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| match ch {
+            'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' => ch.to_string(),
+            _ => format!("%{:02X}", ch as u32),
+        })
+        .collect()
 }

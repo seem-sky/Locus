@@ -2,14 +2,23 @@
 import { computed, nextTick, onMounted, ref, watch } from "vue";
 import { t } from "../../i18n";
 import {
+  agentmemoryActionList,
+  agentmemoryActionUpdate,
+  agentmemoryConsolidate,
+  agentmemoryInsights,
   agentmemoryStart,
   agentmemoryStatus,
   agentmemoryStop,
+  isAgentMemoryPatternNoise,
   memoryCreate,
   memoryDelete,
   memoryList,
   memoryPin,
   memoryUpdate,
+  parseSessionRows,
+  type AgentMemoryAction,
+  type AgentMemoryInsights,
+  type AgentMemorySessionRow,
   type AgentMemoryStatus,
 } from "../../services/memory";
 import { openUrl } from "@tauri-apps/plugin-opener";
@@ -40,6 +49,13 @@ const editSaving = ref(false);
 const deletingId = ref<string | null>(null);
 const serviceStatus = ref<AgentMemoryStatus | null>(null);
 const serviceLoading = ref(false);
+const actions = ref<AgentMemoryAction[]>([]);
+const actionsLoading = ref(false);
+const actionUpdatingId = ref<string | null>(null);
+const insights = ref<AgentMemoryInsights | null>(null);
+const insightsLoading = ref(false);
+const insightsExpanded = ref(false);
+const consolidating = ref(false);
 let loadEntriesSeq = 0;
 
 const viewerUrl = computed(() => {
@@ -212,9 +228,150 @@ async function loadEntries(options?: { force?: boolean }) {
   }
 }
 
+async function loadActions() {
+  if (!hasWorkspace.value || !serviceStatus.value?.available) {
+    actions.value = [];
+    return;
+  }
+  actionsLoading.value = true;
+  try {
+    actions.value = await agentmemoryActionList(project.workingDir);
+  } catch (cause) {
+    actions.value = [];
+    console.warn("[memory-settings] agentmemory_action_list failed:", cause);
+  } finally {
+    actionsLoading.value = false;
+  }
+}
+
+async function markActionDone(action: AgentMemoryAction) {
+  if (!hasWorkspace.value || actionUpdatingId.value) return;
+  actionUpdatingId.value = action.id;
+  try {
+    const updated = await agentmemoryActionUpdate({
+      workingDir: project.workingDir,
+      actionId: action.id,
+      status: "done",
+    });
+    actions.value = actions.value.map((item) => (item.id === updated.id ? updated : item));
+  } catch (cause) {
+    notificationStore.addNotice("error", normalizeAppError(cause).message);
+  } finally {
+    actionUpdatingId.value = null;
+  }
+}
+
+const pendingActions = computed(() =>
+  actions.value.filter((action) => action.status === "pending" || action.status === "active"),
+);
+
+const sessionRows = computed<AgentMemorySessionRow[]>(() =>
+  parseSessionRows(insights.value?.sessions),
+);
+
+const profileSummary = computed(() => {
+  const profile = insights.value?.profile;
+  if (!profile || typeof profile !== "object") return null;
+  const record = profile as Record<string, unknown>;
+  const concepts = Array.isArray(record.concepts)
+    ? record.concepts.filter((item): item is string => typeof item === "string")
+    : [];
+  const topFiles = Array.isArray(record.topFiles)
+    ? record.topFiles.filter((item): item is string => typeof item === "string")
+    : Array.isArray(record.files)
+      ? record.files.filter((item): item is string => typeof item === "string")
+      : [];
+  const summary =
+    typeof record.summary === "string"
+      ? record.summary
+      : typeof record.narrative === "string"
+        ? record.narrative
+        : null;
+  return { concepts, topFiles, summary };
+});
+
+const patternItems = computed(() => {
+  const patterns = insights.value?.patterns;
+  if (!patterns || typeof patterns !== "object") return [] as string[];
+  const record = patterns as Record<string, unknown>;
+  const list = Array.isArray(record.patterns)
+    ? record.patterns
+    : Array.isArray(patterns)
+      ? patterns
+      : [];
+  return list
+    .map((item) => {
+      if (typeof item === "string") return item;
+      if (item && typeof item === "object") {
+        const row = item as Record<string, unknown>;
+        if (typeof row.description === "string") return row.description;
+        if (typeof row.title === "string") return row.title;
+        if (typeof row.pattern === "string") return row.pattern;
+      }
+      return null;
+    })
+    .filter((item): item is string => !!item && item.trim().length > 0)
+    .filter((item) => !isAgentMemoryPatternNoise(item));
+});
+
+const graphSummary = computed(() => {
+  const stats = insights.value?.graphStats;
+  if (!stats || typeof stats !== "object") return null;
+  const record = stats as Record<string, unknown>;
+  const nodes =
+    typeof record.nodeCount === "number"
+      ? record.nodeCount
+      : typeof record.nodes === "number"
+        ? record.nodes
+        : null;
+  const edges =
+    typeof record.edgeCount === "number"
+      ? record.edgeCount
+      : typeof record.edges === "number"
+        ? record.edges
+        : null;
+  const healthy =
+    typeof record.healthy === "boolean"
+      ? record.healthy
+      : typeof record.enabled === "boolean"
+        ? record.enabled
+        : null;
+  return { nodes, edges, healthy };
+});
+
+async function loadAdvancedInsights() {
+  if (!hasWorkspace.value || !serviceStatus.value?.available) {
+    insights.value = null;
+    return;
+  }
+  insightsLoading.value = true;
+  try {
+    insights.value = await agentmemoryInsights(project.workingDir);
+  } catch (cause) {
+    insights.value = null;
+    console.warn("[memory-settings] agentmemory_insights failed:", cause);
+  } finally {
+    insightsLoading.value = false;
+  }
+}
+
+async function runConsolidation() {
+  if (consolidating.value || !serviceStatus.value?.available) return;
+  consolidating.value = true;
+  try {
+    await agentmemoryConsolidate({ tier: "all", force: true });
+    notificationStore.addNotice("success", t("memory.advanced.consolidateDone"));
+    await loadAdvancedInsights();
+  } catch (cause) {
+    notificationStore.addNotice("error", normalizeAppError(cause).message);
+  } finally {
+    consolidating.value = false;
+  }
+}
+
 async function reloadEntries() {
   await loadServiceStatus();
-  await loadEntries({ force: true });
+  await Promise.all([loadEntries({ force: true }), loadActions(), loadAdvancedInsights()]);
 }
 
 function openEdit(entry: MemoryEntry) {
@@ -328,12 +485,15 @@ watch(
   (available, previous) => {
     if (available && previous === false && hasWorkspace.value) {
       void loadEntries({ force: true });
+      void loadAdvancedInsights();
     }
   },
 );
 onMounted(async () => {
   await loadServiceStatus();
   await loadEntries();
+  await loadActions();
+  await loadAdvancedInsights();
 });
 </script>
 
@@ -421,6 +581,163 @@ onMounted(async () => {
         >
           {{ t("memory.agentmemory.openViewer") }}
         </BaseButton>
+      </div>
+    </div>
+
+    <div
+      v-if="hasWorkspace && serviceStatus?.available"
+      class="memory-actions-panel"
+    >
+      <div class="memory-actions-header">
+        <div class="memory-service-title">{{ t("memory.actions.title") }}</div>
+        <span class="memory-service-detail">
+          {{ t("memory.actions.summary", pendingActions.length, actions.length) }}
+        </span>
+      </div>
+      <div v-if="actionsLoading" class="memory-service-detail">{{ t("memory.actions.loading") }}</div>
+      <div v-else-if="actions.length === 0" class="memory-service-detail">{{ t("memory.actions.empty") }}</div>
+      <ul v-else class="memory-actions-list">
+        <li v-for="action in actions" :key="action.id" class="memory-action-item">
+          <div class="memory-action-main">
+            <div class="memory-action-title">{{ action.title }}</div>
+            <div v-if="action.description" class="memory-action-desc">{{ action.description }}</div>
+            <div class="memory-action-meta">
+              <span class="memory-action-status">{{ action.status }}</span>
+            </div>
+          </div>
+          <BaseButton
+            v-if="action.status === 'pending' || action.status === 'active'"
+            variant="neutral"
+            size="sm"
+            :disabled="actionUpdatingId === action.id"
+            @click="markActionDone(action)"
+          >
+            {{ t("memory.actions.markDone") }}
+          </BaseButton>
+        </li>
+      </ul>
+    </div>
+
+    <div
+      v-if="hasWorkspace && serviceStatus?.available"
+      class="memory-advanced-panel"
+    >
+      <div class="memory-actions-header">
+        <button
+          type="button"
+          class="memory-advanced-toggle"
+          @click="insightsExpanded = !insightsExpanded"
+        >
+          <span class="memory-service-title">{{ t("memory.advanced.title") }}</span>
+          <span class="memory-service-detail">{{ insightsExpanded ? "▾" : "▸" }}</span>
+        </button>
+        <div class="memory-advanced-toolbar">
+          <BaseButton
+            variant="neutral"
+            size="sm"
+            :disabled="insightsLoading"
+            @click="loadAdvancedInsights"
+          >
+            {{ t("memory.advanced.refresh") }}
+          </BaseButton>
+          <BaseButton
+            variant="neutral"
+            size="sm"
+            :disabled="consolidating"
+            @click="runConsolidation"
+          >
+            {{ consolidating ? t("memory.advanced.consolidating") : t("memory.advanced.consolidate") }}
+          </BaseButton>
+        </div>
+      </div>
+
+      <div v-if="insightsExpanded">
+        <div v-if="insightsLoading" class="memory-service-detail">{{ t("memory.advanced.loading") }}</div>
+        <template v-else>
+          <div
+            v-if="insights?.errors?.length"
+            class="memory-service-detail memory-service-warn"
+          >
+            {{ insights.errors.join(" · ") }}
+          </div>
+
+          <div class="memory-advanced-grid">
+            <section class="memory-advanced-card">
+              <h3>{{ t("memory.advanced.sessions") }}</h3>
+              <div v-if="sessionRows.length === 0" class="memory-service-detail">
+                {{ t("memory.advanced.sessionsEmpty") }}
+              </div>
+              <ul v-else class="memory-advanced-list">
+                <li v-for="session in sessionRows.slice(0, 8)" :key="session.id">
+                  <div class="memory-advanced-row-title">
+                    {{ session.title || session.id }}
+                  </div>
+                  <div class="memory-service-detail">
+                    <span>{{ session.status || "-" }}</span>
+                    <span v-if="session.observationCount != null">
+                      · {{ t("memory.advanced.observations", session.observationCount) }}
+                    </span>
+                  </div>
+                </li>
+              </ul>
+            </section>
+
+            <section class="memory-advanced-card">
+              <h3>{{ t("memory.advanced.profile") }}</h3>
+              <div v-if="!profileSummary" class="memory-service-detail">
+                {{ t("memory.advanced.profileEmpty") }}
+              </div>
+              <template v-else>
+                <p v-if="profileSummary.summary" class="memory-advanced-text">
+                  {{ profileSummary.summary }}
+                </p>
+                <div v-if="profileSummary.concepts.length" class="memory-advanced-tags">
+                  <span
+                    v-for="concept in profileSummary.concepts.slice(0, 12)"
+                    :key="concept"
+                    class="memory-tag-chip"
+                  >
+                    {{ concept }}
+                  </span>
+                </div>
+                <ul v-if="profileSummary.topFiles.length" class="memory-advanced-list compact">
+                  <li v-for="file in profileSummary.topFiles.slice(0, 6)" :key="file">{{ file }}</li>
+                </ul>
+              </template>
+            </section>
+
+            <section class="memory-advanced-card">
+              <h3>{{ t("memory.advanced.graph") }}</h3>
+              <div v-if="!graphSummary" class="memory-service-detail">
+                {{ t("memory.advanced.graphEmpty") }}
+              </div>
+              <div v-else class="memory-advanced-metrics">
+                <div v-if="graphSummary.nodes != null">
+                  {{ t("memory.advanced.nodes", graphSummary.nodes) }}
+                </div>
+                <div v-if="graphSummary.edges != null">
+                  {{ t("memory.advanced.edges", graphSummary.edges) }}
+                </div>
+                <div v-if="graphSummary.healthy != null">
+                  {{
+                    graphSummary.healthy
+                      ? t("memory.advanced.graphHealthy")
+                      : t("memory.advanced.graphDisabled")
+                  }}
+                </div>
+              </div>
+            </section>
+
+            <section v-if="patternItems.length" class="memory-advanced-card wide">
+              <h3>{{ t("memory.advanced.patterns") }}</h3>
+              <ul class="memory-advanced-list">
+                <li v-for="(pattern, index) in patternItems.slice(0, 6)" :key="index">
+                  {{ pattern }}
+                </li>
+              </ul>
+            </section>
+          </div>
+        </template>
       </div>
     </div>
 
@@ -564,6 +881,159 @@ onMounted(async () => {
   border-radius: 6px;
   color: var(--status-danger-fg);
   font-size: 13px;
+}
+
+.memory-actions-panel {
+  margin-bottom: 16px;
+  padding: 12px 14px;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--panel-bg) 92%, var(--bg-color) 8%);
+}
+
+.memory-advanced-panel {
+  margin-bottom: 16px;
+  padding: 12px 14px;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--panel-bg) 94%, var(--bg-color) 6%);
+}
+
+.memory-advanced-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
+
+.memory-advanced-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-left: auto;
+}
+
+.memory-advanced-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 12px;
+  margin-top: 12px;
+}
+
+.memory-advanced-card {
+  padding: 10px 12px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--panel-bg) 90%, var(--bg-color) 10%);
+}
+
+.memory-advanced-card.wide {
+  grid-column: 1 / -1;
+}
+
+.memory-advanced-card h3 {
+  margin: 0 0 8px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+.memory-advanced-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.memory-advanced-list.compact {
+  gap: 4px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.memory-advanced-row-title {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.memory-advanced-text {
+  margin: 0 0 8px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  white-space: pre-wrap;
+}
+
+.memory-advanced-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.memory-advanced-metrics {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.memory-actions-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.memory-actions-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.memory-action-item {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+}
+
+.memory-action-main {
+  min-width: 0;
+  flex: 1;
+}
+
+.memory-action-title {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.memory-action-desc {
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.memory-action-meta {
+  margin-top: 6px;
+  font-size: 11px;
+  color: var(--text-secondary);
 }
 
 .memory-service-panel {

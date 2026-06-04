@@ -331,6 +331,9 @@ pub struct BasicToolConfirmDisplay {
     pub arguments: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workflow_note: Option<String>,
+    /// Offer "add to READ/PLAN whitelist" when workflow ambiguous confirm is required.
+    #[serde(default)]
+    pub workflow_whitelist_offered: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

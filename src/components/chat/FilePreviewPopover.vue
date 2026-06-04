@@ -2,6 +2,8 @@
 import { ref, computed, onMounted, onUnmounted, watch, nextTick } from "vue";
 import hljs from "../../hljs";
 import type { WorkspaceFilePreview } from "../../services/unity";
+import CodePreviewSelectionMenu from "../code/CodePreviewSelectionMenu.vue";
+import { useCodePreviewSelectionMenu } from "../../composables/useCodePreviewSelectionMenu";
 
 const props = defineProps<{
   preview: WorkspaceFilePreview;
@@ -111,6 +113,21 @@ const actionHint = computed(() => {
   if (p.preferredAction === "unity" && props.unityConnected) return "Click to select in Unity";
   return "Click to open with default app";
 });
+
+const {
+  menu: selectionMenu,
+  closeMenu: closeSelectionMenu,
+  handleContextMenu,
+  copySelection,
+  sendToComposer,
+} = useCodePreviewSelectionMenu(() => {
+  const p = props.preview;
+  return {
+    filePath: p.displayPath,
+    language: p.kind === "text" ? p.language : undefined,
+    lineOffset: p.kind === "text" ? p.snippetStartLine || 1 : 1,
+  };
+});
 </script>
 
 <template>
@@ -127,7 +144,11 @@ const actionHint = computed(() => {
         <span v-if="preview.language" class="lang-tag">{{ preview.language }}</span>
       </div>
 
-      <div v-if="preview.kind === 'text' && preview.snippet" class="popover-body">
+      <div
+        v-if="preview.kind === 'text' && preview.snippet"
+        class="popover-body code-preview-surface"
+        @contextmenu="handleContextMenu"
+      >
         <pre><code v-html="highlightedSnippet" /></pre>
         <div v-if="preview.truncated" class="truncation-hint">...</div>
       </div>
@@ -139,6 +160,13 @@ const actionHint = computed(() => {
       </div>
 
       <div class="popover-hint">{{ actionHint }}</div>
+      <CodePreviewSelectionMenu
+        v-if="selectionMenu"
+        :menu="selectionMenu"
+        @close="closeSelectionMenu"
+        @copy="copySelection"
+        @send-to-composer="sendToComposer"
+      />
     </div>
   </Teleport>
 </template>
@@ -198,11 +226,18 @@ const actionHint = computed(() => {
   background: transparent;
 }
 
+.popover-body {
+  font-size: var(--code-preview-font-size);
+  line-height: var(--code-preview-line-height);
+  letter-spacing: var(--code-preview-letter-spacing);
+}
+
 .popover-body code {
   display: block;
-  font-family: var(--font-mono-block);
-  font-size: 12px;
-  line-height: 1.5;
+  font-family: var(--font-mono-editor);
+  font-size: var(--code-preview-font-size);
+  line-height: var(--code-preview-line-height);
+  letter-spacing: var(--code-preview-letter-spacing);
   padding: 6px 0;
   white-space: pre;
   overflow-x: auto;

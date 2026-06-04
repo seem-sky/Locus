@@ -71,8 +71,15 @@ impl AgentMemoryService {
     }
 
     pub fn ensure_running(&self, client: &AgentMemoryClient) -> Result<(), String> {
-        if self.locus_managed_process_alive() && client.health().available {
+        let health = client.health();
+        if self.locus_managed_process_alive() && health.available && health.worker_count <= 1 {
             return Ok(());
+        }
+        if self.locus_managed_process_alive() && health.available && health.worker_count > 1 {
+            eprintln!(
+                "[Locus] agentmemory: {} workers connected (expected 1), restarting sidecar",
+                health.worker_count
+            );
         }
         if !self.autostart {
             return Err(format!(
@@ -102,20 +109,24 @@ impl AgentMemoryService {
 
     pub fn start(&self, client: &AgentMemoryClient) -> Result<(), String> {
         self.reap_exited_child();
-        if client.health().available && self.locus_managed_process_alive() {
+        let health = client.health();
+        if health.available && self.locus_managed_process_alive() && health.worker_count <= 1 {
             return Ok(());
         }
 
         self.stop()?;
+        let resolved = resolve::resolve_agentmemory()?;
         if client.health().available {
             reclaim_listener_port(client);
         } else {
             cleanup_stale_listener(client);
         }
+        if resolved.using_bundled_runtime {
+            reclaim_all_agentmemory_workers();
+        }
 
         let mut guard = self.child.lock().map_err(|e| e.to_string())?;
 
-        let resolved = resolve::resolve_agentmemory()?;
         self.remember_runtime(&resolved);
 
         let export_root = self
@@ -125,6 +136,10 @@ impl AgentMemoryService {
             .and_then(|guard| guard.clone());
 
         let (program, prefix_args, spawn_cwd) = windows_spawn_command(&resolved);
+        #[cfg(windows)]
+        let program = crate::process_util::windows_command_path(Path::new(&program));
+        #[cfg(not(windows))]
+        let program = program.to_string_lossy().into_owned();
         let mut cmd = std::process::Command::new(&program);
         crate::process_util::suppress_command_window(&mut cmd);
         crate::network::apply_proxy_env_to_command(&mut cmd);
@@ -265,6 +280,103 @@ fn cleanup_stale_listener(client: &AgentMemoryClient) {
         return;
     }
     reclaim_listener_port(client);
+}
+
+/// Stop all agentmemory worker processes so a fresh bundled runtime is the sole handler.
+fn reclaim_all_agentmemory_workers() {
+    for pid in agentmemory_worker_pids() {
+        crate::process_util::kill_pid_tree(pid);
+    }
+}
+
+/// Stop foreign agentmemory worker processes (e.g. global npm installs) so the bundled
+/// runtime is the sole handler on the shared iii engine.
+#[allow(dead_code)]
+fn reclaim_foreign_agentmemory_workers(bundle_root: &Path) {
+    let bundle_cli = bundle_root
+        .join("node_modules")
+        .join("@agentmemory")
+        .join("agentmemory")
+        .join("dist")
+        .join("cli.mjs");
+    let bundle_cli = dunce::canonicalize(&bundle_cli).unwrap_or(bundle_cli);
+    let bundle_marker = bundle_cli
+        .to_string_lossy()
+        .replace('\\', "/")
+        .to_ascii_lowercase();
+
+    for pid in agentmemory_worker_pids() {
+        let cmdline = process_command_line(pid).unwrap_or_default();
+        let normalized = cmdline.replace('\\', "/").to_ascii_lowercase();
+        if !normalized.contains("@agentmemory/agentmemory") {
+            continue;
+        }
+        if normalized.contains(&bundle_marker) {
+            continue;
+        }
+        crate::process_util::kill_pid_tree(pid);
+    }
+}
+
+fn agentmemory_worker_pids() -> Vec<u32> {
+    #[cfg(windows)]
+    {
+        let script = r#"$ErrorActionPreference = 'SilentlyContinue'; Get-CimInstance Win32_Process -Filter "Name = 'node.exe'" | Where-Object { $_.CommandLine -match '@agentmemory/agentmemory' } | ForEach-Object { $_.ProcessId }"#;
+        let mut cmd = std::process::Command::new("powershell");
+        cmd.args(["-NoProfile", "-Command", script])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        crate::process_util::suppress_command_window(&mut cmd);
+        let output = match cmd.output() {
+            Ok(value) => value,
+            Err(_) => return Vec::new(),
+        };
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| line.trim().parse::<u32>().ok())
+            .collect()
+    }
+
+    #[cfg(unix)]
+    {
+        let mut cmd = std::process::Command::new("pgrep");
+        cmd.args(["-f", "@agentmemory/agentmemory"]);
+        crate::process_util::suppress_command_window(&mut cmd);
+        let output = match cmd.output() {
+            Ok(value) => value,
+            Err(_) => return Vec::new(),
+        };
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| line.trim().parse::<u32>().ok())
+            .collect()
+    }
+}
+
+fn process_command_line(pid: u32) -> Option<String> {
+    #[cfg(windows)]
+    {
+        let script = format!(
+            r#"$ErrorActionPreference = 'SilentlyContinue'; (Get-CimInstance Win32_Process -Filter "ProcessId = {pid}").CommandLine"#
+        );
+        let mut cmd = std::process::Command::new("powershell");
+        cmd.args(["-NoProfile", "-Command", &script])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        crate::process_util::suppress_command_window(&mut cmd);
+        let output = cmd.output().ok()?;
+        let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if text.is_empty() { None } else { Some(text) }
+    }
+
+    #[cfg(unix)]
+    {
+        let mut cmd = std::process::Command::new("ps");
+        cmd.args(["-p", &pid.to_string(), "-o", "args="]);
+        let output = cmd.output().ok()?;
+        let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if text.is_empty() { None } else { Some(text) }
+    }
 }
 
 /// Stop any agentmemory listener on the REST port so Locus can spawn a managed child with fresh env.
@@ -424,6 +536,10 @@ mod tests {
 
         let (program, prefix_args, spawn_cwd) = windows_spawn_command(&resolved);
 
+        #[cfg(windows)]
+        let program = crate::process_util::windows_command_path(Path::new(&program));
+        #[cfg(not(windows))]
+        let program = program.to_string_lossy().into_owned();
         let mut cmd = std::process::Command::new(&program);
         crate::process_util::suppress_command_window(&mut cmd);
         crate::process_util::set_new_process_group(&mut cmd);

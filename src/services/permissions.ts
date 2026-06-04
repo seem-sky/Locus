@@ -23,6 +23,21 @@ export function saveToolPermissions(value: Record<string, string>): Promise<void
   return ipcInvoke("save_tool_permissions", { value });
 }
 
+export interface WorkflowToolWhitelistPayload {
+  tools: string[];
+  bashCommands: string[];
+}
+
+export function getWorkflowToolWhitelist(): Promise<WorkflowToolWhitelistPayload> {
+  return ipcInvoke<WorkflowToolWhitelistPayload>("get_workflow_tool_whitelist");
+}
+
+export function saveWorkflowToolWhitelist(
+  value: WorkflowToolWhitelistPayload,
+): Promise<void> {
+  return ipcInvoke("save_workflow_tool_whitelist", { value });
+}
+
 export function getCachedDebugMode(): boolean | null {
   return cachedDebugMode;
 }

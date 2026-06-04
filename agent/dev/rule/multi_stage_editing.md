@@ -40,7 +40,7 @@ Dispatch `task(reviewer)` directly from READ or PLAN (before plan confirmation).
 ```json
 {
   "description": "Review code for issues",
-  "prompt": "Review this code:\n\n[file contents and analysis]\n\nReturn PASS, PASS_WITH_RISKS, or BLOCK with actionable fixes.",
+  "prompt": "Review this code:\n\n[file contents and analysis]\n\nRe-read changed files and related call sites. Check quality, security, performance, logic, and runtime edge cases.\n\nIf any target file is `.lua`, walk the table-reuse and object-pool checklists (see reviewer Lua GC rules). For GC/performance audits, attach Play Mode `lua_gc_analyze` or profiler findings when available.\n\nReturn PASS, PASS_WITH_RISKS, or BLOCK with actionable fixes.",
   "subagent_type": "reviewer"
 }
 ```
@@ -81,7 +81,9 @@ Present the plan to the user, then call `ask_user_question` with these options (
 - **取消** — phase resets to READ; re-explore before a new plan
 - **修改** — stay in PLAN; revise the plan from user feedback (with the same per-file detail) and call `ask_user_question` again
 
-**Do not** call `task(implementer)` until the user confirms the plan.
+**Zero-change plan (keep status quo):** When the plan lists **no files to modify** (修改文件: 无 / 零修改 / 保持现状), state that clearly in the plan and in the **确认执行** option `description` (e.g. "确认本轮不修改任何文件"). After the user confirms, the runtime completes the cycle **without** implementer / optimizer / reviewer — summarize for the user and stop. **Do not** dispatch placeholder no-op subagent tasks.
+
+**Do not** call `task(implementer)` until the user confirms a plan that actually requires code changes.
 
 ### Stage 2c: Implement (Subagent Only)
 
@@ -102,7 +104,7 @@ After implementer completes, dispatch optimization — **do not** skip:
 ```json
 {
   "description": "Optimize implementation",
-  "prompt": "Optimize the implementer changes below for efficiency, concision, and runtime depth:\n\n[implementer summary + file list]\n\nRe-read every changed file. Trace normal/edge/error/runtime paths (Unity lifecycle, async, allocations). Apply minimal surgical improvements only. List files changed and runtime notes for the reviewer.",
+  "prompt": "Optimize the implementer changes below for efficiency, concision, and runtime depth:\n\n[implementer summary + file list]\n\nRe-read every changed file. Trace normal/edge/error/runtime paths (Unity lifecycle, async, allocations). Apply minimal surgical improvements only.\n\nFor `.lua` hot paths: reduce allocations only with evidence; table reuse requires full clear (including nested subtables); pools require reset on acquire — do not trade correctness for GC savings.\n\nList files changed and runtime notes for the reviewer (include any profiler / lua_gc_analyze context to pass through).",
   "subagent_type": "optimizer"
 }
 ```
@@ -114,7 +116,7 @@ After optimizer completes, dispatch review — **do not** skip:
 ```json
 {
   "description": "Review code changes",
-  "prompt": "Review these changes:\n\n[optimizer summary + files]\n\nRe-read changed files and related call sites. Check quality, security, performance, logic, and runtime edge cases (null/empty, lifecycle, async). Return PASS, PASS_WITH_RISKS, or BLOCK with actionable fixes.",
+  "prompt": "Review these changes:\n\n[optimizer summary + files]\n\nRe-read changed files and related call sites. Check quality, security, performance, logic, and runtime edge cases (null/empty, lifecycle, async).\n\nIf any changed file is `.lua`, walk the table-reuse and object-pool checklists (reviewer Lua GC rules). Pass along any `lua_gc_analyze` / profiler / hot-path evidence from earlier stages.\n\nReturn PASS, PASS_WITH_RISKS, or BLOCK with actionable fixes.",
   "subagent_type": "reviewer"
 }
 ```

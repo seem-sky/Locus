@@ -267,8 +267,12 @@ pub fn evaluate_memory_proposal_from_session(
         return None;
     }
 
-    let mut raw_candidates = Vec::new();
+    let mut raw_candidates =
+        crate::memory::extract_session_correction_candidates(messages, &pairs);
     for (user, assistant) in &pairs {
+        if crate::memory::is_correction_message(user) {
+            continue;
+        }
         if let Some(mut hits) = evaluate_memory_proposal(user, assistant) {
             raw_candidates.append(&mut hits);
         }
@@ -312,8 +316,22 @@ pub fn extract_memory_candidates(
         ));
     }
 
-    let feedback_markers = FEEDBACK_MARKERS;
-    if feedback_markers.iter().any(|marker| lower_user.contains(marker)) {
+    if crate::memory::is_correction_message(user) {
+        if crate::memory::correction_likely_valid(user, assistant, None, &[]) {
+            let draft = crate::memory::build_correction_draft(user, None, assistant, &[]);
+            candidates.push((
+                MemoryCategory::Feedback,
+                crate::memory::format_correction_memory_content(&draft),
+                vec![
+                    "feedback".to_string(),
+                    "correction".to_string(),
+                    "avoidance".to_string(),
+                    "user-validated".to_string(),
+                ],
+                0.9,
+            ));
+        }
+    } else if FEEDBACK_MARKERS.iter().any(|marker| lower_user.contains(marker)) {
         candidates.push((
             MemoryCategory::Feedback,
             clip_line(user, 240),
@@ -653,7 +671,9 @@ const PREFERENCE_MARKERS: &[&str] = &[
 const FEEDBACK_MARKERS: &[&str] = &[
     "that's wrong",
     "that is wrong",
+    "actually",
     "actually ",
+    "instead",
     "instead ",
     "correction",
     "不对",
@@ -697,7 +717,27 @@ mod tests {
     #[test]
     fn evaluate_accepts_preference_and_feedback() {
         assert!(evaluate_memory_proposal("Please always reply in Chinese", "").is_some());
-        assert!(evaluate_memory_proposal("That's wrong, it should use async/await", "").is_some());
+    }
+
+    #[test]
+    fn evaluate_accepts_weak_feedback_without_validation() {
+        assert!(evaluate_memory_proposal("actually ", "ok").is_some());
+    }
+
+    #[test]
+    fn evaluate_structured_correction_when_user_is_right() {
+        let hits = evaluate_memory_proposal(
+            "不对，local TimerManager 会破坏全局 _G，应该保持全局赋值",
+            "你说得对，我之前理解错了，会改回全局赋值。",
+        )
+        .expect("correction proposal");
+        let feedback = hits
+            .iter()
+            .find(|(cat, _, _, _)| *cat == MemoryCategory::Feedback)
+            .expect("feedback item");
+        assert!(feedback.1.contains("【错误原因】"));
+        assert!(feedback.1.contains("【如何避免】"));
+        assert!(feedback.2.iter().any(|tag| tag == "user-validated"));
     }
 
     #[test]

@@ -2429,8 +2429,17 @@ pub async fn start_unity_monitor(
                             error
                         );
                     }
-                    Some(error) if disconnected_attempts % 10 == 0 => {
+                    Some(error) if disconnected_attempts == 10 => {
                         tracing::debug!(
+                            log_module = "Locus",
+                            "Unity reconnect still failing after {} attempt(s) (pipe: {}): {}",
+                            disconnected_attempts,
+                            pipe_name,
+                            error
+                        );
+                    }
+                    Some(error) if disconnected_attempts > 10 && disconnected_attempts % 60 == 0 => {
+                        tracing::trace!(
                             log_module = "Locus",
                             "Unity reconnect still failing after {} attempt(s) (pipe: {}): {}",
                             disconnected_attempts,

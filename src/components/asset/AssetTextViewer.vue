@@ -2,13 +2,29 @@
 import { computed } from "vue";
 import { t } from "../../i18n";
 import hljs from "../../hljs";
+import CodePreviewSelectionMenu from "../code/CodePreviewSelectionMenu.vue";
+import { useCodePreviewSelectionMenu } from "../../composables/useCodePreviewSelectionMenu";
 
 const props = defineProps<{
   snippet: string;
   truncated: boolean;
   totalLines: number;
   language?: string;
+  filePath?: string;
+  lineOffset?: number;
 }>();
+
+const {
+  menu: selectionMenu,
+  closeMenu: closeSelectionMenu,
+  handleContextMenu,
+  copySelection,
+  sendToComposer,
+} = useCodePreviewSelectionMenu(() => ({
+  filePath: props.filePath,
+  language: props.language,
+  lineOffset: props.lineOffset ?? 1,
+}));
 
 const lines = computed(() => props.snippet.split("\n"));
 const shownLines = computed(() => lines.value.length);
@@ -34,7 +50,7 @@ function escapeHtml(source: string): string {
 </script>
 
 <template>
-  <div class="atv-root">
+  <div class="atv-root code-preview-surface" @contextmenu="handleContextMenu">
     <div class="atv-body">
       <pre class="atv-pre hljs" :class="languageClass"><code><span
         v-for="(line, i) in highlightedLines"
@@ -46,6 +62,13 @@ function escapeHtml(source: string): string {
     <div v-if="truncated" class="atv-footer">
       {{ t("asset.preview.truncated", shownLines) }}
     </div>
+    <CodePreviewSelectionMenu
+      v-if="selectionMenu"
+      :menu="selectionMenu"
+      @close="closeSelectionMenu"
+      @copy="copySelection"
+      @send-to-composer="sendToComposer"
+    />
   </div>
 </template>
 
@@ -65,9 +88,6 @@ function escapeHtml(source: string): string {
 .atv-pre.hljs {
   margin: 0;
   padding: 8px 0;
-  font-family: var(--font-mono-editor);
-  font-size: 12px;
-  line-height: 1.5;
   color: var(--text-color);
   background: var(--panel-bg);
   white-space: pre;

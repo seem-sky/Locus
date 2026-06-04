@@ -62,7 +62,7 @@ function labelForScope(scope: string): string {
     <div class="memory-card-actions">
       <template v-if="proposal.status === 'pending'">
         <BaseButton variant="neutral" @click="emit('ignore', proposal.proposalId)">{{ t("memory.proposal.ignore") }}</BaseButton>
-        <BaseButton variant="primary" @click="emit('apply', proposal.proposalId)">{{ t("memory.proposal.apply") }}</BaseButton>
+        <BaseButton variant="primary" :disabled="proposal.status !== 'pending'" @click="emit('apply', proposal.proposalId)">{{ t("memory.proposal.apply") }}</BaseButton>
       </template>
       <template v-else-if="proposal.status === 'applying'">
         <span class="memory-card-status">{{ t("memory.proposal.applying") }}</span>

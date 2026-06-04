@@ -1001,16 +1001,23 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
     }
   }
 
+  const applyingMemoryProposalKeys = new Set<string>();
+
   async function applyMemoryProposal(proposalId: string) {
     const state = activeState.value;
     if (!state.sessionId) return;
+    const inflightKey = `${state.sessionId}:${proposalId}`;
+    if (applyingMemoryProposalKeys.has(inflightKey)) return;
+    applyingMemoryProposalKeys.add(inflightKey);
     updateProposalStatus(state, "applying", proposalId, "memory");
     try {
       await sessionService.applyMemoryProposal(state.sessionId, proposalId);
       updateProposalStatus(state, "applied", proposalId, "memory");
     } catch (error) {
       state.error = normalizeAppError(error).message;
-      updateProposalStatus(state, "pending", proposalId, "memory");
+      await reloadSessionMessagesAfterError(state, state.sessionId);
+    } finally {
+      applyingMemoryProposalKeys.delete(inflightKey);
     }
   }
 

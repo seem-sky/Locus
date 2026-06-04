@@ -2644,9 +2644,10 @@ function copyBranchName() {
   border: none;
   background: var(--bg-color);
   color: var(--text-color);
-  font-size: 12px;
   font-family: var(--font-mono-editor);
-  line-height: 1.5;
+  font-size: var(--code-preview-font-size);
+  line-height: var(--code-preview-line-height);
+  letter-spacing: var(--code-preview-letter-spacing);
   resize: vertical;
   outline: none;
   box-sizing: border-box;

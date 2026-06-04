@@ -92,18 +92,25 @@ async function onTreeSelect(targetId: string) {
       <button class="aph-close" :title="t('asset.preview.close')" @click="emit('close')">×</button>
     </div>
 
-    <div class="aph-body">
+    <div class="aph-body code-preview-surface">
       <div v-if="loading && !payload" class="aph-state">{{ t("asset.preview.loading") }}</div>
       <div v-else-if="error && !payload" class="aph-state aph-error">{{ error }}</div>
 
       <template v-else-if="payload">
         <!-- text -->
+        <div
+          v-if="payload.kind === 'text' && !payload.snippet.trim()"
+          class="aph-state"
+        >
+          {{ t("asset.preview.emptyFile") }}
+        </div>
         <AssetTextViewer
-          v-if="payload.kind === 'text'"
+          v-else-if="payload.kind === 'text'"
           :snippet="payload.snippet"
           :truncated="payload.truncated"
           :total-lines="payload.totalLines"
           :language="payload.language"
+          :file-path="selectedPath"
         />
 
         <!-- binaryPreview: image / psd / model -->
@@ -118,10 +125,10 @@ async function onTreeSelect(targetId: string) {
         </div>
 
         <!-- binaryInfo -->
-        <AssetBinaryInfoCard
-          v-else-if="payload.kind === 'binaryInfo'"
-          :meta="payload.meta"
-        />
+        <div v-else-if="payload.kind === 'binaryInfo'" class="aph-binary-info-wrap">
+          <p class="aph-binary-info-hint">{{ t("asset.preview.binaryInfo.hint") }}</p>
+          <AssetBinaryInfoCard :meta="payload.meta" />
+        </div>
 
         <!-- structured: scene/prefab or YAML asset -->
         <div v-else-if="payload.kind === 'structured'" class="aph-structured">
@@ -247,6 +254,25 @@ async function onTreeSelect(targetId: string) {
   display: flex;
   min-height: 0;
   overflow: hidden;
+}
+.aph-binary-info-wrap {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: auto;
+}
+.aph-binary-info-hint {
+  flex-shrink: 0;
+  margin: 0;
+  padding: 10px 14px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  border-bottom: 1px solid var(--border-color);
+}
+.aph-binary-info-wrap :deep(.abic-root) {
+  flex: 1;
+  padding-top: 16px;
 }
 .aph-structured {
   flex: 1;

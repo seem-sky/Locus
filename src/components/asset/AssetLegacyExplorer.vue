@@ -138,6 +138,12 @@ function fileIconClass(node: AssetExplorerNode) {
     ? unityFolderIconClass(false)
     : unityAssetIconClassForPath(node.path, { isFolder: false });
 }
+
+function rowTitle(entry: Extract<VisibleEntry, { kind: "row" }>): string | undefined {
+  if (entry.isFolder) return undefined;
+  if (props.assetRefDraggable) return t("asset.legacyExplorer.dblClickToPreview");
+  return entry.node.name;
+}
 </script>
 
 <template>
@@ -161,6 +167,8 @@ function fileIconClass(node: AssetExplorerNode) {
             :draggable="false"
             role="button"
             tabindex="0"
+            :title="rowTitle(entry)"
+            :aria-keyshortcuts="!entry.isFolder && assetRefDraggable ? 'DoubleClick' : undefined"
             :data-asset-ref-path="assetRefDraggable ? entry.node.path : undefined"
             @click="rowClick(entry)"
             @dblclick.stop="rowDblClick(entry)"

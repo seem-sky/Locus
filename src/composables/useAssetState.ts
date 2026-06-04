@@ -15,6 +15,7 @@ import { useWorkspaceBrowseFilters } from "./useWorkspaceBrowseFilters";
 import { normalizeAppError } from "../services/errors";
 import { getWarmup } from "./warmupCache";
 import { acquireSelectionLock } from "./useSelectionLock";
+import { defaultStructuredTargetId } from "./assetPreviewTarget";
 import type {
   AssetDbOverview,
   AssetSearchResult,
@@ -163,18 +164,6 @@ export function useAssetState(props: AssetProps) {
     };
   }
 
-  function isPrefabPath(path: string): boolean {
-    return path.toLowerCase().endsWith(".prefab");
-  }
-
-  function defaultPrefabRootTargetId(payload: AssetPreviewPayload, assetPath: string): string | null {
-    if (!isPrefabPath(assetPath) || payload.kind !== "structured") return null;
-    const knownIds = new Set(payload.tree.map((node) => node.id));
-    const root = payload.tree.find((node) =>
-      node.hasInspector && (!node.parentId || !knownIds.has(node.parentId)),
-    );
-    return root?.id ?? null;
-  }
 
   // db overview
   const dbOverview = ref<AssetDbOverview | null>(null);
@@ -707,7 +696,7 @@ export function useAssetState(props: AssetProps) {
       previewNode.value = nextNode;
       activeTargetId.value = null;
       targetCache.value = new Map();
-      const defaultTargetId = defaultPrefabRootTargetId(payload, nextNode.path);
+      const defaultTargetId = defaultStructuredTargetId(payload);
       if (payload.kind === "structured" && defaultTargetId) {
         await loadTarget(payload.previewKey, defaultTargetId);
       }

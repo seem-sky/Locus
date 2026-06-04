@@ -9,9 +9,15 @@
  */
 //! Dev agent code-edit workflow gate: Read → Plan → Implement (subagent) → Optimize (subagent) → Review (subagent).
 
+pub mod whitelist;
+
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+
+pub use whitelist::{
+    WorkflowAmbiguousWhitelist, WORKFLOW_TOOL_WHITELIST_FILENAME,
+};
 
 const AGENT_DEV_ID: &str = "dev";
 
@@ -105,6 +111,8 @@ pub struct WorkflowGate {
     codegraph_satisfied: bool,
     /// User confirmed the written modification plan (`ask_user_question` → 确认执行).
     plan_confirmed: bool,
+    /// Confirmed plan has no file changes — skip implementer/optimizer/reviewer.
+    plan_zero_change: bool,
     strict: bool,
     review_cycle: u32,
     /// Consecutive text-only stops nudged in the current workflow phase.
@@ -124,6 +132,7 @@ impl WorkflowGate {
             exploration_satisfied: false,
             codegraph_satisfied: false,
             plan_confirmed: false,
+            plan_zero_change: false,
             strict: dev_workflow_strict_enabled(),
             review_cycle: 0,
             workflow_text_stop_nudges: 0,
@@ -136,6 +145,7 @@ impl WorkflowGate {
             exploration_satisfied: false,
             codegraph_satisfied: false,
             plan_confirmed: false,
+            plan_zero_change: false,
             strict,
             review_cycle: 0,
             workflow_text_stop_nudges: 0,
@@ -199,6 +209,7 @@ impl WorkflowGate {
         self.exploration_satisfied = false;
         self.codegraph_satisfied = false;
         self.plan_confirmed = false;
+        self.plan_zero_change = false;
         self.workflow_text_stop_nudges = 0;
     }
 
@@ -206,6 +217,7 @@ impl WorkflowGate {
         if self.phase == CodeEditPhase::Read && self.read_satisfied() {
             self.phase = CodeEditPhase::Plan;
             self.plan_confirmed = false;
+            self.plan_zero_change = false;
             self.workflow_text_stop_nudges = 0;
         }
     }
@@ -224,6 +236,7 @@ impl WorkflowGate {
                  Natural-language \"please confirm\" does NOT show UI — you MUST call ask_user_question with options \
                  确认执行 / 取消 / 修改 so the user can confirm the plan before task(implementer).",
             ),
+            CodeEditPhase::Plan if self.plan_confirmed && self.plan_zero_change => None,
             CodeEditPhase::Plan if self.plan_confirmed => Some(
                 "Do not end the turn yet. The plan is confirmed — dispatch task(subagent_type=\"implementer\") now. \
                  Do not reply with text only.",
@@ -357,7 +370,7 @@ impl WorkflowGate {
             if let Some(answer) = output.and_then(extract_ask_user_answer) {
                 self.reset_workflow_text_stop_nudges();
                 if self.phase == CodeEditPhase::Plan {
-                    return self.handle_plan_confirmation_answer(&answer);
+                    return self.handle_plan_confirmation_answer(&answer, &effective_args);
                 }
                 if self.phase == CodeEditPhase::Read {
                     if !self.read_satisfied() {
@@ -373,7 +386,7 @@ impl WorkflowGate {
                         ));
                     }
                     self.maybe_advance_read_to_plan();
-                    return self.handle_plan_confirmation_answer(&answer);
+                    return self.handle_plan_confirmation_answer(&answer, &effective_args);
                 }
             }
         }
@@ -407,10 +420,15 @@ impl WorkflowGate {
         None
     }
 
-    fn handle_plan_confirmation_answer(&mut self, answer: &str) -> Option<String> {
+    fn handle_plan_confirmation_answer(&mut self, answer: &str, args: &Value) -> Option<String> {
         match parse_plan_confirmation_choice(answer) {
             PlanConfirmationChoice::Confirm => {
                 self.plan_confirmed = true;
+                if is_zero_change_plan_confirmation(answer, args) {
+                    self.plan_zero_change = true;
+                    self.phase = CodeEditPhase::Complete;
+                    return Some(plan_zero_change_complete_hint());
+                }
                 Some(plan_confirmed_hint(self.review_cycle, self.codegraph_satisfied))
             }
             PlanConfirmationChoice::Cancel => {
@@ -591,6 +609,13 @@ impl WorkflowGate {
                              Then call ask_user_question with options {PLAN_ASK_USER_OPTIONS} and wait for the user.",
                         )));
                     }
+                    if self.plan_zero_change {
+                        return Some(self.block_message(
+                            "Cannot dispatch implementer: the confirmed plan is zero-change (no files to modify). \
+                             The workflow cycle is complete — summarize the decision for the user. \
+                             Do NOT dispatch implementer, optimizer, or reviewer placeholder tasks.",
+                        ));
+                    }
                     if let Some(prompt) = args.get("prompt").and_then(|v| v.as_str()) {
                         if is_complex_code_edit_prompt(prompt) && !self.codegraph_satisfied {
                             return Some(self.block_message(
@@ -666,6 +691,12 @@ impl WorkflowGate {
             }
             CodeEditPhase::Complete => {
                 if subagent == "implementer" {
+                    if self.plan_zero_change {
+                        return Some(self.block_message(
+                            "Cannot dispatch implementer: the confirmed plan was zero-change. \
+                             The workflow cycle is complete — summarize for the user.",
+                        ));
+                    }
                     if !self.read_satisfied() {
                         return Some(self.block_message(&format!(
                             "Previous review cycle completed with PASS. Start a new cycle: {READ_GATE_REQUIREMENT} Then PLAN → task(implementer) → task(optimizer) → task(reviewer).",
@@ -740,6 +771,9 @@ impl WorkflowGate {
             (CodeEditPhase::Plan, _, false) => {
                 "Next: write the modification plan and call ask_user_question (确认执行 / 取消 / 修改), or dispatch task(subagent_type=reviewer) for read-only review without edits. After plan confirmation, use task(implementer) → task(optimizer) → task(reviewer)."
             }
+            (CodeEditPhase::Plan, _, true) if self.plan_zero_change => {
+                "Next: zero-change plan confirmed — workflow complete. Summarize for the user; do NOT dispatch implementer/optimizer/reviewer."
+            }
             (CodeEditPhase::Plan, _, true) if !self.codegraph_satisfied => {
                 "Next: run CodeGraph (codegraph_context preferred) to satisfy codegraph_gate, then task(subagent_type=implementer). CodeGraph can be run in PLAN phase. Do NOT use edit/write on dev."
             }
@@ -781,6 +815,7 @@ pub fn workflow_applies(agent_id: &str, mode: &str) -> bool {
 pub fn parse_review_verdict(output: &str) -> ReviewVerdict {
     let normalized: String = output
         .chars()
+        .filter(|c| !matches!(*c, '*' | '#' | '`' | '|' | '[' | ']' | '"' | '\''))
         .map(|c| {
             if c.is_whitespace() || c == '-' || c == '_' {
                 ' '
@@ -1023,6 +1058,82 @@ fn parse_plan_confirmation_choice(answer: &str) -> PlanConfirmationChoice {
     PlanConfirmationChoice::Modify
 }
 
+/// Detects a confirmed plan that intentionally changes no files (keep status quo).
+fn is_zero_change_plan_confirmation(answer: &str, args: &Value) -> bool {
+    if looks_like_zero_change_text(answer) {
+        return true;
+    }
+    let Some(selected_label) = extract_ask_user_selected_label(answer) else {
+        return false;
+    };
+    let Some(options) = args.get("options").and_then(|v| v.as_array()) else {
+        return false;
+    };
+    for opt in options {
+        let label = opt.get("label").and_then(|v| v.as_str()).unwrap_or("");
+        if !labels_match_for_ask_user(label, &selected_label) {
+            continue;
+        }
+        let description = opt
+            .get("description")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if looks_like_zero_change_text(description) {
+            return true;
+        }
+    }
+    false
+}
+
+fn extract_ask_user_selected_label(answer: &str) -> Option<String> {
+    let rest = answer.strip_prefix("User answered: ").unwrap_or(answer).trim();
+    if rest.is_empty() {
+        return None;
+    }
+    let label = rest
+        .split(['—', '–', '-', ':', '：'])
+        .next()
+        .unwrap_or(rest)
+        .trim();
+    if label.is_empty() {
+        None
+    } else {
+        Some(label.to_string())
+    }
+}
+
+fn labels_match_for_ask_user(option_label: &str, selected_label: &str) -> bool {
+    let a = option_label.trim();
+    let b = selected_label.trim();
+    a == b || a.contains(b) || b.contains(a)
+}
+
+fn looks_like_zero_change_text(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    text.contains("零修改")
+        || text.contains("无修改")
+        || text.contains("不修改")
+        || text.contains("保持现状")
+        || text.contains("不触碰")
+        || text.contains("无实际修改")
+        || text.contains("无任何代码修改")
+        || text.contains("无代码修改")
+        || text.contains("不修改任何")
+        || text.contains("修改文件") && (text.contains(":无") || text.contains("：无"))
+        || text.contains("无文件") && text.contains("修改")
+        || lower.contains("no code change")
+        || lower.contains("no file change")
+        || lower.contains("zero modification")
+        || lower.contains("keep as-is")
+        || lower.contains("keep status quo")
+}
+
+fn plan_zero_change_complete_hint() -> String {
+    "[Dev workflow] User confirmed a zero-change plan (keep status quo). \
+     This cycle is complete — do NOT dispatch task(implementer), task(optimizer), or task(reviewer). \
+     Summarize the confirmed decision for the user and end the turn.".to_string()
+}
+
 fn implementer_complete_hint(review_cycle: u32) -> String {
     if review_cycle > 0 {
         format!(
@@ -1099,7 +1210,7 @@ pub fn resolve_effective_tool_name(tool_name: &str, args: &Value) -> String {
         .unwrap_or_else(|| tool_name.to_string())
 }
 
-fn effective_tool_args(tool_name: &str, args: &Value) -> Value {
+pub(crate) fn effective_tool_args(tool_name: &str, args: &Value) -> Value {
     if tool_name == "tool_call" {
         args.get("arguments")
             .cloned()
@@ -1266,16 +1377,25 @@ pub fn classify_tool_workflow_kind(tool_name: &str, args: &Value) -> ToolWorkflo
     ToolWorkflowKind::Ambiguous
 }
 
+/// Normalize a bash command for session whitelist matching (whitespace-collapsed, trimmed).
+pub fn normalize_bash_whitelist_key(command: &str) -> String {
+    command.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// READ/PLAN: ambiguous tools (cannot classify as read vs edit) require user approval before run.
 pub fn workflow_ambiguous_tool_requires_user_confirm(
     gate: &WorkflowGate,
     tool_name: &str,
     args: &Value,
+    persisted_whitelist: &WorkflowAmbiguousWhitelist,
 ) -> bool {
     if !gate.strict {
         return false;
     }
     if !matches!(gate.phase, CodeEditPhase::Read | CodeEditPhase::Plan) {
+        return false;
+    }
+    if persisted_whitelist.is_whitelisted(tool_name, args) {
         return false;
     }
     classify_tool_workflow_kind(tool_name, args) == ToolWorkflowKind::Ambiguous
@@ -1685,7 +1805,11 @@ pub fn advance_to_implement_if_allowed(gate: &mut WorkflowGate, args: &Value) ->
         .get("subagent_type")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    if sub != "implementer" || !gate.read_satisfied() || !gate.plan_confirmed {
+    if sub != "implementer"
+        || !gate.read_satisfied()
+        || !gate.plan_confirmed
+        || gate.plan_zero_change
+    {
         return false;
     }
     if gate.phase == CodeEditPhase::Plan {
@@ -1939,11 +2063,56 @@ mod tests {
         let mut gate = WorkflowGate::with_strict(true);
         let args = serde_json::json!({"command": "some_custom_script.sh --dry-run"});
         assert!(gate.check_tool("bash", &args).is_none());
-        assert!(workflow_ambiguous_tool_requires_user_confirm(&gate, "bash", &args));
+        let whitelist = WorkflowAmbiguousWhitelist::default();
+        assert!(workflow_ambiguous_tool_requires_user_confirm(
+            &gate, "bash", &args, &whitelist
+        ));
         assert_eq!(
             classify_tool_workflow_kind("bash", &args),
             ToolWorkflowKind::Ambiguous
         );
+    }
+
+    #[test]
+    fn ambiguous_tool_whitelist_skips_confirm_for_same_bash_command() {
+        let gate = WorkflowGate::with_strict(true);
+        let args = serde_json::json!({"command": "  some_custom_script.sh   --dry-run  "});
+        let mut whitelist = WorkflowAmbiguousWhitelist::default();
+        assert!(workflow_ambiguous_tool_requires_user_confirm(
+            &gate, "bash", &args, &whitelist
+        ));
+        whitelist.add("bash", &args);
+        assert!(!workflow_ambiguous_tool_requires_user_confirm(
+            &gate, "bash", &args, &whitelist
+        ));
+        assert!(whitelist.is_whitelisted(
+            "bash",
+            &serde_json::json!({"command": "some_custom_script.sh --dry-run"})
+        ));
+        assert!(!whitelist.is_whitelisted(
+            "bash",
+            &serde_json::json!({"command": "other_script.sh"})
+        ));
+    }
+
+    #[test]
+    fn ambiguous_tool_whitelist_skips_confirm_for_non_bash_tool() {
+        let gate = WorkflowGate::with_strict(true);
+        let args = serde_json::json!({"foo": "bar"});
+        let mut whitelist = WorkflowAmbiguousWhitelist::default();
+        assert!(workflow_ambiguous_tool_requires_user_confirm(
+            &gate,
+            "lazy_unknown_tool",
+            &args,
+            &whitelist,
+        ));
+        whitelist.add("lazy_unknown_tool", &args);
+        assert!(!workflow_ambiguous_tool_requires_user_confirm(
+            &gate,
+            "lazy_unknown_tool",
+            &args,
+            &whitelist,
+        ));
     }
 
     #[test]
@@ -2457,6 +2626,14 @@ mod tests {
             ReviewVerdict::Block
         );
         assert_eq!(parse_review_verdict("looks fine"), ReviewVerdict::Unknown);
+        assert_eq!(
+            parse_review_verdict("结论末尾明确 \"**PASS**\""),
+            ReviewVerdict::Pass
+        );
+        assert_eq!(
+            parse_review_verdict("VERDICT: PASS\nAll fixes verified."),
+            ReviewVerdict::Pass
+        );
     }
 
     #[test]
@@ -2696,5 +2873,75 @@ mod tests {
         }
         assert!(gate.take_incomplete_text_stop_nudge().is_none());
         assert!(!gate.needs_incomplete_workflow_continuation());
+    }
+
+    #[test]
+    fn zero_change_plan_confirm_completes_without_implementer_nudge() {
+        let mut gate = WorkflowGate::with_strict(true);
+        enter_plan_phase(&mut gate);
+        let args = serde_json::json!({
+            "question": "请确认保持现状",
+            "options": [
+                {
+                    "label": "确认执行",
+                    "description": "确认本轮不修改任何文件,工作区保持当前状态"
+                },
+                { "label": "取消", "description": "取消" },
+                { "label": "修改", "description": "修改计划" }
+            ]
+        });
+        let hint = gate
+            .on_tool_success(
+                "ask_user_question",
+                &args,
+                Some("User answered: 确认执行"),
+            )
+            .unwrap();
+        assert!(gate.plan_confirmed);
+        assert!(gate.plan_zero_change);
+        assert_eq!(gate.phase, CodeEditPhase::Complete);
+        assert!(hint.contains("zero-change"));
+        assert!(hint.contains("do NOT dispatch"));
+        assert!(!gate.needs_incomplete_workflow_continuation());
+        let task_args = serde_json::json!({
+            "subagent_type": "implementer",
+            "prompt": "noop",
+            "description": "noop"
+        });
+        let err = gate.check_tool("task", &task_args).unwrap();
+        assert!(err.contains("zero-change"));
+    }
+
+    #[test]
+    fn zero_change_detected_from_answer_text() {
+        assert!(looks_like_zero_change_text("确认零修改,保持现状"));
+        assert!(is_zero_change_plan_confirmation(
+            "User answered: 确认执行 — 零修改",
+            &serde_json::json!({})
+        ));
+    }
+
+    #[test]
+    fn normal_plan_confirm_still_requires_implementer() {
+        let mut gate = WorkflowGate::with_strict(true);
+        enter_plan_phase(&mut gate);
+        satisfy_full_read_gates(&mut gate);
+        let hint = gate
+            .on_tool_success(
+                "ask_user_question",
+                &serde_json::json!({
+                    "question": "confirm plan",
+                    "options": [
+                        { "label": "确认执行", "description": "按计划修改 Coroutine.lua" }
+                    ]
+                }),
+                Some("User answered: 确认执行"),
+            )
+            .unwrap();
+        assert!(gate.plan_confirmed);
+        assert!(!gate.plan_zero_change);
+        assert_eq!(gate.phase, CodeEditPhase::Plan);
+        assert!(hint.contains("implementer"));
+        assert!(gate.needs_incomplete_workflow_continuation());
     }
 }

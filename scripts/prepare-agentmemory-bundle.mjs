@@ -50,6 +50,357 @@ function cliEntryPath() {
   return path.join(bundleDir, "node_modules", "@agentmemory", "agentmemory", "dist", "cli.mjs");
 }
 
+function agentmemoryIndexPath() {
+  return path.join(bundleDir, "node_modules", "@agentmemory", "agentmemory", "dist", "index.mjs");
+}
+
+function agentmemoryIndexCandidates() {
+  const candidates = [agentmemoryIndexPath()];
+  const extraRoots = [
+    process.env.LOCUS_AGENTMEMORY_PATCH_ROOT?.trim(),
+    path.join(process.env.APPDATA || "", "npm", "node_modules", "@agentmemory", "agentmemory"),
+    path.join(process.env.LOCALAPPDATA || "", "npm", "node_modules", "@agentmemory", "agentmemory"),
+    path.join(process.env.HOME || process.env.USERPROFILE || "", ".agentmemory", "node_modules", "@agentmemory", "agentmemory"),
+  ].filter(Boolean);
+  for (const root of extraRoots) {
+    candidates.push(path.join(root, "dist", "index.mjs"));
+  }
+  return [...new Set(candidates.map((candidate) => path.resolve(candidate)))];
+}
+
+function isReplayPatchApplied(source) {
+  return source.includes("toolName: isConversation ? void 0 : obs.title || void 0");
+}
+
+function isReplayHydrateApplied(source) {
+  return source.includes("/* locus-replay-v3-hydrate */");
+}
+
+function isPreToolObserveApplied(source) {
+  return source.includes('payload.hookType === "pre_tool_use"');
+}
+
+function patchAgentmemoryIndexFile(indexPath) {
+  if (!existsSync(indexPath)) {
+    return false;
+  }
+  const marker = "/* locus-replay-v2 */";
+  let source = readFileSync(indexPath, "utf8");
+  const original = source;
+  // Repair earlier patch runs that left `/* locus-replay-v2 */-raw` before the function.
+  source = source.replace(/\/\* locus-replay-v2 \*\/-raw\s*\n(?=function rawFromCompressed)/, "");
+  source = source.replace(/\/\* locus-replay-v2 \*\/-body\s*\n(?=function bodyFor)/, "");
+
+  if (isReplayPatchApplied(source) && isReplayHydrateApplied(source) && isPreToolObserveApplied(source) && source.includes("locus-observations-hydrate") && source === original) {
+    return false;
+  }
+
+  const observeNeedle = `\t\t\tif (payload.hookType === "prompt_submit") raw.userPrompt = d["prompt"];`;
+  const observeReplacement = `\t\t\tif (payload.hookType === "pre_tool_use") {
+\t\t\t\traw.toolName = d["tool_name"];
+\t\t\t\traw.toolInput = d["tool_input"];
+\t\t\t}
+\t\t\tif (payload.hookType === "prompt_submit") raw.userPrompt = d["prompt"];`;
+  if (!isPreToolObserveApplied(source) && source.includes(observeNeedle)) {
+    source = source.replace(observeNeedle, observeReplacement);
+  }
+
+  const bodyForReplacement = `${marker}
+function bodyFor(obs, kind) {
+\tif (kind === "prompt") return obs.userPrompt ?? obs.raw?.narrative;
+\tif (kind === "response") return obs.assistantResponse;
+\tif (kind === "tool_result" || kind === "tool_error") {
+\t\tif (typeof obs.toolOutput === "string" && obs.toolOutput.trim()) return obs.toolOutput;
+\t\tconst facts = obs.raw?.facts;
+\t\tif (Array.isArray(facts) && facts.length) return facts.filter(Boolean).join("\\n• ");
+\t\treturn obs.raw?.narrative;
+\t}
+\tif (kind === "tool_call") {
+\t\tif (typeof obs.toolInput === "string" && obs.toolInput.trim()) return obs.toolInput;
+\t\tif (obs.toolInput !== void 0) try {
+\t\t\treturn JSON.stringify(obs.toolInput, null, 2);
+\t\t} catch {
+\t\t\treturn void 0;
+\t\t}
+\t\tconst nested = obs.raw?.tool_input ?? obs.raw?.toolInput;
+\t\tif (nested !== void 0) try {
+\t\t\treturn typeof nested === "string" ? nested : JSON.stringify(nested, null, 2);
+\t\t} catch {
+\t\t\treturn void 0;
+\t\t}
+\t}
+}`;
+
+  if (!isReplayPatchApplied(source) && source.includes("function bodyFor(obs, kind)")) {
+    source = source.replace(/^function bodyFor\(obs, kind\) \{[\s\S]*?\n\}/m, bodyForReplacement);
+  }
+
+  const rawFromCompressedReplacement = `${marker}
+function rawFromCompressed(obs) {
+\tconst isConversation = obs.type === "conversation";
+\tconst hookType = isConversation ? "prompt_submit" : obs.type === "error" ? "post_tool_failure" : "post_tool_use";
+\tconst factsText = Array.isArray(obs.facts) ? obs.facts.filter(Boolean).join("\\n• ") : "";
+\tconst narrative = String(obs.narrative || factsText || "").trim();
+\tconst subtitle = String(obs.subtitle || "").trim();
+\treturn {
+\t\tid: obs.id,
+\t\tsessionId: obs.sessionId,
+\t\ttimestamp: obs.timestamp,
+\t\thookType,
+\t\ttoolName: isConversation ? void 0 : obs.title || void 0,
+\t\ttoolInput: isConversation ? void 0 : subtitle || void 0,
+\t\ttoolOutput: isConversation ? void 0 : narrative || subtitle || void 0,
+\t\tuserPrompt: isConversation ? narrative : void 0,
+\t\tassistantResponse: void 0,
+\t\traw: {
+\t\t\ttitle: obs.title,
+\t\t\tnarrative: obs.narrative,
+\t\t\tfacts: obs.facts,
+\t\t\ttype: obs.type
+\t\t}
+\t};
+}`;
+
+  if (!isReplayPatchApplied(source) && source.includes("function rawFromCompressed(obs)")) {
+    source = source.replace(/^function rawFromCompressed\(obs\) \{[\s\S]*?\n\}/m, rawFromCompressedReplacement);
+  }
+
+  const compressFailNeedle = `\t\t\t\treturn {
+\t\t\t\t\tsuccess: false,
+\t\t\t\t\terror: "parse_failed"
+\t\t\t\t};`;
+  const compressFailReplacement = `${marker}-compress
+\t\t\t\tconst synthetic = buildSyntheticCompression(data.raw);
+\t\t\t\tawait kv.set(KV.observations(data.sessionId), data.observationId, synthetic);
+\t\t\t\tgetSearchIndex().add(synthetic);
+\t\t\t\treturn {
+\t\t\t\t\tsuccess: true,
+\t\t\t\t\tcompressed: synthetic,
+\t\t\t\t\tqualityScore: 0,
+\t\t\t\t\tfallback: "synthetic"
+\t\t\t\t};`;
+  if (!source.includes(`${marker}-compress`) && source.includes(compressFailNeedle)) {
+    source = source.replace(compressFailNeedle, compressFailReplacement);
+  }
+
+  const hydrateMarker = "/* locus-replay-v3-hydrate */";
+  const hydrateReplacement = `${hydrateMarker}
+function hydrateObservationFields(obs) {
+\tconst payload = obs?.raw;
+\tif (!payload || typeof payload !== "object" || Array.isArray(payload)) return obs;
+\tif (!obs.toolName && typeof payload.tool_name === "string") obs.toolName = payload.tool_name;
+\tif (obs.toolInput === void 0 && payload.tool_input !== void 0) obs.toolInput = payload.tool_input;
+\tif (obs.toolOutput === void 0 && (payload.tool_output !== void 0 || payload.error !== void 0)) obs.toolOutput = payload.tool_output ?? payload.error;
+\tif (!obs.userPrompt && typeof payload.prompt === "string") obs.userPrompt = payload.prompt;
+\treturn obs;
+}`;
+  const inlineHydrateBlock = `${hydrateMarker}
+function hydrateObservationFields(obs) {
+\tconst payload = obs?.raw;
+\tif (!payload || typeof payload !== "object" || Array.isArray(payload)) return obs;
+\tif (!obs.toolName && typeof payload.tool_name === "string") obs.toolName = payload.tool_name;
+\tif (obs.toolInput === void 0 && payload.tool_input !== void 0) obs.toolInput = payload.tool_input;
+\tif (obs.toolOutput === void 0 && (payload.tool_output !== void 0 || payload.error !== void 0)) obs.toolOutput = payload.tool_output ?? payload.error;
+\tif (!obs.userPrompt && typeof payload.prompt === "string") obs.userPrompt = payload.prompt;
+\treturn obs;
+}
+\tfor (const obs of sorted) {
+\t\thydrateObservationFields(obs);
+\t\tconst kind = kindFromHook(obs);`;
+  const projectTimelineNeedle = `\tfor (const obs of sorted) {
+\t\tconst kind = kindFromHook(obs);`;
+  const projectTimelineReplacement = `\tfor (const obs of sorted) {
+\t\thydrateObservationFields(obs);
+\t\tconst kind = kindFromHook(obs);`;
+  if (source.includes(inlineHydrateBlock)) {
+    source = source.replace(inlineHydrateBlock, projectTimelineReplacement);
+  }
+  if (!isReplayHydrateApplied(source) && source.includes("function projectTimeline(observations) {")) {
+    source = source.replace(
+      "function projectTimeline(observations) {",
+      `${hydrateReplacement}
+function projectTimeline(observations) {`,
+    );
+  }
+  if (!source.includes("\t\thydrateObservationFields(obs);") && source.includes(projectTimelineNeedle)) {
+    source = source.replace(projectTimelineNeedle, projectTimelineReplacement);
+  }
+
+  const obsApiNeedle = `\t\tconst observations = await kv.list(KV.observations(sessionId));
+\t\tconst normalizedAgentId`;
+  const obsApiReplacement = `\t\tconst observations = (await kv.list(KV.observations(sessionId))).map((o) => hydrateObservationFields({ ...o }));
+\t\tconst normalizedAgentId`;
+  if (!source.includes("locus-observations-hydrate") && source.includes(obsApiNeedle)) {
+    source = source.replace(obsApiNeedle, obsApiReplacement.replace("hydrateObservationFields({ ...o })", "/* locus-observations-hydrate */ hydrateObservationFields({ ...o })"));
+  }
+
+  if (source === original) {
+    return false;
+  }
+  writeFileSync(indexPath, source);
+  return true;
+}
+
+function patchAgentmemoryReplay() {
+  let patched = 0;
+  for (const indexPath of agentmemoryIndexCandidates()) {
+    if (patchAgentmemoryIndexFile(indexPath)) {
+      patched += 1;
+      console.log(`[locus] Patched agentmemory replay mapping (v3): ${path.relative(repoRoot, indexPath)}`);
+    }
+  }
+  if (patched === 0 && existsSync(agentmemoryIndexPath())) {
+    console.log("[locus] agentmemory replay mapping (v2) already present");
+  }
+}
+
+function agentmemoryViewerCandidates() {
+  return agentmemoryIndexCandidates()
+    .map((indexPath) => path.join(path.dirname(indexPath), "viewer", "index.html"))
+    .filter((viewerPath) => existsSync(viewerPath));
+}
+
+function patchAgentmemoryViewerFile(viewerPath) {
+  let source = readFileSync(viewerPath, "utf8");
+  const original = source;
+  if (source.includes("/* locus-viewer-timeline-v1 */")) {
+    return false;
+  }
+
+  const toolMapNeedle =
+    "var TOOL_TYPE_MAP = { Read: 'file_read', Write: 'file_write', Edit: 'file_edit', Bash: 'command_run', Grep: 'search', Glob: 'search', WebFetch: 'web_fetch', WebSearch: 'web_fetch', AskUserQuestion: 'conversation', Task: 'subagent' };";
+  const toolMapReplacement =
+    "var TOOL_TYPE_MAP = { Read: 'file_read', Write: 'file_write', Edit: 'file_edit', Bash: 'command_run', Grep: 'search', Glob: 'search', WebFetch: 'web_fetch', WebSearch: 'web_fetch', AskUserQuestion: 'conversation', Task: 'subagent', read: 'file_read', write: 'file_write', edit: 'file_edit', bash: 'command_run', grep: 'search', glob: 'search', list: 'search', task: 'subagent', ask_user_question: 'conversation', codegraph_search: 'search', unity_yaml_read: 'file_read', unity_yaml_search: 'search', memory_recall: 'search', memory_save: 'conversation' };";
+  if (source.includes(toolMapNeedle)) {
+    source = source.replace(toolMapNeedle, toolMapReplacement);
+  }
+
+  const renderNeedle = "    function renderObservations() {";
+  const renderReplacement = `    /* locus-viewer-timeline-v1 */
+    function locusResolveToolName(o) {
+      if (!o) return '';
+      if (o.toolName) return o.toolName;
+      if (o.raw && typeof o.raw === 'object') return o.raw.tool_name || o.raw.toolName || '';
+      return '';
+    }
+    function locusObsTitle(o) {
+      if (o.title) return o.title;
+      var name = locusResolveToolName(o);
+      if (name) {
+        if (o.hookType === 'pre_tool_use') return name + ' ▸ call';
+        if (o.hookType === 'post_tool_use') return name + ' ▸ result';
+        if (o.hookType === 'post_tool_failure') return name + ' ▸ error';
+        return name;
+      }
+      if (o.hookType) return o.hookType.replace(/_/g, ' ');
+      return 'Observation';
+    }
+    function locusObsType(o, toolTypeMap) {
+      if (o.type) return o.type;
+      var name = locusResolveToolName(o);
+      if (name) {
+        var mapped = toolTypeMap[name] || toolTypeMap[name.charAt(0).toUpperCase() + name.slice(1)];
+        if (mapped) return mapped;
+        return name;
+      }
+      if (o.hookType === 'pre_tool_use') return 'tool_call';
+      if (o.hookType === 'post_tool_use' || o.hookType === 'post_tool_failure') return 'tool_result';
+      if (o.hookType) return o.hookType.replace(/_/g, ' ');
+      return 'other';
+    }
+
+    function renderObservations() {`;
+  if (source.includes(renderNeedle)) {
+    source = source.replace(renderNeedle, renderReplacement);
+  }
+
+  source = source.replace(
+    /var t = o\.type \|\| TOOL_TYPE_MAP\[o\.toolName\] \|\| \(o\.hookType \? o\.hookType\.replace\(\/_\/g, ' '\) : 'other'\);/g,
+    "var t = locusObsType(o, TOOL_TYPE_MAP);",
+  );
+  source = source.replace(
+    "var type = o.type || TOOL_TYPE_MAP[o.toolName] || 'other';",
+    "var type = locusObsType(o, TOOL_TYPE_MAP);",
+  );
+  source = source.replace(
+    "var title = o.title || o.toolName || (o.hookType ? o.hookType.replace(/_/g, ' ') : 'Observation');",
+    "var title = locusObsTitle(o);",
+  );
+
+  if (source === original) {
+    return false;
+  }
+  writeFileSync(viewerPath, source);
+  return true;
+}
+
+function patchAgentmemoryViewerV2(viewerPath) {
+  let source = readFileSync(viewerPath, "utf8");
+  const original = source;
+  if (source.includes("/* locus-viewer-timeline-v2 */")) {
+    return false;
+  }
+
+  const hydrateFn = `    /* locus-viewer-timeline-v2 */
+    function locusHydrateObservation(o) {
+      if (!o || typeof o !== 'object') return o;
+      var obs = Object.assign({}, o);
+      var payload = obs.raw;
+      if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return obs;
+      if (!obs.toolName && typeof payload.tool_name === 'string') obs.toolName = payload.tool_name;
+      if (obs.toolInput === void 0 && payload.tool_input !== void 0) obs.toolInput = payload.tool_input;
+      if (obs.toolOutput === void 0 && (payload.tool_output !== void 0 || payload.error !== void 0)) {
+        obs.toolOutput = payload.tool_output !== void 0 ? payload.tool_output : payload.error;
+      }
+      if (!obs.userPrompt && typeof payload.prompt === 'string') obs.userPrompt = payload.prompt;
+      return obs;
+    }
+`;
+
+  if (source.includes("function locusObsType(o, toolTypeMap) {")) {
+    source = source.replace(
+      "function locusObsType(o, toolTypeMap) {",
+      `${hydrateFn}
+    function locusObsType(o, toolTypeMap) {`,
+    );
+  }
+
+  source = source.replace(
+    "state.timeline.observations = (result && result.observations) || [];",
+    "state.timeline.observations = ((result && result.observations) || []).map(function(o) { return locusHydrateObservation(o); });",
+  );
+
+  source = source.replace(
+    "var obs = state.timeline.observations;",
+    "var obs = state.timeline.observations.map(function(o) { return locusHydrateObservation(o); });",
+  );
+
+  source = source.replace(
+    "var isCompressed = !!o.narrative || !!o.type;\n        var isRaw = !isCompressed;",
+    "var isCompressed = !!(o.narrative && String(o.narrative).trim()) || (o.facts && o.facts.length > 0);\n        var isRaw = !isCompressed && (!!o.hookType || !!locusResolveToolName(o));",
+  );
+
+  if (source === original) {
+    return false;
+  }
+  writeFileSync(viewerPath, source);
+  return true;
+}
+
+function patchAgentmemoryViewer() {
+  let patched = 0;
+  for (const viewerPath of agentmemoryViewerCandidates()) {
+    if (patchAgentmemoryViewerFile(viewerPath)) {
+      patched += 1;
+      console.log(`[locus] Patched agentmemory viewer timeline (v1): ${path.relative(repoRoot, viewerPath)}`);
+    }
+    if (patchAgentmemoryViewerV2(viewerPath)) {
+      patched += 1;
+      console.log(`[locus] Patched agentmemory viewer timeline (v2): ${path.relative(repoRoot, viewerPath)}`);
+    }
+  }
+}
+
 function iiiBinaryPath() {
   return path.join(bundleDir, "bin", iiiBinaryName());
 }
@@ -68,6 +419,8 @@ function writeManifest(entry) {
         target: platformTarget(),
         agentmemoryVersion: readPinnedVersion(),
         iiiVersion: readIiiVersion(),
+        replayPatchVersion: 3,
+        timelineViewerPatchVersion: 2,
         ...entry,
       },
       null,
@@ -336,6 +689,8 @@ async function main() {
   }
 
   const cliVersion = verifyCli(nodeProgram);
+  patchAgentmemoryReplay();
+  patchAgentmemoryViewer();
   writeManifest({ cliVersion, layout: "npm-plus-iii" });
   console.log(
     `[locus] Prepared agentmemory ${cliVersion} (iii ${iiiVersion}) at ${path.relative(repoRoot, bundleDir)}`,

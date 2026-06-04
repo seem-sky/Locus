@@ -31,11 +31,13 @@ If you cannot explain current behavior per scenario, read more before writing.
 - Over-broad APIs, missing early returns, redundant awaits or locks
 - Weak error handling or unclear failure modes
 - Performance hotspots surfaced by CodeGraph call chains or Unity profiler hints (when available)
+- **Lua / xLua hot paths** (when `.lua` files change): reduce allocations only with evidence; reuse tables with full `table.clear` (including nested subtables); pool objects with complete field reset on acquire — see `skill/gc.md`
 
 ### What to avoid
 - Behavior changes without explicit justification in the summary
 - Large structural rewrites when a local fix suffices
 - Cosmetic-only edits that do not improve correctness or runtime clarity
+- **Lua GC shortcuts that break correctness**: partial table reuse, module-level `_temp` passed to callees/callbacks that may cache refs, object pools without reset or max size — correctness before allocation savings
 
 ## Output format
 

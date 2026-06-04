@@ -4,23 +4,8 @@ import {
   previewWorkspaceAssetTarget,
 } from "../services/asset";
 import { normalizeAppError } from "../services/errors";
-import type {
-  AssetPreviewPayload,
-  SemanticTargetInspector,
-} from "../types";
-
-function isPrefabPath(path: string): boolean {
-  return path.toLowerCase().endsWith(".prefab");
-}
-
-function defaultPrefabRootTargetId(payload: AssetPreviewPayload, assetPath: string): string | null {
-  if (!isPrefabPath(assetPath) || payload.kind !== "structured") return null;
-  const knownIds = new Set(payload.tree.map((node) => node.id));
-  const root = payload.tree.find((node) =>
-    node.hasInspector && (!node.parentId || !knownIds.has(node.parentId)),
-  );
-  return root?.id ?? null;
-}
+import type { AssetPreviewPayload, SemanticTargetInspector } from "../types";
+import { defaultStructuredTargetId } from "./assetPreviewTarget";
 
 export function useWorkspaceAssetPreview(
   workingDir: Ref<string>,
@@ -84,7 +69,7 @@ export function useWorkspaceAssetPreview(
       const payload = await previewWorkspaceAsset(normalizedPath);
       if (session !== previewSession) return;
       previewPayload.value = payload;
-      const defaultTargetId = defaultPrefabRootTargetId(payload, normalizedPath);
+      const defaultTargetId = defaultStructuredTargetId(payload);
       if (payload.kind === "structured" && defaultTargetId) {
         await loadTarget(payload.previewKey, defaultTargetId, session);
       }

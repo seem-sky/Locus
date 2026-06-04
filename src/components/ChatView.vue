@@ -1155,7 +1155,16 @@ watch(
   async (prefillId) => {
     const prefill = uiStore.pendingChatPrefill;
     if (!prefillId || !prefill) return;
-    if (prefill.draft) {
+    if (prefill.append) {
+      await nextTick();
+      if (composerPanelRef.value) {
+        await composerPanelRef.value.appendPrefill(prefill.text);
+      } else {
+        const pad = inputText.value.trim() ? "\n\n" : "";
+        inputText.value = `${inputText.value}${pad}${prefill.text}`;
+      }
+      await focusComposerInput();
+    } else if (prefill.draft) {
       await nextTick();
       if (composerPanelRef.value) {
         await composerPanelRef.value.applyDraftPrefill(prefill.draft);

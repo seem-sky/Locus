@@ -38,9 +38,11 @@ pub fn set_managed_agentmemory_resource_dir(path: PathBuf) {
 }
 
 pub fn resolve_agentmemory() -> Result<ResolvedAgentmemory, String> {
+    // Prefer the bundled runtime (includes Locus replay patches) over a global npm install
+    // on PATH, which would otherwise win and serve stale replay/timeline behavior.
     resolve_agentmemory_from_env()
-        .or_else(resolve_agentmemory_from_path)
         .or_else(resolve_agentmemory_from_bundle)
+        .or_else(resolve_agentmemory_from_path)
         .ok_or_else(|| format!("agentmemory is not available. {}", AGENTMEMORY_BUNDLE_HINT))
 }
 
@@ -189,8 +191,15 @@ fn resolve_agentmemory_from_cli_entry(
     bundle_version: Option<String>,
 ) -> Option<ResolvedAgentmemory> {
     if using_bundled_runtime {
-        let (program, prefix_args) =
+        let (program, mut prefix_args) =
             crate::tool::builtins::codegraph::resolve_codegraph_node_for_script(cli_entry)?;
+        // Avoid passing absolute `G:/.../node_modules/...` on Windows — Node re-parses the
+        // command line and `\n` in `\node_modules` inside the node.exe path corrupts argv.
+        if prefix_args.len() >= 2 {
+            if let Ok(relative) = cli_entry.strip_prefix(&working_dir) {
+                prefix_args[1] = cli_arg_path(relative.as_ref());
+            }
+        }
         return Some(ResolvedAgentmemory {
             program,
             prefix_args,
@@ -377,6 +386,13 @@ mod tests {
             if arg.ends_with(".mjs") && arg.contains('\\') {
                 panic!("cli entry still contains backslashes on Windows: {arg}");
             }
+        }
+        #[cfg(windows)]
+        if resolved.prefix_args.len() >= 2 {
+            assert_eq!(
+                resolved.prefix_args[1], "dist/cli.mjs",
+                "bundled spawn should use cwd-relative cli path on Windows"
+            );
         }
     }
 

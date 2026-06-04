@@ -45,16 +45,21 @@ describe("chat project view panel", () => {
     expect(legacyExplorer).toContain(':draggable="false"');
     expect(legacyExplorer).toContain("@dblclick.stop=\"rowDblClick(entry)\"");
     expect(legacyExplorer).toContain('role="button"');
+    expect(legacyExplorer).toContain(":title=\"rowTitle(entry)\"");
+    expect(legacyExplorer).toContain('aria-keyshortcuts="!entry.isFolder && assetRefDraggable ? \'DoubleClick\' : undefined"');
+    expect(legacyExplorer).toContain('asset.legacyExplorer.dblClickToPreview');
+    expect(zh).toContain('"asset.legacyExplorer.dblClickToPreview": "双击打开预览"');
 
     expect(floatingPreview).toContain("chat-floating-asset-preview");
     expect(floatingPreview).toContain("inset: 0");
     expect(chatView).toMatch(/<\/RichChatInput>\s*<\/div>\s*<ChatFloatingAssetPreview/);
-    expect(floatingPreview).toContain("useAssetRefPointerDragSource");
+    expect(floatingPreview).not.toContain("chat-floating-asset-preview-header");
+    expect(floatingPreview).not.toContain("chat.floatingAssetPreview.dragHint");
     expect(floatingPreview).toContain("data-composer-asset-ref-drop");
-    expect(floatingPreview).toContain("@pointerdown.stop=\"onHeaderPointerDown\"");
     expect(floatingPreview).toContain("@dragover=\"onPreviewDragOver\"");
     expect(floatingPreview).toContain("@drop=\"onPreviewDrop\"");
     expect(floatingPreview).toContain("useWorkspaceAssetPreview");
+    expect(floatingPreview).toContain("AssetPreviewHost");
 
     expect(assetRefDrag).toContain("LOCUS_ASSET_REF_DRAG_MIME");
     expect(assetRefDrag).toContain("draggingAssetRefPath");
@@ -70,6 +75,5 @@ describe("chat project view panel", () => {
     expect(richInput).toContain("handleComposerDrop");
     expect(richInput).toContain("addAssetRefs,");
 
-    expect(zh).toContain('"chat.floatingAssetPreview.dragHint": "拖到输入框引用"');
   });
 });

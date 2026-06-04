@@ -1013,8 +1013,12 @@ export const useChatStore = defineStore("chat", () => {
     proposalId?: string,
   ): ChatMessage | null {
     const proposal = message.memoryProposal;
-    if (!proposal || proposal.status !== "pending") return null;
-    if (proposalId && proposal.proposalId !== proposalId) return null;
+    if (!proposal) return null;
+    if (proposalId) {
+      if (proposal.proposalId !== proposalId) return null;
+    } else if (proposal.status !== "pending") {
+      return null;
+    }
     return {
       ...message,
       memoryProposal: {
@@ -2581,16 +2585,25 @@ export const useChatStore = defineStore("chat", () => {
     }
   }
 
+  const applyingMemoryProposalKeys = new Set<string>();
+
   async function applyMemoryProposal(proposalId: string) {
-    if (!activeSessionId.value) return;
+    const sessionId = activeSessionId.value;
+    if (!sessionId) return;
+    const inflightKey = `${sessionId}:${proposalId}`;
+    if (applyingMemoryProposalKeys.has(inflightKey)) return;
+    applyingMemoryProposalKeys.add(inflightKey);
     updateMemoryProposalStatuses("applying", proposalId);
     try {
-      await sessionService.applyMemoryProposal(activeSessionId.value, proposalId);
+      await sessionService.applyMemoryProposal(sessionId, proposalId);
+      updateMemoryProposalStatuses("applied", proposalId);
       useNotificationStore().addNotice("success", t("memory.saved"));
     } catch (e) {
       console.error("apply_memory_proposal failed:", e);
       useNotificationStore().addNotice("error", normalizeAppError(e).message);
-      await loadSessionState(activeSessionId.value);
+      await loadSessionState(sessionId);
+    } finally {
+      applyingMemoryProposalKeys.delete(inflightKey);
     }
   }
 

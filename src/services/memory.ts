@@ -213,3 +213,171 @@ export function agentmemoryStart(): Promise<AgentMemoryStatus> {
 export function agentmemoryStop(): Promise<AgentMemoryStatus> {
   return invokeAgentmemoryCommand<AgentMemoryStatus>("agentmemory_stop");
 }
+
+export interface AgentMemoryAction {
+  id: string;
+  title: string;
+  description?: string | null;
+  status: string;
+  priority?: number | null;
+  project?: string | null;
+  createdBy?: string | null;
+  tags: string[];
+  createdAt: string;
+  updatedAt: string;
+}
+
+export function agentmemoryActionList(
+  workingDir: string,
+  status?: string | null,
+): Promise<AgentMemoryAction[]> {
+  return ipcInvoke<AgentMemoryAction[]>("agentmemory_action_list", {
+    request: { workingDir, status: status ?? null },
+  });
+}
+
+export function agentmemoryActionCreate(params: {
+  workingDir: string;
+  title: string;
+  description?: string | null;
+  priority?: number | null;
+  tags?: string[];
+  parentId?: string | null;
+}): Promise<AgentMemoryAction> {
+  return ipcInvoke<AgentMemoryAction>("agentmemory_action_create", {
+    request: {
+      workingDir: params.workingDir,
+      title: params.title,
+      description: params.description ?? null,
+      priority: params.priority ?? null,
+      tags: params.tags ?? [],
+      parentId: params.parentId ?? null,
+    },
+  });
+}
+
+export function agentmemoryActionUpdate(params: {
+  workingDir: string;
+  actionId: string;
+  status?: string | null;
+  title?: string | null;
+  description?: string | null;
+  priority?: number | null;
+  result?: string | null;
+}): Promise<AgentMemoryAction> {
+  return ipcInvoke<AgentMemoryAction>("agentmemory_action_update", {
+    request: {
+      workingDir: params.workingDir,
+      actionId: params.actionId,
+      status: params.status ?? null,
+      title: params.title ?? null,
+      description: params.description ?? null,
+      priority: params.priority ?? null,
+      result: params.result ?? null,
+    },
+  });
+}
+
+export interface AgentMemorySessionRow {
+  id: string;
+  title?: string | null;
+  status?: string | null;
+  project?: string | null;
+  observationCount?: number | null;
+  startedAt?: string | null;
+  endedAt?: string | null;
+}
+
+export interface AgentMemoryInsights {
+  sessions: unknown;
+  profile?: unknown;
+  patterns?: unknown;
+  graphStats?: unknown;
+  errors: string[];
+}
+
+function parseSessionRows(payload: unknown): AgentMemorySessionRow[] {
+  if (!payload || typeof payload !== "object") return [];
+  const record = payload as Record<string, unknown>;
+  const list = Array.isArray(record.sessions)
+    ? record.sessions
+    : Array.isArray(payload)
+      ? payload
+      : [];
+  return list
+    .filter((item): item is Record<string, unknown> => !!item && typeof item === "object")
+    .map((item) => ({
+      id: String(item.id ?? item.sessionId ?? ""),
+      title: typeof item.title === "string" ? item.title : null,
+      status: typeof item.status === "string" ? item.status : null,
+      project: typeof item.project === "string" ? item.project : null,
+      observationCount:
+        typeof item.observationCount === "number"
+          ? item.observationCount
+          : typeof item.observation_count === "number"
+            ? item.observation_count
+            : null,
+      startedAt:
+        typeof item.startedAt === "string"
+          ? item.startedAt
+          : typeof item.started_at === "string"
+            ? item.started_at
+            : null,
+      endedAt:
+        typeof item.endedAt === "string"
+          ? item.endedAt
+          : typeof item.ended_at === "string"
+            ? item.ended_at
+            : null,
+    }))
+    .filter((row) => row.id.length > 0);
+}
+
+export function agentmemoryInsights(workingDir: string): Promise<AgentMemoryInsights> {
+  return ipcInvoke<{
+    sessions: unknown;
+    profile?: unknown;
+    patterns?: unknown;
+    graph_stats?: unknown;
+    errors: string[];
+  }>("agentmemory_insights", {
+    request: { workingDir },
+  }).then((response) => ({
+    sessions: response.sessions,
+    profile: response.profile,
+    patterns: response.patterns,
+    graphStats: response.graph_stats,
+    errors: response.errors ?? [],
+  }));
+}
+
+export { parseSessionRows };
+
+export function isAgentMemoryPatternNoise(text: string): boolean {
+  const lower = text.trim().toLowerCase();
+  if (!lower) return true;
+  const markers = [
+    "posttoolusefailure",
+    "post_tool_failure",
+    "post tool use failure",
+    "hook triggered",
+    "hook fired",
+    "recurring error:",
+    "with no details",
+    "pre-tool-use hook",
+    "pre_tool_use hook",
+  ];
+  return markers.some((marker) => lower.includes(marker));
+}
+
+export function agentmemoryConsolidate(params?: {
+  tier?: string | null;
+  force?: boolean | null;
+}): Promise<unknown> {
+  return ipcInvoke("agentmemory_consolidate", {
+    request: {
+      tier: params?.tier ?? null,
+      force: params?.force ?? null,
+    },
+  });
+}

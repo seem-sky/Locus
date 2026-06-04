@@ -1,3 +1,4 @@
+pub mod agentmemory;
 pub mod codegraph;
 mod filesystem;
 mod knowledge;
@@ -27,6 +28,7 @@ pub fn register_all(registry: &mut ToolRegistry) {
     registry.register_builtin(misc::todowrite());
     registry.register_builtin(misc::graph_view());
     codegraph::register_all(registry);
+    agentmemory::register_all(registry);
 
     registry.register_builtin(filesystem::list());
     registry.register_builtin(unity::unity_execute());

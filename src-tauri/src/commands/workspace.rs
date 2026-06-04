@@ -1500,6 +1500,59 @@ pub async fn save_tool_permission_mode(
     Ok(())
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkflowToolWhitelistPayload {
+    pub tools: Vec<String>,
+    pub bash_commands: Vec<String>,
+}
+
+impl From<crate::agent::workflow::WorkflowAmbiguousWhitelist> for WorkflowToolWhitelistPayload {
+    fn from(value: crate::agent::workflow::WorkflowAmbiguousWhitelist) -> Self {
+        let mut tools: Vec<_> = value.tools.into_iter().collect();
+        let mut bash_commands: Vec<_> = value.bash_commands.into_iter().collect();
+        tools.sort();
+        bash_commands.sort();
+        Self {
+            tools,
+            bash_commands,
+        }
+    }
+}
+
+impl From<WorkflowToolWhitelistPayload> for crate::agent::workflow::WorkflowAmbiguousWhitelist {
+    fn from(value: WorkflowToolWhitelistPayload) -> Self {
+        Self {
+            tools: value.tools.into_iter().collect(),
+            bash_commands: value.bash_commands.into_iter().collect(),
+        }
+    }
+}
+
+#[tauri::command]
+pub async fn get_workflow_tool_whitelist(
+    whitelist: State<'_, crate::WorkflowToolWhitelist>,
+) -> Result<WorkflowToolWhitelistPayload, AppError> {
+    let guard = whitelist.0.read().await;
+    Ok(WorkflowToolWhitelistPayload::from(guard.clone()))
+}
+
+#[tauri::command]
+pub async fn save_workflow_tool_whitelist(
+    value: WorkflowToolWhitelistPayload,
+    whitelist: State<'_, crate::WorkflowToolWhitelist>,
+    app_handle: AppHandle,
+) -> Result<(), AppError> {
+    let normalized = crate::agent::workflow::WorkflowAmbiguousWhitelist::from(value);
+    *whitelist.0.write().await = normalized.clone();
+    let data_dir = super::resolve_runtime_storage_dir(&app_handle)
+        .map_err(|e| format!("Failed to get data dir: {}", e))?;
+    normalized
+        .save_to_dir(&data_dir)
+        .map_err(AppError::from)?;
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn get_tool_permissions(
     perms: State<'_, crate::ToolPermissions>,
@@ -2760,6 +2813,7 @@ pub async fn reset_all_config(
         "active_session_selection.json",
         "tool_permission_mode.txt",
         "tool_permissions.json",
+        crate::agent::workflow::WORKFLOW_TOOL_WHITELIST_FILENAME,
         "git_path_override.txt",
         "config.json",
     ];

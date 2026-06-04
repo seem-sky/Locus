@@ -20,7 +20,7 @@ import {
   codexStatus as fetchCodexStatus,
 } from "../services/auth";
 import { getModelDefaults, getCustomEndpoints } from "../services/model";
-import { getToolPermissions } from "../services/permissions";
+import { getToolPermissions, getWorkflowToolWhitelist } from "../services/permissions";
 import {
   gitProbe,
   gitHistorySnapshot,
@@ -354,11 +354,12 @@ export function useAppBootstrap() {
   function warmupSettings(generation: number): Promise<void> {
     if (_wpSettings) return _wpSettings;
     _wpSettings = (async () => {
-      const [providers, codex, defaults, perms, endpoints] = await Promise.all([
+      const [providers, codex, defaults, perms, workflowWhitelist, endpoints] = await Promise.all([
         getProviders(),
         fetchCodexStatus(),
         getModelDefaults(),
         getToolPermissions(),
+        getWorkflowToolWhitelist(),
         getCustomEndpoints(),
       ]);
       setWarmup(
@@ -369,6 +370,7 @@ export function useAppBootstrap() {
       setWarmup("settings:codexStatus", codex, generation);
       setWarmup("settings:modelDefaults", defaults, generation);
       setWarmup("settings:toolPermissions", perms, generation);
+      setWarmup("settings:workflowToolWhitelist", workflowWhitelist, generation);
       setWarmup("settings:customEndpoints", endpoints, generation);
     })();
     return _wpSettings;
@@ -483,7 +485,16 @@ export function useAppBootstrap() {
     });
     unlistenAppError = await runtime.subscribe<AppErrorPayload>("app-error", (eventPayload) => {
       const payload = normalizeAppError(eventPayload);
-      notificationStore.addNotice(payload.severity, payload.message, {
+      let message = payload.message;
+      if (payload.detail && payload.code === "undo.checkpoint_failed") {
+        const reason = payload.detail.includes("reason=")
+          ? payload.detail.split("reason=").pop()?.trim() ?? payload.detail
+          : payload.detail;
+        const clipped =
+          reason.length > 240 ? `${reason.slice(0, 237)}…` : reason;
+        message = `${payload.message} ${clipped}`;
+      }
+      notificationStore.addNotice(payload.severity, message, {
         code: payload.code,
         operation: payload.operation,
       });

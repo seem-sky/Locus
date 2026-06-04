@@ -10,8 +10,13 @@ namespace Locus
 {
     public static partial class LocusBridge
     {
-        private const int MaxConsoleEntriesToSend = 200;
-        private const int MaxConsoleCharsToSend = 60000;
+        internal const int MaxConsoleEntriesToSend = 200;
+        internal const int MaxConsoleCharsToSend = 60000;
+        internal const string ConsoleSourceAll = "unity-console";
+        internal const string ConsoleSourceSelected = "unity-console-selected";
+
+        [ThreadStatic]
+        private static string _currentBuildSource = ConsoleSourceAll;
 
         [Serializable]
         private sealed class UnityConsoleTextPayload
@@ -31,21 +36,48 @@ namespace Locus
             public string level;
         }
 
-        private static string BuildConsoleTextPayloadJson()
+        internal static string BuildConsoleTextPayloadJson()
         {
-            ConsoleTextEntry[] entries = BuildConsoleTextEntries();
-            return JsonUtility.ToJson(new UnityConsoleTextPayload
+            return BuildConsoleTextPayloadJson(null, ConsoleSourceAll);
+        }
+
+        internal static string BuildConsoleTextPayloadJsonForSelection(int[] rowIndices)
+        {
+            return BuildConsoleTextPayloadJson(rowIndices, ConsoleSourceSelected);
+        }
+
+        private static string BuildConsoleTextPayloadJson(int[] selectionRowIndices, string source)
+        {
+            string previous = _currentBuildSource;
+            _currentBuildSource = string.IsNullOrEmpty(source) ? ConsoleSourceAll : source;
+            try
             {
-                text = JoinConsoleTextEntries(entries),
-                entries = entries,
-                title = "Unity Console",
-                source = "unity-console"
-            });
+                ConsoleTextEntry[] entries = BuildConsoleTextEntries(selectionRowIndices);
+                string title = source == ConsoleSourceSelected && entries.Length > 0
+                    ? "Unity Console (Selection)"
+                    : "Unity Console";
+                return JsonUtility.ToJson(new UnityConsoleTextPayload
+                {
+                    text = JoinConsoleTextEntries(entries),
+                    entries = entries,
+                    title = title,
+                    source = source
+                });
+            }
+            finally
+            {
+                _currentBuildSource = previous;
+            }
         }
 
         private static ConsoleTextEntry[] BuildConsoleTextEntries()
         {
-            ConsoleTextEntry[] entries = TryBuildConsoleTextEntriesFromLogEntries();
+            return BuildConsoleTextEntries(null);
+        }
+
+        private static ConsoleTextEntry[] BuildConsoleTextEntries(int[] selectionRowIndices)
+        {
+            ConsoleTextEntry[] entries = TryBuildConsoleTextEntriesFromLogEntries(selectionRowIndices);
             if (entries == null || entries.Length == 0)
                 return new ConsoleTextEntry[0];
 
@@ -77,6 +109,11 @@ namespace Locus
 
         private static ConsoleTextEntry[] TryBuildConsoleTextEntriesFromLogEntries()
         {
+            return TryBuildConsoleTextEntriesFromLogEntries(null);
+        }
+
+        private static ConsoleTextEntry[] TryBuildConsoleTextEntriesFromLogEntries(int[] selectionRowIndices)
+        {
             try
             {
                 Type logEntriesType = FindEditorType("UnityEditor.LogEntries", "UnityEditorInternal.LogEntries");
@@ -102,12 +139,16 @@ namespace Locus
                         logEntryType,
                         getEntryInternal,
                         startGettingEntries,
-                        endGettingEntries);
+                        endGettingEntries,
+                        ResolveTargetEntryIndices(count, selectionRowIndices));
                 }
 
                 MethodInfo getLinesAndMode = FindStaticMethod(logEntriesType, "GetLinesAndModeFromEntryInternal", 4);
                 if (getLinesAndMode != null)
-                    return BuildConsoleTextFromLinesAndMode(count, getLinesAndMode);
+                {
+                    int[] targets = ResolveTargetEntryIndices(count, selectionRowIndices);
+                    return BuildConsoleTextFromLinesAndMode(targets, getLinesAndMode);
+                }
             }
             catch
             {
@@ -116,15 +157,42 @@ namespace Locus
             return new ConsoleTextEntry[0];
         }
 
+        private static int[] ResolveTargetEntryIndices(int totalCount, int[] selectionRowIndices)
+        {
+            if (selectionRowIndices == null || selectionRowIndices.Length == 0)
+            {
+                int startIndex = Math.Max(0, totalCount - MaxConsoleEntriesToSend);
+                int length = totalCount - startIndex;
+                if (length <= 0)
+                    return new int[0];
+                int[] all = new int[length];
+                for (int i = 0; i < length; i++)
+                    all[i] = startIndex + i;
+                return all;
+            }
+
+            List<int> resolved = new List<int>(selectionRowIndices.Length);
+            for (int i = 0; i < selectionRowIndices.Length; i++)
+            {
+                int row = selectionRowIndices[i];
+                if (row < 0 || row >= totalCount)
+                    continue;
+                resolved.Add(row);
+            }
+            return resolved.Count == 0 ? new int[0] : resolved.ToArray();
+        }
+
         private static ConsoleTextEntry[] BuildConsoleTextFromLogEntryObjects(
             int count,
             Type logEntryType,
             MethodInfo getEntryInternal,
             MethodInfo startGettingEntries,
-            MethodInfo endGettingEntries)
+            MethodInfo endGettingEntries,
+            int[] targetEntryIndices)
         {
             List<ConsoleTextEntry> entries = new List<ConsoleTextEntry>();
-            int startIndex = Math.Max(0, count - MaxConsoleEntriesToSend);
+            if (targetEntryIndices.Length == 0)
+                return entries.ToArray();
             object logEntry = Activator.CreateInstance(logEntryType);
 
             try
@@ -132,8 +200,11 @@ namespace Locus
                 if (startGettingEntries != null)
                     startGettingEntries.Invoke(null, null);
 
-                for (int i = startIndex; i < count; i++)
+                for (int n = 0; n < targetEntryIndices.Length; n++)
                 {
+                    int i = targetEntryIndices[n];
+                    if (i < 0 || i >= count)
+                        continue;
                     object result = getEntryInternal.Invoke(null, new[] { (object)i, logEntry });
                     if (result is bool && !(bool)result)
                         continue;
@@ -141,7 +212,7 @@ namespace Locus
                     string condition = ReadStringMember(logEntry, "message", "condition");
                     string stackTrace = ReadStringMember(logEntry, "stacktrace", "stackTrace");
                     int mode = ReadIntMember(logEntry, "mode");
-                    AddConsoleEntry(entries, LogModeLabel(mode), condition, stackTrace);
+                    AddConsoleEntry(entries, LogModeLabel(mode), condition, stackTrace, _currentBuildSource);
                     TrimConsoleEntries(entries);
                 }
             }
@@ -154,17 +225,19 @@ namespace Locus
             return entries.ToArray();
         }
 
-        private static ConsoleTextEntry[] BuildConsoleTextFromLinesAndMode(int count, MethodInfo getLinesAndMode)
+        private static ConsoleTextEntry[] BuildConsoleTextFromLinesAndMode(int[] targetEntryIndices, MethodInfo getLinesAndMode)
         {
             List<ConsoleTextEntry> entries = new List<ConsoleTextEntry>();
-            int startIndex = Math.Max(0, count - MaxConsoleEntriesToSend);
-            for (int i = startIndex; i < count; i++)
+            if (targetEntryIndices.Length == 0)
+                return entries.ToArray();
+            for (int n = 0; n < targetEntryIndices.Length; n++)
             {
+                int i = targetEntryIndices[n];
                 string lines;
                 int mode;
                 if (!TryGetLinesAndMode(getLinesAndMode, i, out lines, out mode))
                     continue;
-                AddConsoleEntry(entries, LogModeLabel(mode), lines, "");
+                AddConsoleEntry(entries, LogModeLabel(mode), lines, "", _currentBuildSource);
                 TrimConsoleEntries(entries);
             }
             return entries.ToArray();
@@ -292,6 +365,11 @@ namespace Locus
 
         private static void AddConsoleEntry(List<ConsoleTextEntry> entries, string type, string condition, string stackTrace)
         {
+            AddConsoleEntry(entries, type, condition, stackTrace, _currentBuildSource);
+        }
+
+        private static void AddConsoleEntry(List<ConsoleTextEntry> entries, string type, string condition, string stackTrace, string source)
+        {
             condition = (condition ?? "").TrimEnd();
             stackTrace = (stackTrace ?? "").TrimEnd();
             if (string.IsNullOrEmpty(condition) && string.IsNullOrEmpty(stackTrace))
@@ -308,7 +386,7 @@ namespace Locus
             {
                 title = ConsoleEntryTitle(level, condition),
                 text = sb.ToString().TrimEnd(),
-                source = "unity-console",
+                source = string.IsNullOrEmpty(source) ? ConsoleSourceAll : source,
                 level = level
             });
         }

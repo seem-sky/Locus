@@ -1527,29 +1527,70 @@ impl Default for WorkspacePreviewCache {
 fn text_language_for_ext(ext: &str) -> Option<&'static str> {
     match ext {
         "cs" => Some("csharp"),
+        "js" | "jsx" => Some("javascript"),
+        "ts" | "tsx" => Some("typescript"),
         "json" => Some("json"),
         "txt" => Some("text"),
         "md" | "markdown" => Some("markdown"),
         "shader" | "cginc" | "hlsl" | "glsl" | "compute" => Some("hlsl"),
-        "xml" => Some("xml"),
+        "xml" | "csproj" | "sln" => Some("xml"),
         "yaml" | "yml" => Some("yaml"),
         "toml" => Some("toml"),
-        "ini" | "cfg" | "conf" => Some("ini"),
-        "js" | "ts" => Some("typescript"),
+        "ini" | "cfg" | "conf" | "properties" => Some("ini"),
         "py" => Some("python"),
         "rs" => Some("rust"),
+        "lua" => Some("lua"),
+        "go" => Some("go"),
+        "java" => Some("java"),
+        "c" | "h" => Some("c"),
+        "cpp" | "hpp" | "cc" => Some("cpp"),
+        "rb" => Some("ruby"),
+        "sh" | "bash" | "zsh" | "bat" | "cmd" | "ps1" => Some("shell"),
         "html" | "htm" => Some("html"),
-        "css" => Some("css"),
-        // CSV / TSV / log are technically text but rarely useful as previews;
-        // include them to avoid surprising the user.
+        "css" | "scss" | "less" => Some("css"),
+        "vue" | "svelte" => Some("html"),
         "csv" | "tsv" | "log" => Some("text"),
+        "asmdef" | "asmref" | "rsp" => Some("json"),
+        "meta" | "locus-meta" => Some("yaml"),
+        "sql" => Some("sql"),
+        "gradle" => Some("groovy"),
         _ => None,
     }
 }
 
-/// Validates that `requested` is a workspace-relative file path. Symlinked
-/// directories are accepted when the path is reached through the workspace
-/// tree, matching Unity's treatment of linked asset folders.
+/// Extensions treated as non-textual for the text-snippet fallback path.
+const KNOWN_BINARY_EXTS: &[&str] = &[
+    "png", "jpg", "jpeg", "gif", "bmp", "tga", "psd", "tif", "tiff", "exr", "hdr", "webp", "ico",
+    "svg", "fbx", "obj", "blend", "dae", "3ds", "wav", "mp3", "ogg", "aif", "aiff", "flac", "mp4",
+    "avi", "mov", "wmv", "webm", "dll", "so", "dylib", "exe", "a", "lib", "ttf", "otf", "woff",
+    "woff2", "zip", "rar", "7z", "gz", "tar", "pdf", "doc", "docx", "xls", "xlsx", "unitybank",
+    "resource", "res", "assets", "bundle",
+];
+
+fn is_known_binary_ext(ext: &str) -> bool {
+    KNOWN_BINARY_EXTS.contains(&ext)
+}
+
+/// Heuristic: reject obvious binary payloads before attempting a text snippet.
+fn file_snippet_looks_textual(path: &Path) -> bool {
+    use std::io::Read;
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut buf = [0u8; 512];
+    let Ok(n) = file.read(&mut buf) else {
+        return false;
+    };
+    if n == 0 {
+        return true;
+    }
+    !buf[..n].contains(&0)
+}
+
+/// Validates that `requested` is a workspace-relative file path whose canonical
+/// location stays inside the workspace root. Symlinked asset folders under
+/// `Assets/` / `Packages/` remain allowed; symlinks that escape the workspace
+/// are rejected after canonicalization.
 fn resolve_workspace_path(
     workspace_root: &Path,
     requested: &str,
@@ -1566,15 +1607,6 @@ fn resolve_workspace_path(
             "Asset preview path cannot be empty.",
         ));
     }
-    if root_for_rel_path(&rel_path).is_none() {
-        return Err(AppError::new(
-            "asset.preview.invalid_root",
-            format!(
-                "Asset preview only supports Assets, Packages, and ProjectSettings paths: {}",
-                requested
-            ),
-        ));
-    }
     let candidate = workspace_root.join(&rel_path);
     if !candidate.exists() {
         return Err(AppError::new(
@@ -1588,7 +1620,33 @@ fn resolve_workspace_path(
             format!("Path is not a regular file: {}", requested),
         ));
     }
-    Ok((candidate, rel_path))
+
+    // Unity asset roots keep the legacy behavior: symlinked folders under
+    // Assets/ or Packages/ may resolve outside the workspace directory.
+    if root_for_rel_path(&rel_path).is_some() {
+        return Ok((candidate, rel_path));
+    }
+
+    let canonical = dunce::canonicalize(&candidate).map_err(|e| {
+        AppError::new(
+            "asset.preview.not_found",
+            format!("File not found: {} ({})", requested, e),
+        )
+    })?;
+    let ws_canonical = dunce::canonicalize(workspace_root).map_err(|e| {
+        AppError::new(
+            "asset.preview.invalid_path",
+            format!("Failed to resolve workspace: {}", e),
+        )
+    })?;
+    if !canonical.starts_with(&ws_canonical) {
+        return Err(AppError::new(
+            "asset.preview.invalid_path",
+            format!("Path is not within the workspace: {}", requested),
+        ));
+    }
+
+    Ok((canonical, rel_path))
 }
 
 /// Read up to `TEXT_SNIPPET_MAX_LINES` lines / `TEXT_SNIPPET_MAX_BYTES` bytes
@@ -2398,6 +2456,14 @@ pub async fn preview_workspace_asset(
         // sees something rather than an error.
     }
 
+    // Text fallback for extensions we do not recognize explicitly (e.g. `.lua`,
+    // extensionless configs) and for Unity YAML assets whose structured parse
+    // failed above — show a streamed snippet instead of a metadata-only card.
+    if !is_known_binary_ext(&ext) && file_snippet_looks_textual(&canonical) {
+        let preview = read_text_snippet(&canonical)?;
+        return Ok(AssetPreviewPayload::Text(preview));
+    }
+
     // Binary / structured fallthrough.
     //
     // Slice 3b: try to render image/psd/model via the existing BinaryCache
@@ -2443,6 +2509,16 @@ mod tests {
                 false
             }
         }
+    }
+
+    #[test]
+    #[test]
+    fn text_language_for_ext_includes_common_workspace_text_types() {
+        assert_eq!(text_language_for_ext("lua"), Some("lua"));
+        assert_eq!(text_language_for_ext("meta"), Some("yaml"));
+        assert_eq!(text_language_for_ext("asmdef"), Some("json"));
+        assert_eq!(is_known_binary_ext("png"), true);
+        assert_eq!(is_known_binary_ext("lua"), false);
     }
 
     #[test]
@@ -2567,8 +2643,29 @@ mod tests {
         }
 
         let err = resolve_workspace_path(&workspace, "Docs/Secret.txt")
-            .expect_err("reject non-asset linked file");
-        assert_eq!(err.code, "asset.preview.invalid_root");
+            .expect_err("reject symlink that escapes workspace");
+        assert_eq!(err.code, "asset.preview.invalid_path");
+    }
+
+    #[test]
+    fn asset_preview_resolution_allows_workspace_relative_logs() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let workspace = temp.path().join("project");
+        std::fs::create_dir_all(workspace.join("Logs")).expect("create logs dir");
+        std::fs::write(
+            workspace.join("Logs/com.example.game.log"),
+            b"[info] ok\n",
+        )
+        .expect("write log file");
+
+        let (resolved, rel_path) =
+            resolve_workspace_path(&workspace, "Logs/com.example.game.log")
+                .expect("resolve log under workspace");
+        assert_eq!(rel_path, "Logs/com.example.game.log");
+        assert_eq!(
+            std::fs::read_to_string(resolved).expect("read resolved log"),
+            "[info] ok\n"
+        );
     }
 
     #[test]

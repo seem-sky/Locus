@@ -8,7 +8,10 @@ use tauri::{AppHandle, State};
 
 
 
-use crate::agentmemory::AgentMemoryState;
+use crate::agentmemory::{
+    AgentMemoryAction, AgentMemoryState, CreateAgentMemoryActionRequest,
+    UpdateAgentMemoryActionRequest,
+};
 
 use crate::commands::default_app_storage_dir;
 
@@ -940,111 +943,98 @@ pub async fn apply_memory_proposal(
 
     };
 
-    if proposal.status != KnowledgeProposalStatus::Pending {
-
-        return Err(format!(
-
-            "Memory proposal '{}' is not pending (current status: {:?})",
-
-            proposal_id, proposal.status
-
-        )
-
-        .into());
-
+    match proposal.status {
+        KnowledgeProposalStatus::Applied => return Ok(()),
+        KnowledgeProposalStatus::Pending => {}
+        KnowledgeProposalStatus::Applying => {
+            // Concurrent or repeated apply while the first call is still running.
+        }
+        other => {
+            return Err(format!(
+                "Memory proposal '{}' cannot be applied (current status: {:?})",
+                proposal_id, other
+            )
+            .into());
+        }
     }
 
-
-
-    if let Some(applying_message) = session_store.update_memory_proposal_status(
-
-        &session_id,
-
-        &proposal_id,
-
-        KnowledgeProposalStatus::Applying,
-
-    )? {
-
-        emit_memory_proposal_message(
-
-            &app_handle,
-
-            session_store.inner().as_ref(),
-
+    if proposal.status == KnowledgeProposalStatus::Pending {
+        if let Some(applying_message) = session_store.update_memory_proposal_status(
             &session_id,
-
-            applying_message,
-
-        );
-
-    }
-
-
-
-    let mut apply_error: Option<String> = None;
-
-    for item in &proposal.items {
-        if !crate::agentmemory::mapping::should_include_memory_content(&item.content) {
-            continue;
-        }
-
-        let entry = build_memory_entry_from_proposal_item(item, Some(session_id.clone()));
-
-        if let Err(error) =
-            apply_memory_entry(memory_store.inner(), &working_dir, None, entry, None)
-        {
-            apply_error = Some(error);
-            break;
+            &proposal_id,
+            KnowledgeProposalStatus::Applying,
+        )? {
+            emit_memory_proposal_message(
+                &app_handle,
+                session_store.inner().as_ref(),
+                &session_id,
+                applying_message,
+            );
         }
     }
 
+    let memory_store = memory_store.inner().clone();
+    let working_dir = working_dir.clone();
+    let session_id_for_apply = session_id.clone();
+    let proposal_items = proposal.items.clone();
 
+    let apply_error = run_memory_blocking(
+        "memory.apply_proposal.join_failed",
+        "Failed to apply memory proposal",
+        move || {
+            let mut error: Option<String> = None;
+            for item in &proposal_items {
+                if !crate::agentmemory::mapping::should_include_memory_content(&item.content) {
+                    continue;
+                }
+                let entry =
+                    build_memory_entry_from_proposal_item(item, Some(session_id_for_apply.clone()));
+                if let Err(err) =
+                    apply_memory_entry(memory_store.as_ref(), &working_dir, None, entry, None)
+                {
+                    error = Some(err);
+                    break;
+                }
+                if let Err(err) = memory_store.create_action_from_proposal_item(
+                    item,
+                    &working_dir,
+                    &session_id_for_apply,
+                ) {
+                    eprintln!(
+                        "[Locus] memory proposal saved but agentmemory action create failed: {}",
+                        err
+                    );
+                }
+            }
+            Ok(error)
+        },
+    )
+    .await?;
 
     let next_status = if apply_error.is_some() {
-
         KnowledgeProposalStatus::Pending
-
     } else {
-
         KnowledgeProposalStatus::Applied
-
     };
 
     if let Some(message) = session_store.update_memory_proposal_status(
-
         &session_id,
-
         &proposal_id,
-
         next_status,
-
     )? {
-
         emit_memory_proposal_message(
-
             &app_handle,
-
             session_store.inner().as_ref(),
-
             &session_id,
-
             message,
-
         );
-
     }
 
-
-
     if let Some(error) = apply_error {
-
         return Err(error.into());
-
     }
 
     Ok(())
-
 }
 
 
@@ -1081,6 +1071,206 @@ pub fn build_memory_proposal(items: Vec<MemoryProposalItem>, confidence: f32) ->
 
     }
 
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentMemoryActionListRequest {
+    pub working_dir: String,
+    pub status: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentMemoryActionCreateRequest {
+    pub working_dir: String,
+    pub title: String,
+    pub description: Option<String>,
+    pub priority: Option<i32>,
+    pub tags: Option<Vec<String>>,
+    pub parent_id: Option<String>,
+    pub requires: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentMemoryActionUpdateRequest {
+    pub working_dir: String,
+    pub action_id: String,
+    pub status: Option<String>,
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub priority: Option<i32>,
+    pub result: Option<String>,
+}
+
+#[tauri::command]
+pub async fn agentmemory_action_list(
+    store: State<'_, Arc<AgentMemoryState>>,
+    request: AgentMemoryActionListRequest,
+) -> Result<Vec<AgentMemoryAction>, AppError> {
+    let store = store.inner().clone();
+    let working_dir = request.working_dir;
+    let status = request.status;
+    run_memory_blocking(
+        "agentmemory.action_list.join_failed",
+        "Failed to list agentmemory actions",
+        move || store.list_actions(&working_dir, status.as_deref()),
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn agentmemory_action_create(
+    store: State<'_, Arc<AgentMemoryState>>,
+    request: AgentMemoryActionCreateRequest,
+) -> Result<AgentMemoryAction, AppError> {
+    let store = store.inner().clone();
+    let working_dir = request.working_dir.clone();
+    let project = crate::agentmemory::mapping::normalize_project_path(&working_dir);
+    let project = if project.is_empty() {
+        None
+    } else {
+        Some(project)
+    };
+    let create = CreateAgentMemoryActionRequest {
+        title: request.title,
+        description: request.description,
+        priority: request.priority,
+        project,
+        created_by: Some("locus".to_string()),
+        tags: request.tags.unwrap_or_default(),
+        parent_id: request.parent_id,
+        requires: request.requires.unwrap_or_default(),
+    };
+    run_memory_blocking(
+        "agentmemory.action_create.join_failed",
+        "Failed to create agentmemory action",
+        move || store.create_action(create),
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn agentmemory_action_update(
+    store: State<'_, Arc<AgentMemoryState>>,
+    request: AgentMemoryActionUpdateRequest,
+) -> Result<AgentMemoryAction, AppError> {
+    let store = store.inner().clone();
+    let update = UpdateAgentMemoryActionRequest {
+        action_id: request.action_id,
+        status: request.status,
+        title: request.title,
+        description: request.description,
+        priority: request.priority,
+        result: request.result,
+    };
+    run_memory_blocking(
+        "agentmemory.action_update.join_failed",
+        "Failed to update agentmemory action",
+        move || store.update_action(update),
+    )
+    .await
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AgentMemoryInsightsRequest {
+    #[serde(rename = "workingDir")]
+    pub working_dir: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AgentMemoryInsightsResponse {
+    pub sessions: serde_json::Value,
+    pub profile: Option<serde_json::Value>,
+    pub patterns: Option<serde_json::Value>,
+    pub graph_stats: Option<serde_json::Value>,
+    pub errors: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AgentMemoryConsolidateRequest {
+    pub tier: Option<String>,
+    pub force: Option<bool>,
+}
+
+#[tauri::command]
+pub async fn agentmemory_insights(
+    store: State<'_, Arc<AgentMemoryState>>,
+    request: AgentMemoryInsightsRequest,
+) -> Result<AgentMemoryInsightsResponse, AppError> {
+    let store = store.inner().clone();
+    let working_dir = request.working_dir;
+    run_memory_blocking(
+        "agentmemory.insights.join_failed",
+        "Failed to load agentmemory insights",
+        move || fetch_agentmemory_insights(&store, &working_dir),
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn agentmemory_consolidate(
+    store: State<'_, Arc<AgentMemoryState>>,
+    request: AgentMemoryConsolidateRequest,
+) -> Result<serde_json::Value, AppError> {
+    let store = store.inner().clone();
+    let tier = request.tier;
+    let force = request.force;
+    run_memory_blocking(
+        "agentmemory.consolidate.join_failed",
+        "Failed to run agentmemory consolidation",
+        move || store.run_consolidate(tier.as_deref(), force),
+    )
+    .await
+}
+
+fn fetch_agentmemory_insights(
+    store: &AgentMemoryState,
+    working_dir: &str,
+) -> Result<AgentMemoryInsightsResponse, String> {
+    store.ensure_ready()?;
+    let mut errors = Vec::new();
+
+    let sessions = match store.list_sessions() {
+        Ok(value) => value,
+        Err(error) => {
+            errors.push(format!("sessions: {error}"));
+            serde_json::json!({})
+        }
+    };
+
+    let profile = match store.fetch_profile(working_dir) {
+        Ok(value) => Some(value),
+        Err(error) => {
+            errors.push(format!("profile: {error}"));
+            None
+        }
+    };
+
+    let patterns = match store.fetch_patterns(working_dir) {
+        Ok(value) => Some(value),
+        Err(error) => {
+            errors.push(format!("patterns: {error}"));
+            None
+        }
+    };
+
+    let graph_stats = match store.fetch_graph_stats() {
+        Ok(value) => Some(value),
+        Err(error) => {
+            errors.push(format!("graph: {error}"));
+            None
+        }
+    };
+
+    Ok(AgentMemoryInsightsResponse {
+        sessions,
+        profile,
+        patterns,
+        graph_stats,
+        errors,
+    })
 }
 
 

@@ -1,6 +1,8 @@
 <script setup lang="ts">
 import { computed } from "vue";
 import { t } from "../../i18n";
+import type { WorkflowToolWhitelistPayload } from "../../services/permissions";
+import BaseButton from "../ui/BaseButton.vue";
 import BaseSegmented from "../ui/BaseSegmented.vue";
 
 type ToolMode = "auto" | "ask";
@@ -21,6 +23,9 @@ const props = defineProps<{
   fileWorkspaceBoundaryEnabled: boolean;
   fileWorkspaceBoundaryReady: boolean;
   fileWorkspaceBoundaryBusy: boolean;
+  workflowToolWhitelist: WorkflowToolWhitelistPayload;
+  workflowWhitelistReady: boolean;
+  workflowWhitelistBusy: boolean;
   permSaveMsg: string;
 }>();
 
@@ -28,6 +33,9 @@ const emit = defineEmits<{
   setGlobalPermissionMode: [mode: ToolMode];
   setPermission: [name: string, mode: ToolMode];
   setFileWorkspaceBoundary: [value: boolean];
+  removeWorkflowWhitelistTool: [name: string];
+  removeWorkflowWhitelistBash: [command: string];
+  clearWorkflowToolWhitelist: [];
 }>();
 
 const permissionOptions = [
@@ -50,6 +58,12 @@ const fileBoundaryOptions = computed(() => [
 
 const fileBoundaryMode = computed<FileBoundaryMode>(() =>
   props.fileWorkspaceBoundaryEnabled ? "workspace" : "all",
+);
+
+const workflowWhitelistEmpty = computed(
+  () =>
+    props.workflowToolWhitelist.tools.length === 0
+    && props.workflowToolWhitelist.bashCommands.length === 0,
 );
 
 function getToolMode(name: string): ToolMode {
@@ -141,6 +155,75 @@ function setFileBoundaryMode(mode: string) {
             </div>
           </div>
         </div>
+      </div>
+
+      <div class="perm-panel">
+        <div class="perm-panel-heading perm-panel-heading-with-action">
+          <div>
+            <div class="perm-panel-title">{{ t("settings.perms.workflowWhitelistTitle") }}</div>
+            <div class="perm-panel-desc">{{ t("settings.perms.workflowWhitelistDesc") }}</div>
+          </div>
+          <BaseButton
+            v-if="workflowWhitelistReady && !workflowWhitelistEmpty"
+            class="perm-whitelist-clear"
+            size="sm"
+            :disabled="workflowWhitelistBusy"
+            @click="emit('clearWorkflowToolWhitelist')"
+          >
+            {{ t("settings.perms.workflowWhitelistClearAll") }}
+          </BaseButton>
+        </div>
+
+        <div v-if="!workflowWhitelistReady" class="perm-whitelist-loading">
+          {{ t("settings.perms.workflowWhitelistLoading") }}
+        </div>
+        <div v-else-if="workflowWhitelistEmpty" class="perm-whitelist-empty">
+          {{ t("settings.perms.workflowWhitelistEmpty") }}
+        </div>
+        <template v-else>
+          <div v-if="workflowToolWhitelist.tools.length > 0" class="perm-whitelist-group">
+            <div class="perm-whitelist-group-label">{{ t("settings.perms.workflowWhitelistTools") }}</div>
+            <ul class="perm-whitelist-list">
+              <li
+                v-for="toolName in workflowToolWhitelist.tools"
+                :key="`tool:${toolName}`"
+                class="perm-whitelist-item"
+              >
+                <code class="perm-whitelist-value">{{ toolName }}</code>
+                <BaseButton
+                  class="perm-whitelist-remove"
+                  size="sm"
+                  :disabled="workflowWhitelistBusy"
+                  :aria-label="t('settings.perms.workflowWhitelistRemoveTool', toolName)"
+                  @click="emit('removeWorkflowWhitelistTool', toolName)"
+                >
+                  {{ t("settings.perms.workflowWhitelistRemove") }}
+                </BaseButton>
+              </li>
+            </ul>
+          </div>
+          <div v-if="workflowToolWhitelist.bashCommands.length > 0" class="perm-whitelist-group">
+            <div class="perm-whitelist-group-label">{{ t("settings.perms.workflowWhitelistBash") }}</div>
+            <ul class="perm-whitelist-list">
+              <li
+                v-for="command in workflowToolWhitelist.bashCommands"
+                :key="`bash:${command}`"
+                class="perm-whitelist-item"
+              >
+                <code class="perm-whitelist-value">{{ command }}</code>
+                <BaseButton
+                  class="perm-whitelist-remove"
+                  size="sm"
+                  :disabled="workflowWhitelistBusy"
+                  :aria-label="t('settings.perms.workflowWhitelistRemoveBash', command)"
+                  @click="emit('removeWorkflowWhitelistBash', command)"
+                >
+                  {{ t("settings.perms.workflowWhitelistRemove") }}
+                </BaseButton>
+              </li>
+            </ul>
+          </div>
+        </template>
       </div>
 
       <div class="perm-panel">
@@ -354,6 +437,72 @@ function setFileBoundaryMode(mode: string) {
 
 .perm-boundary-control {
   width: 132px;
+}
+
+.perm-panel-heading-with-action {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.perm-whitelist-clear {
+  flex-shrink: 0;
+}
+
+.perm-whitelist-loading,
+.perm-whitelist-empty {
+  padding: 14px 16px;
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--text-secondary);
+}
+
+.perm-whitelist-group {
+  border-top: 1px solid var(--border-color);
+}
+
+.perm-whitelist-group-label {
+  padding: 10px 16px 6px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-secondary);
+}
+
+.perm-whitelist-list {
+  margin: 0;
+  padding: 0 16px 12px;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.perm-whitelist-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: start;
+  padding: 8px 10px;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--panel-bg) 90%, var(--sidebar-bg) 10%);
+}
+
+.perm-whitelist-value {
+  display: block;
+  min-width: 0;
+  font-size: 12px;
+  line-height: 1.45;
+  word-break: break-word;
+  white-space: pre-wrap;
+  color: var(--text-color);
+}
+
+.perm-whitelist-remove {
+  flex-shrink: 0;
 }
 
 @media (max-width: 860px) {

@@ -783,7 +783,9 @@ struct AgentSkillListArgs {
 }
 
 enum ToolConfirmDecision {
-    Allow,
+    Allow {
+        workflow_whitelist: bool,
+    },
     Deny { feedback: Option<String> },
 }
 
@@ -2429,6 +2431,44 @@ impl AgentInstance {
         Self::has_selected_working_dir_value(&self.working_dir)
     }
 
+    async fn spawn_agentmemory_observe_tool_use(
+        &self,
+        app_handle: &AppHandle,
+        tool_name: &str,
+        tool_input: &serde_json::Value,
+        tool_output: &str,
+        is_error: bool,
+    ) {
+        if !self.has_selected_working_dir() {
+            return;
+        }
+        let memory_store: tauri::State<'_, std::sync::Arc<crate::agentmemory::AgentMemoryState>> =
+            app_handle.state();
+        let memory_store = memory_store.inner().clone();
+        let session_id = self.session_id.clone();
+        let working_dir = self.working_dir.clone();
+        let tool_name = tool_name.to_string();
+        let tool_input = tool_input.clone();
+        let tool_output = tool_output.to_string();
+        if let Err(error) = tauri::async_runtime::spawn_blocking(move || {
+            memory_store.observe_tool_use(
+                &session_id,
+                &working_dir,
+                &tool_name,
+                &tool_input,
+                &tool_output,
+                is_error,
+            );
+        })
+        .await
+        {
+            eprintln!(
+                "[Agent {}] agentmemory observe_tool_use join failed for session {}: {}",
+                self.id, self.session_id, error
+            );
+        }
+    }
+
     fn knowledge_semantic_search_enabled(&self) -> bool {
         if !self.has_selected_working_dir() {
             return false;
@@ -3003,6 +3043,54 @@ impl AgentInstance {
         self.partial_assistant.clone()
     }
 
+    async fn fetch_agentmemory_enrich_prefix(
+        &self,
+        app_handle: &AppHandle,
+        tool_name: &str,
+        args: &serde_json::Value,
+    ) -> Option<String> {
+        if !self.has_selected_working_dir() {
+            return None;
+        }
+        let memory_store: tauri::State<
+            '_,
+            std::sync::Arc<crate::agentmemory::AgentMemoryState>,
+        > = app_handle.state();
+        let memory_store = memory_store.inner().clone();
+        let session_id = self.session_id.clone();
+        let working_dir = self.working_dir.clone();
+        let tool_name = tool_name.to_string();
+        let args = args.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            memory_store.fetch_enrich_context(&session_id, &working_dir, &tool_name, &args)
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
+    async fn prepend_agentmemory_enrich_context(
+        &self,
+        app_handle: &AppHandle,
+        tool_name: &str,
+        args: &serde_json::Value,
+        result: &mut ExecutedToolResult,
+    ) {
+        if result.is_error {
+            return;
+        }
+        let Some(context) = self
+            .fetch_agentmemory_enrich_prefix(app_handle, tool_name, args)
+            .await
+        else {
+            return;
+        };
+        if context.trim().is_empty() {
+            return;
+        }
+        result.output = format!("{context}\n\n{}", result.output);
+    }
+
     async fn build_tool_execution_context(
         &self,
         app_handle: &AppHandle,
@@ -3021,6 +3109,7 @@ impl AgentInstance {
             } else {
                 None
             },
+            session_id: Some(self.session_id.clone()),
             unity_connected,
             runtime_state: Some(self.tool_runtime_state.clone()),
             execution_meta_sink: Some(Arc::new(Mutex::new(None))),
@@ -6107,6 +6196,24 @@ impl AgentInstance {
 
         let boundary_idx = compact_plan.boundary_idx;
         let mut summary = compact::extract_summary(&summary_response.text);
+        if self.has_selected_working_dir() {
+            let memory_store: tauri::State<
+                '_,
+                std::sync::Arc<crate::agentmemory::AgentMemoryState>,
+            > = app_handle.state();
+            let memory_store = memory_store.inner().clone();
+            let session_id = self.session_id.clone();
+            let working_dir = self.working_dir.clone();
+            if let Ok(Some(context)) = tauri::async_runtime::spawn_blocking(move || {
+                memory_store.fetch_compact_context(&session_id, &working_dir, 1500)
+            })
+            .await
+            {
+                if !context.trim().is_empty() {
+                    summary = format!("{context}\n\n{summary}");
+                }
+            }
+        }
         if !compact::is_valid_compact_summary(&summary) {
             eprintln!(
                 "[Agent {}] compact returned invalid summary, using emergency compact: summary_len={}",
@@ -6919,6 +7026,25 @@ impl AgentInstance {
                 "clearPendingKnowledgeProposal",
                 clear_started_at,
             );
+            if self.has_selected_working_dir() {
+                let memory_store: tauri::State<
+                    '_,
+                    std::sync::Arc<crate::agentmemory::AgentMemoryState>,
+                > = app_handle.state();
+                let memory_store = memory_store.inner().clone();
+                let session_id = self.session_id.clone();
+                let working_dir = self.working_dir.clone();
+                let title = user_text.trim().to_string();
+                let title_opt = if title.is_empty() { None } else { Some(title) };
+                let _ = tauri::async_runtime::spawn_blocking(move || {
+                    memory_store.ensure_session_started(
+                        &session_id,
+                        &working_dir,
+                        title_opt.as_deref(),
+                    )
+                })
+                .await;
+            }
             let run_result: Result<String, String> = async {
         // Notify frontend of the new run_id
         eprintln!(
@@ -7140,6 +7266,20 @@ impl AgentInstance {
             session_id: self.session_id.clone(),
             message: current_user_message,
         });
+        if self.has_selected_working_dir() {
+            let memory_store: tauri::State<
+                '_,
+                std::sync::Arc<crate::agentmemory::AgentMemoryState>,
+            > = app_handle.state();
+            let memory_store = memory_store.inner().clone();
+            let session_id = self.session_id.clone();
+            let working_dir = self.working_dir.clone();
+            let prompt = actual_user_text.clone();
+            let _ = tauri::async_runtime::spawn_blocking(move || {
+                memory_store.observe_user_prompt(&session_id, &working_dir, &prompt);
+            })
+            .await;
+        }
         if let Some(pending_input_id) = accepted_pending_input_id.as_deref() {
             emit_stream(app_handle, &run_id, StreamEvent::PendingInputAccepted {
                 session_id: self.session_id.clone(),
@@ -8020,12 +8160,21 @@ impl AgentInstance {
                         match undo_mgr.before_round(&self.working_dir, "agent round").await {
                             Ok(cp) => cp,
                             Err(e) => {
-                                eprintln!("[Agent {}] undo checkpoint failed: {}", self.id, e);
+                                tracing::warn!(
+                                    log_module = "Locus",
+                                    agent_id = %self.id,
+                                    "Undo checkpoint unavailable (round continues): {}",
+                                    e
+                                );
                                 let lower = e.to_ascii_lowercase();
                                 let message = if lower.contains("unable to index file 'nul'")
                                     || lower.contains("short read while indexing nul")
                                 {
                                     "Undo is unavailable for this round because Git could not snapshot the workspace. Remove or rename reserved Windows file names such as NUL in the repository."
+                                } else if lower.contains("not a git repository")
+                                    || lower.contains("not inside a working tree")
+                                {
+                                    "Undo is unavailable for this round: the workspace is not a Git repository."
                                 } else {
                                     "Undo may be unavailable for this round because the workspace snapshot failed."
                                 };
@@ -8059,6 +8208,32 @@ impl AgentInstance {
                             "[Agent {}] failed to begin Unity edit session for {}: {}",
                             self.id, self.session_id, e
                         ),
+                    }
+                }
+
+                if self.has_selected_working_dir() {
+                    let memory_store: tauri::State<
+                        '_,
+                        std::sync::Arc<crate::agentmemory::AgentMemoryState>,
+                    > = app_handle.state();
+                    let memory_store = memory_store.inner().clone();
+                    let session_id = self.session_id.clone();
+                    let working_dir = self.working_dir.clone();
+                    for (tc, args) in &prepared {
+                        let memory_store = memory_store.clone();
+                        let session_id = session_id.clone();
+                        let working_dir = working_dir.clone();
+                        let tool_name = tc.name.clone();
+                        let tool_input = args.clone();
+                        let _ = tauri::async_runtime::spawn_blocking(move || {
+                            memory_store.observe_pre_tool_use(
+                                &session_id,
+                                &working_dir,
+                                &tool_name,
+                                &tool_input,
+                            );
+                        })
+                        .await;
                     }
                 }
 
@@ -8169,46 +8344,26 @@ impl AgentInstance {
                         stored_output.len()
                     );
 
-                    match store.add_tool_result_with_images_for_run(
+                    let save_result = store.add_tool_result_with_images_for_run(
                         &self.session_id,
                         &run_id,
                         &tc.id,
                         &stored_output,
                         result.images.as_deref(),
-                    ) {
-                        Ok(Some(_)) => {
-                            let memory_store: tauri::State<
-                                '_,
-                                std::sync::Arc<crate::agentmemory::AgentMemoryState>,
-                            > = app_handle.state();
-                            let memory_store = memory_store.inner().clone();
-                            let session_id = self.session_id.clone();
-                            let working_dir = self.working_dir.clone();
-                            let tool_name = tc.name.clone();
-                            let tool_input = args.clone();
-                            let tool_output = stored_output.clone();
-                            let is_error = result.is_error;
-                            if let Err(error) = tauri::async_runtime::spawn_blocking(move || {
-                                memory_store.observe_tool_use(
-                                    &session_id,
-                                    &working_dir,
-                                    &tool_name,
-                                    &tool_input,
-                                    &tool_output,
-                                    is_error,
-                                );
-                            })
-                            .await
-                            {
-                                eprintln!(
-                                    "[Agent {}] agentmemory observe_tool_use join failed for session {}: {}",
-                                    self.id, self.session_id, error
-                                );
-                            }
-                        }
+                    );
+                    self.spawn_agentmemory_observe_tool_use(
+                        app_handle,
+                        &tc.name,
+                        args,
+                        &stored_output,
+                        result.is_error,
+                    )
+                    .await;
+                    match save_result {
+                        Ok(Some(_)) => {}
                         Ok(None) => {
                             eprintln!(
-                                "[Agent {}] discarding stale tool result before save: session={} run={} tool_call_id={}",
+                                "[Agent {}] discarding stale tool result before save: session={} run={} tool_call_id={} (agentmemory post_tool still recorded)",
                                 self.id, self.session_id, run_id, tc.id
                             );
                             return Ok(String::new());
@@ -8711,8 +8866,9 @@ impl AgentInstance {
                 app_handle.state();
             let memory_store = memory_store.inner().clone();
             let session_id = self.session_id.clone();
+            let working_dir = self.working_dir.clone();
             match tauri::async_runtime::spawn_blocking(move || {
-                memory_store.session_end(&session_id)
+                memory_store.session_end(&session_id, Some(&working_dir))
             })
             .await
             {
@@ -8970,6 +9126,7 @@ impl AgentInstance {
         arguments: &str,
         knowledge_preview: Option<KnowledgeToolConfirmPreview>,
         workflow_note: Option<String>,
+        workflow_whitelist_offered: bool,
     ) -> ToolConfirmDisplay {
         match knowledge_preview {
             Some(preview) => ToolConfirmDisplay::Knowledge(preview),
@@ -8977,6 +9134,7 @@ impl AgentInstance {
                 tool_name: tool_name.to_string(),
                 arguments: arguments.to_string(),
                 workflow_note,
+                workflow_whitelist_offered,
             }),
         }
     }
@@ -9019,6 +9177,8 @@ impl AgentInstance {
         } else {
             Some(workflow_notes.join("\n\n"))
         };
+        let workflow_whitelist_offered = workflow_ambiguous_requires_confirm
+            && !(tool_name == "bash" && bash_rm_requires_confirm);
 
         ToolConfirmAssessment {
             reasons,
@@ -9027,13 +9187,29 @@ impl AgentInstance {
                 arguments,
                 knowledge_preview,
                 workflow_note,
+                workflow_whitelist_offered,
             ),
         }
     }
 
+    async fn persist_workflow_tool_whitelist(
+        app_handle: &AppHandle,
+        tool_name: &str,
+        args: &serde_json::Value,
+    ) -> Result<(), String> {
+        let data_dir = crate::commands::resolve_runtime_storage_dir(app_handle)
+            .map_err(|e| format!("Failed to get data dir: {}", e))?;
+        let state: tauri::State<crate::WorkflowToolWhitelist> = app_handle.state();
+        let mut whitelist = state.0.write().await;
+        whitelist.add(tool_name, args);
+        whitelist.save_to_dir(&data_dir)
+    }
+
     fn parse_tool_confirm_answer(answer: &str) -> ToolConfirmDecision {
-        if answer == "allow" {
-            return ToolConfirmDecision::Allow;
+        if answer == "allow" || answer == "allow:whitelist" {
+            return ToolConfirmDecision::Allow {
+                workflow_whitelist: answer == "allow:whitelist",
+            };
         }
         if answer == "deny" {
             return ToolConfirmDecision::Deny { feedback: None };
@@ -9109,11 +9285,20 @@ impl AgentInstance {
             );
         drop(perms);
 
+        let workflow_whitelist = {
+            let state: tauri::State<crate::WorkflowToolWhitelist> = app_handle.state();
+            let guard = state.0.read().await;
+            guard.clone()
+        };
+
         let workflow_ambiguous_requires_confirm = WorkflowGate::applies(&self.def.id, mode)
             && self
                 .with_dev_workflow_gate(mode, |gate| {
                     Some(crate::agent::workflow::workflow_ambiguous_tool_requires_user_confirm(
-                        gate, tool_name, args,
+                        gate,
+                        tool_name,
+                        args,
+                        &workflow_whitelist,
                     ))
                 })
                 .flatten()
@@ -9130,7 +9315,9 @@ impl AgentInstance {
                 "[Agent {}] tool confirm skipped for '{}' (global_mode=auto)",
                 self.id, tool_name
             );
-            return ToolConfirmDecision::Allow;
+            return ToolConfirmDecision::Allow {
+                workflow_whitelist: false,
+            };
         }
 
         let assessment = Self::assess_tool_confirmation(
@@ -9149,7 +9336,9 @@ impl AgentInstance {
                 "[Agent {}] tool confirm skipped for '{}' (global_mode='{}', tool_mode={:?})",
                 self.id, tool_name, global_mode, tool_mode
             );
-            return ToolConfirmDecision::Allow;
+            return ToolConfirmDecision::Allow {
+                workflow_whitelist: false,
+            };
         }
 
         eprintln!(
@@ -9199,8 +9388,26 @@ impl AgentInstance {
         match answer_result {
             Some(Ok(answer)) => {
                 let decision = Self::parse_tool_confirm_answer(&answer);
+                if let ToolConfirmDecision::Allow {
+                    workflow_whitelist: true,
+                } = &decision
+                {
+                    if let Err(error) =
+                        Self::persist_workflow_tool_whitelist(app_handle, tool_name, args).await
+                    {
+                        eprintln!(
+                            "[Agent {}] failed to persist workflow tool whitelist for '{}': {}",
+                            self.id, tool_name, error
+                        );
+                    }
+                }
                 let status = match &decision {
-                    ToolConfirmDecision::Allow => "allowed".to_string(),
+                    ToolConfirmDecision::Allow {
+                        workflow_whitelist: true,
+                    } => "allowed (workflow whitelist)".to_string(),
+                    ToolConfirmDecision::Allow {
+                        workflow_whitelist: false,
+                    } => "allowed".to_string(),
                     ToolConfirmDecision::Deny {
                         feedback: Some(feedback),
                     } => format!("rejected with feedback: {}", feedback),
@@ -9256,7 +9463,9 @@ impl AgentInstance {
                 "[Agent {}] {} status change confirm skipped (permission behavior=auto)",
                 self.id, tool_name
             );
-            return ToolConfirmDecision::Allow;
+            return ToolConfirmDecision::Allow {
+                workflow_whitelist: false,
+            };
         }
 
         let question_id = uuid::Uuid::new_v4().to_string();
@@ -9308,7 +9517,7 @@ impl AgentInstance {
             Some(Ok(answer)) => {
                 let decision = Self::parse_tool_confirm_answer(&answer);
                 let status = match &decision {
-                    ToolConfirmDecision::Allow => "allowed".to_string(),
+                    ToolConfirmDecision::Allow { .. } => "allowed".to_string(),
                     ToolConfirmDecision::Deny {
                         feedback: Some(feedback),
                     } => format!("rejected with feedback: {}", feedback),
@@ -9542,7 +9751,7 @@ impl AgentInstance {
             .request_tool_confirm(app_handle, &tc.id, &tc.name, &tc.arguments, args, run_id, mode)
             .await
         {
-            ToolConfirmDecision::Allow => {}
+            ToolConfirmDecision::Allow { .. } => {}
             ToolConfirmDecision::Deny { feedback } => {
                 if self.is_cancel_requested() {
                     return Self::interrupted_tool_result();
@@ -9562,8 +9771,12 @@ impl AgentInstance {
         }
 
         if tc.name == "read" {
-            self.await_executed_tool_result(self.execute_read(app_handle, args))
-                .await
+            let mut result = self
+                .await_executed_tool_result(self.execute_read(app_handle, args))
+                .await;
+            self.prepend_agentmemory_enrich_context(app_handle, &tc.name, args, &mut result)
+                .await;
+            return result;
         } else if tc.name == "task" {
             self.await_executed_tool_result(
                 self.execute_task(app_handle, store, args, &tc.id, run_id, mode),
@@ -9710,6 +9923,9 @@ impl AgentInstance {
                     }
                 }
             }
+
+            self.prepend_agentmemory_enrich_context(app_handle, &tc.name, args, &mut result)
+                .await;
 
             result
         }
@@ -11400,7 +11616,7 @@ impl AgentInstance {
                 )
                 .await
             {
-                ToolConfirmDecision::Allow => {}
+                ToolConfirmDecision::Allow { .. } => {}
                 ToolConfirmDecision::Deny { feedback } => {
                     if self.is_cancel_requested() {
                         return Self::interrupted_tool_result();
@@ -11547,7 +11763,7 @@ impl AgentInstance {
                 )
                 .await
             {
-                ToolConfirmDecision::Allow => {}
+                ToolConfirmDecision::Allow { .. } => {}
                 ToolConfirmDecision::Deny { feedback } => {
                     let is_error = feedback.is_some();
                     let output = match feedback {
@@ -11693,7 +11909,7 @@ impl AgentInstance {
                 )
                 .await
             {
-                ToolConfirmDecision::Allow => {}
+                ToolConfirmDecision::Allow { .. } => {}
                 ToolConfirmDecision::Deny { feedback } => {
                     let output = match feedback {
                         Some(feedback) => format!(

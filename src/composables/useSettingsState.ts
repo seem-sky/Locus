@@ -38,8 +38,11 @@ import {
 import {
   getFileToolWorkspaceBoundary,
   getToolPermissions,
+  getWorkflowToolWhitelist,
   setFileToolWorkspaceBoundary,
   saveToolPermissions as serviceSaveToolPermissions,
+  saveWorkflowToolWhitelist,
+  type WorkflowToolWhitelistPayload,
 } from "../services/permissions";
 import {
   customEndpointTestStatusForReply,
@@ -821,6 +824,12 @@ export function useSettingsState(emit: SettingsEmit) {
   ]);
 
   const toolPermissions = ref<Record<string, "auto" | "ask">>({});
+  const workflowToolWhitelist = ref<WorkflowToolWhitelistPayload>({
+    tools: [],
+    bashCommands: [],
+  });
+  const workflowWhitelistReady = ref(false);
+  const workflowWhitelistBusy = ref(false);
 
   function getToolMode(name: string): "auto" | "ask" {
     return toolPermissions.value[name] ?? (permissionList.value.find(item => item.name === name)?.defaultMode ?? "ask");
@@ -835,6 +844,110 @@ export function useSettingsState(emit: SettingsEmit) {
       }
       toolPermissions.value = normalized;
     } catch { /* use defaults */ }
+  }
+
+  function normalizeWorkflowWhitelistPayload(
+    payload: WorkflowToolWhitelistPayload,
+  ): WorkflowToolWhitelistPayload {
+    return {
+      tools: [...payload.tools].sort(),
+      bashCommands: [...payload.bashCommands].sort(),
+    };
+  }
+
+  async function loadWorkflowToolWhitelist() {
+    try {
+      const payload = await getWorkflowToolWhitelist();
+      workflowToolWhitelist.value = normalizeWorkflowWhitelistPayload(payload);
+      setWarmup("settings:workflowToolWhitelist", workflowToolWhitelist.value);
+    } catch {
+      workflowToolWhitelist.value = { tools: [], bashCommands: [] };
+    } finally {
+      workflowWhitelistReady.value = true;
+    }
+  }
+
+  async function persistWorkflowToolWhitelist() {
+    const payload = normalizeWorkflowWhitelistPayload(workflowToolWhitelist.value);
+    workflowToolWhitelist.value = payload;
+    await saveWorkflowToolWhitelist(payload);
+    setWarmup("settings:workflowToolWhitelist", payload);
+    permSaveMsg.value = t("settings.perms.saved");
+    if (permSaveTimer) clearTimeout(permSaveTimer);
+    permSaveTimer = setTimeout(() => {
+      permSaveMsg.value = "";
+      permSaveTimer = null;
+    }, 2000);
+  }
+
+  async function removeWorkflowWhitelistTool(name: string) {
+    if (workflowWhitelistBusy.value) return;
+    const previous = workflowToolWhitelist.value;
+    const nextTools = previous.tools.filter((entry) => entry !== name);
+    if (nextTools.length === previous.tools.length) return;
+    workflowToolWhitelist.value = { ...previous, tools: nextTools };
+    workflowWhitelistBusy.value = true;
+    try {
+      await persistWorkflowToolWhitelist();
+    } catch (e) {
+      workflowToolWhitelist.value = previous;
+      const err = normalizeAppError(e);
+      useNotificationStore().addNotice(
+        "error",
+        t("settings.perms.workflowWhitelistSaveFailed", err.message),
+        { code: err.code, operation: "saveWorkflowToolWhitelist" },
+      );
+    } finally {
+      workflowWhitelistBusy.value = false;
+    }
+  }
+
+  async function removeWorkflowWhitelistBashCommand(command: string) {
+    if (workflowWhitelistBusy.value) return;
+    const previous = workflowToolWhitelist.value;
+    const nextCommands = previous.bashCommands.filter((entry) => entry !== command);
+    if (nextCommands.length === previous.bashCommands.length) return;
+    workflowToolWhitelist.value = { ...previous, bashCommands: nextCommands };
+    workflowWhitelistBusy.value = true;
+    try {
+      await persistWorkflowToolWhitelist();
+    } catch (e) {
+      workflowToolWhitelist.value = previous;
+      const err = normalizeAppError(e);
+      useNotificationStore().addNotice(
+        "error",
+        t("settings.perms.workflowWhitelistSaveFailed", err.message),
+        { code: err.code, operation: "saveWorkflowToolWhitelist" },
+      );
+    } finally {
+      workflowWhitelistBusy.value = false;
+    }
+  }
+
+  async function clearWorkflowToolWhitelist() {
+    if (workflowWhitelistBusy.value) return;
+    if (
+      workflowToolWhitelist.value.tools.length === 0
+      && workflowToolWhitelist.value.bashCommands.length === 0
+    ) {
+      return;
+    }
+    const previous = workflowToolWhitelist.value;
+    workflowToolWhitelist.value = { tools: [], bashCommands: [] };
+    workflowWhitelistBusy.value = true;
+    try {
+      await persistWorkflowToolWhitelist();
+    } catch (e) {
+      workflowToolWhitelist.value = previous;
+      const err = normalizeAppError(e);
+      useNotificationStore().addNotice(
+        "error",
+        t("settings.perms.workflowWhitelistSaveFailed", err.message),
+        { code: err.code, operation: "saveWorkflowToolWhitelist" },
+      );
+    } finally {
+      workflowWhitelistBusy.value = false;
+    }
   }
 
   async function loadFileToolWorkspaceBoundary() {
@@ -1144,6 +1257,9 @@ export function useSettingsState(emit: SettingsEmit) {
     const cachedCodex = getWarmup<RemoteCodexStatus>("settings:codexStatus");
     const cachedDefaults = getWarmup<ModelDefaults>("settings:modelDefaults");
     const cachedPerms = getWarmup<Record<string, string>>("settings:toolPermissions");
+    const cachedWorkflowWhitelist = getWarmup<WorkflowToolWhitelistPayload>(
+      "settings:workflowToolWhitelist",
+    );
     const cachedEndpoints = getWarmup<CustomEndpoint[]>("settings:customEndpoints");
 
     if (cachedProviders) providers.value = cachedProviders;
@@ -1170,6 +1286,13 @@ export function useSettingsState(emit: SettingsEmit) {
       await loadToolPermissions();
     }
     await loadFileToolWorkspaceBoundary();
+
+    if (cachedWorkflowWhitelist) {
+      workflowToolWhitelist.value = normalizeWorkflowWhitelistPayload(cachedWorkflowWhitelist);
+      workflowWhitelistReady.value = true;
+    } else {
+      await loadWorkflowToolWhitelist();
+    }
 
     if (cachedEndpoints) customEndpoints.value = cachedEndpoints.map(normalizeCustomEndpoint);
     else await loadCustomEndpoints();
@@ -1266,6 +1389,13 @@ export function useSettingsState(emit: SettingsEmit) {
     toggleToolPermission,
     saveToolPermissions,
     getToolMode,
+    workflowToolWhitelist,
+    workflowWhitelistReady,
+    workflowWhitelistBusy,
+    loadWorkflowToolWhitelist,
+    removeWorkflowWhitelistTool,
+    removeWorkflowWhitelistBashCommand,
+    clearWorkflowToolWhitelist,
 
     // custom endpoints
     customEndpoints,

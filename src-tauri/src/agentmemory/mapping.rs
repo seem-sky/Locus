@@ -6,32 +6,237 @@ const SCOPE_PREFIX: &str = "locus-scope:";
 const CATEGORY_PREFIX: &str = "locus-category:";
 const PINNED_TAG: &str = "locus:pinned";
 
-/// Claude Code / agentmemory hook names — not user-facing memory content.
+/// Hook labels / titles from observations — not user-facing memory content.
 const OBSERVATION_HOOK_MARKERS: &[&str] = &[
     "UserPromptSubmit",
+    "prompt_submit",
     "PostToolUse",
+    "post_tool_use",
     "PostToolUseFailure",
+    "post_tool_failure",
     "PreToolUse",
+    "pre_tool_use",
     "SessionStart",
+    "session_start",
     "SessionEnd",
+    "session_end",
     "Stop",
+    "stop",
     "SubagentStop",
+    "subagent_stop",
     "Notification",
+    "notification",
     "PermissionRequest",
+    "permission_request",
 ];
+
+/// LLM-compressed hook lifecycle narratives — not user-facing memory content.
+const OBSERVATION_HOOK_NARRATIVE_MARKERS: &[&str] = &[
+    "pre-tool-use hook",
+    "pre_tool_use hook",
+    "post-tool-use failure hook",
+    "post_tool_failure hook",
+    "posttoolusefailure hook",
+    "post tool use failure hook",
+    "hook fired with no tool",
+    "hook triggered with no",
+    "hook triggered",
+    "hook fired",
+    "with no details",
+    "no details provided",
+    "no tool call content or payload",
+    "hook lifecycle event",
+    "observation payload",
+    "pre-compact hook",
+    "pre_compact hook",
+    "recurring error:",
+];
+
+const OBSERVE_TOOL_OUTPUT_MAX_CHARS: usize = 8_000;
+
+pub fn enrich_targets_for_tool(
+    tool_name: &str,
+    tool_input: &serde_json::Value,
+) -> (Vec<String>, Vec<String>) {
+    let normalized = tool_name.trim().to_ascii_lowercase();
+    let enrichable = matches!(
+        normalized.as_str(),
+        "read" | "write" | "edit" | "grep" | "list" | "glob"
+    );
+    if !enrichable {
+        return (Vec::new(), Vec::new());
+    }
+
+    let mut files = Vec::new();
+    let mut terms = Vec::new();
+    let file_keys = if normalized == "grep" {
+        &["path", "file"][..]
+    } else {
+        &["filePath", "file_path", "path", "file", "pattern"][..]
+    };
+    for key in file_keys {
+        if let Some(value) = tool_input.get(*key).and_then(|v| v.as_str()) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                files.push(trimmed.to_string());
+            }
+        }
+    }
+    if normalized == "grep" || normalized == "glob" {
+        if let Some(pattern) = tool_input.get("pattern").and_then(|v| v.as_str()) {
+            let trimmed = pattern.trim();
+            if !trimmed.is_empty() {
+                terms.push(trimmed.to_string());
+            }
+        }
+    }
+    (files, terms)
+}
+
+pub fn extract_smart_search_result_content(result: &serde_json::Value) -> Option<String> {
+    if let Some(content) = extract_search_result_content(result) {
+        return Some(content);
+    }
+    let title = result.get("title").and_then(|v| v.as_str()).unwrap_or("").trim();
+    if should_include_memory_content(title) {
+        return Some(title.to_string());
+    }
+    None
+}
+
+pub fn observe_tool_payload(
+    tool_name: &str,
+    tool_input: &serde_json::Value,
+    tool_output: &str,
+    is_error: bool,
+) -> (&'static str, serde_json::Value) {
+    let tool_input = tool_input.clone();
+    let output = truncate_observe_text(tool_output, OBSERVE_TOOL_OUTPUT_MAX_CHARS);
+    if is_error {
+        (
+            "post_tool_failure",
+            serde_json::json!({
+                "tool_name": tool_name,
+                "tool_input": tool_input,
+                "error": output,
+            }),
+        )
+    } else {
+        (
+            "post_tool_use",
+            serde_json::json!({
+                "tool_name": tool_name,
+                "tool_input": tool_input,
+                "tool_output": output,
+            }),
+        )
+    }
+}
+
+fn truncate_observe_text(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    let truncated: String = value.chars().take(max_chars).collect();
+    format!("{truncated}\n[...truncated]")
+}
 
 pub fn is_observation_hook_noise(value: &str) -> bool {
     let trimmed = value.trim();
     if trimmed.is_empty() {
         return true;
     }
-    OBSERVATION_HOOK_MARKERS
+    if OBSERVATION_HOOK_MARKERS
         .iter()
         .any(|marker| trimmed.eq_ignore_ascii_case(marker))
+    {
+        return true;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    OBSERVATION_HOOK_NARRATIVE_MARKERS
+        .iter()
+        .any(|marker| lower.contains(marker))
 }
 
 pub fn should_include_memory_content(content: &str) -> bool {
     !is_observation_hook_noise(content)
+}
+
+/// Pattern API / cross-session summaries that describe hook lifecycle noise, not project facts.
+pub fn is_memory_pattern_noise(value: &str) -> bool {
+    is_observation_hook_noise(value)
+}
+
+pub fn should_observe_tool_failure(tool_output: &str) -> bool {
+    let trimmed = tool_output.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if trimmed == crate::session::history::INTERRUPTED_TOOL_RESULT {
+        return false;
+    }
+    if is_observation_hook_noise(trimmed) {
+        return false;
+    }
+    // Ignore generic one-liners with no diagnostic value.
+    let lower = trimmed.to_ascii_lowercase();
+    if lower == "error" || lower == "failed" || lower == "tool error" {
+        return false;
+    }
+    true
+}
+
+pub fn filter_patterns_response(mut body: serde_json::Value) -> serde_json::Value {
+    if let Some(patterns) = body.get_mut("patterns").and_then(|v| v.as_array_mut()) {
+        patterns.retain(|item| {
+            pattern_item_text(item)
+                .map(|text| !is_memory_pattern_noise(&text))
+                .unwrap_or(true)
+        });
+    }
+    body
+}
+
+fn pattern_item_text(item: &serde_json::Value) -> Option<String> {
+    if let Some(text) = item.as_str() {
+        return Some(text.to_string());
+    }
+    let object = item.as_object()?;
+    for key in ["description", "title", "pattern", "narrative", "summary", "text"] {
+        if let Some(text) = object.get(key).and_then(|v| v.as_str()) {
+            let trimmed = text.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
+
+pub fn action_project_matches_workspace(
+    action_project: Option<&str>,
+    normalized_workspace: &str,
+) -> bool {
+    let action_project = action_project.map(str::trim).filter(|value| !value.is_empty());
+    let Some(action_project) = action_project else {
+        return true;
+    };
+    if normalized_workspace.is_empty() {
+        return true;
+    }
+    if action_project == normalized_workspace {
+        return true;
+    }
+    let action_name = std::path::Path::new(action_project)
+        .file_name()
+        .and_then(|name| name.to_str());
+    let workspace_name = std::path::Path::new(normalized_workspace)
+        .file_name()
+        .and_then(|name| name.to_str());
+    match (action_name, workspace_name) {
+        (Some(a), Some(w)) => a.eq_ignore_ascii_case(w),
+        _ => false,
+    }
 }
 
 pub fn extract_search_result_content(result: &serde_json::Value) -> Option<String> {
@@ -344,7 +549,96 @@ mod tests {
     fn hook_names_are_filtered_as_noise() {
         assert!(is_observation_hook_noise("UserPromptSubmit"));
         assert!(is_observation_hook_noise("  PostToolUse  "));
+        assert!(is_observation_hook_noise("post_tool_use"));
+        assert!(is_observation_hook_noise(
+            "Pre-tool-use hook triggered. Hook fired with no tool call details provided."
+        ));
+        assert!(is_observation_hook_noise(
+            "A pre_tool_use hook event was triggered. No associated tool invocation details."
+        ));
+        assert!(is_observation_hook_noise(
+            "Recurring error: posttoolusefailure hook triggered with no details"
+        ));
         assert!(!is_observation_hook_noise("所有会话使用简体中文"));
+    }
+
+    #[test]
+    fn tool_failure_observation_skips_empty_and_hook_noise() {
+        assert!(!should_observe_tool_failure(""));
+        assert!(!should_observe_tool_failure("   "));
+        assert!(!should_observe_tool_failure(
+            "PostToolUseFailure hook triggered with no details"
+        ));
+        assert!(should_observe_tool_failure(
+            "unity_execute failed: NullReferenceException at PhoneLoginComponent.cs:42"
+        ));
+    }
+
+    #[test]
+    fn pattern_response_filters_hook_noise() {
+        let body = serde_json::json!({
+            "patterns": [
+                "H:/exas game/Assets.Lua/Halmodels/oginNiewui/Phonel ogincomponent.lua frequently modified",
+                "Recurring error: posttoolusefailure hook triggered",
+                { "description": "Recurring error: posttoolusefailure hook triggered with no details" }
+            ]
+        });
+        let filtered = filter_patterns_response(body);
+        let patterns = filtered["patterns"].as_array().unwrap();
+        assert_eq!(patterns.len(), 1);
+    }
+
+    #[test]
+    fn action_project_matches_workspace_by_full_path_or_basename() {
+        assert!(action_project_matches_workspace(
+            Some(r"G:\AI\Locus"),
+            r"G:\AI\Locus",
+        ));
+        assert!(action_project_matches_workspace(
+            Some("Locus"),
+            r"G:\AI\Locus",
+        ));
+        assert!(!action_project_matches_workspace(
+            Some(r"G:\AI\Other"),
+            r"G:\AI\Locus",
+        ));
+        assert!(action_project_matches_workspace(None, r"G:\AI\Locus"));
+    }
+
+    #[test]
+    fn observe_tool_payload_uses_agentmemory_hook_types() {
+        let (hook, data) = observe_tool_payload(
+            "bash",
+            &serde_json::json!({ "command": "git status" }),
+            "Exit code: 0",
+            false,
+        );
+        assert_eq!(hook, "post_tool_use");
+        assert_eq!(data["tool_name"], "bash");
+        assert_eq!(data["tool_output"], "Exit code: 0");
+
+        let (hook, data) = observe_tool_payload("read", &serde_json::json!({}), "not found", true);
+        assert_eq!(hook, "post_tool_failure");
+        assert_eq!(data["tool_name"], "read");
+        assert_eq!(data["error"], "not found");
+        assert!(data.get("tool_output").is_none());
+    }
+
+    #[test]
+    fn enrich_targets_extract_read_and_grep_paths() {
+        let (files, terms) = enrich_targets_for_tool(
+            "read",
+            &serde_json::json!({ "filePath": "src/main.rs" }),
+        );
+        assert_eq!(files, vec!["src/main.rs"]);
+        assert!(terms.is_empty());
+
+        let (files, terms) = enrich_targets_for_tool(
+            "grep",
+            &serde_json::json!({ "path": "src", "pattern": "AgentMemory" }),
+        );
+        assert_eq!(files, vec!["src"]);
+        assert_eq!(terms, vec!["AgentMemory"]);
     }
 
     #[test]

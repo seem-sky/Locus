@@ -262,6 +262,11 @@ pub struct ToolPermissionMode(pub Arc<tokio::sync::RwLock<String>>);
 #[derive(Clone)]
 pub struct ToolPermissions(pub Arc<tokio::sync::RwLock<HashMap<String, String>>>);
 
+#[derive(Clone)]
+pub struct WorkflowToolWhitelist(
+    pub Arc<tokio::sync::RwLock<agent::workflow::WorkflowAmbiguousWhitelist>>,
+);
+
 #[cfg(test)]
 mod state_type_tests {
     use super::{ApiKeyState, ProviderKeysState, ToolPermissionMode, ToolPermissions};
@@ -621,6 +626,17 @@ pub fn run() {
             println!("[Locus] tool_permissions: {:?}", initial_tool_perms);
             let tool_permissions: ToolPermissions =
                 ToolPermissions(Arc::new(tokio::sync::RwLock::new(initial_tool_perms)));
+
+            let initial_workflow_whitelist =
+                agent::workflow::WorkflowAmbiguousWhitelist::load_from_dir(&data_dir);
+            println!(
+                "[Locus] workflow_tool_whitelist: {} tools, {} bash commands",
+                initial_workflow_whitelist.tools.len(),
+                initial_workflow_whitelist.bash_commands.len()
+            );
+            let workflow_tool_whitelist: WorkflowToolWhitelist = WorkflowToolWhitelist(Arc::new(
+                tokio::sync::RwLock::new(initial_workflow_whitelist),
+            ));
             startup_for_setup.mark("setup_permissions_ready");
 
             let unity_monitor: UnityMonitorHandle = Arc::new(tokio::sync::Mutex::new(None));
@@ -888,6 +904,7 @@ pub fn run() {
             app.manage(view_automation_store);
             app.manage(tool_permission_mode);
             app.manage(tool_permissions);
+            app.manage(workflow_tool_whitelist);
             app.manage(binary_cache);
             app.manage(knowledge_index_state.clone());
             app.manage(unity_reference_import_state);
@@ -1067,6 +1084,11 @@ pub fn run() {
             commands::agentmemory_status,
             commands::agentmemory_start,
             commands::agentmemory_stop,
+            commands::agentmemory_action_list,
+            commands::agentmemory_action_create,
+            commands::agentmemory_action_update,
+            commands::agentmemory_insights,
+            commands::agentmemory_consolidate,
             commands::check_unity_connection,
             commands::check_unity_connection_status,
             commands::lua_gc_monitor_start,
@@ -1258,6 +1280,8 @@ pub fn run() {
             commands::save_tool_permission_mode,
             commands::get_tool_permissions,
             commands::save_tool_permissions,
+            commands::get_workflow_tool_whitelist,
+            commands::save_workflow_tool_whitelist,
             commands::reset_all_config,
             commands::save_plan_artifact,
             commands::get_system_fonts,

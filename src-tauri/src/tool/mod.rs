@@ -24,6 +24,7 @@ pub struct ToolRuntimeState {
 pub struct ToolExecutionContext {
     pub app_handle: Option<AppHandle>,
     pub working_dir: Option<String>,
+    pub session_id: Option<String>,
     pub unity_connected: Option<bool>,
     pub runtime_state: Option<Arc<ToolRuntimeState>>,
     pub execution_meta_sink: Option<Arc<Mutex<Option<serde_json::Value>>>>,
@@ -517,6 +518,7 @@ mod tests {
         let context = ToolExecutionContext {
             app_handle: None,
             working_dir: Some("C:/Project".to_string()),
+            session_id: None,
             unity_connected: Some(true),
             runtime_state: Some(Arc::new(ToolRuntimeState::default())),
             execution_meta_sink: None,
@@ -532,6 +534,7 @@ mod tests {
         let disconnected = ToolExecutionContext {
             app_handle: None,
             working_dir: Some("C:/Project".to_string()),
+            session_id: None,
             unity_connected: Some(false),
             runtime_state: Some(Arc::new(ToolRuntimeState::default())),
             execution_meta_sink: None,
@@ -541,6 +544,7 @@ mod tests {
         let connected = ToolExecutionContext {
             app_handle: None,
             working_dir: Some("C:/Project".to_string()),
+            session_id: None,
             unity_connected: Some(true),
             runtime_state: Some(Arc::new(ToolRuntimeState::default())),
             execution_meta_sink: None,

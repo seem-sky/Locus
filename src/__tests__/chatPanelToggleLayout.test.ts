@@ -157,6 +157,8 @@ describe("chat panel toggle layout", () => {
     expect(toolPermissions).toContain("setFileBoundaryMode");
     expect(toolPermissions).toContain("settings.perms.columnMode");
     expect(toolPermissions).toContain("settings.perms.toolTitle");
+    expect(toolPermissions).toContain("settings.perms.workflowWhitelistTitle");
+    expect(toolPermissions).toContain("workflowToolWhitelist");
     expect(toolPermissions).toContain("emit('setGlobalPermissionMode', $event as ToolMode)");
     expect(toolPermissions).toContain('emit("setFileWorkspaceBoundary", mode === "workspace")');
     expect(toolPermissions.indexOf("settings.perms.behaviorTitle")).toBeLessThan(

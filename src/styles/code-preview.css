@@ -1,0 +1,10 @@
+/* Code / diff / asset text preview typography (overridden from Display settings). */
+
+.code-preview-surface pre,
+.code-preview-surface code,
+.code-preview-surface .hljs {
+  font-family: var(--font-mono-editor);
+  font-size: var(--code-preview-font-size);
+  line-height: var(--code-preview-line-height);
+  letter-spacing: var(--code-preview-letter-spacing);
+}

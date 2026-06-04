@@ -95,7 +95,7 @@ impl GitProvider {
 
     fn log_workspace_snapshot_failure(working_dir: &str, label: &str, error: String) -> String {
         let detail = Self::format_workspace_snapshot_failure(working_dir, label, &error);
-        eprintln!("{}", detail);
+        tracing::warn!(log_module = "Locus", "{}", detail);
         detail
     }
 

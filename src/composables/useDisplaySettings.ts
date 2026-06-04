@@ -5,6 +5,15 @@ import type {
 } from "../services/notificationSounds";
 
 export type FontSlot = "ui" | "prose" | "monoInline" | "monoBlock" | "monoEditor";
+
+export interface CodePreviewTypography {
+  /** Editor code preview font size in px */
+  fontSize: number;
+  /** Unitless line height multiplier */
+  lineHeight: number;
+  /** Letter spacing in em */
+  letterSpacing: number;
+}
 export type DiffReviewTarget = "inline" | "window";
 export type ChatDiffReviewTarget = DiffReviewTarget;
 export type GitDiffReviewTarget = DiffReviewTarget;
@@ -72,6 +81,8 @@ export interface DisplaySettings {
   soundOnToolConfirm: boolean;
   /** Per-slot font-family overrides (empty string = use default) */
   fonts: Record<FontSlot, string>;
+  /** Typography for asset preview, diff viewer, and file hover previews */
+  codePreview: CodePreviewTypography;
 }
 
 const STORAGE_KEY = "locus-display-settings";
@@ -83,6 +94,31 @@ const defaultFonts: Record<FontSlot, string> = {
   monoBlock: "",
   monoEditor: "",
 };
+
+const defaultCodePreview: CodePreviewTypography = {
+  fontSize: 12,
+  lineHeight: 1.5,
+  letterSpacing: 0,
+};
+
+export function clampCodePreviewTypography(
+  raw: Partial<CodePreviewTypography> | undefined,
+): CodePreviewTypography {
+  const fontSize = Number(raw?.fontSize);
+  const lineHeight = Number(raw?.lineHeight);
+  const letterSpacing = Number(raw?.letterSpacing);
+  return {
+    fontSize: Number.isFinite(fontSize)
+      ? Math.min(24, Math.max(10, Math.round(fontSize)))
+      : defaultCodePreview.fontSize,
+    lineHeight: Number.isFinite(lineHeight)
+      ? Math.min(2.5, Math.max(1, Math.round(lineHeight * 100) / 100))
+      : defaultCodePreview.lineHeight,
+    letterSpacing: Number.isFinite(letterSpacing)
+      ? Math.min(0.2, Math.max(-0.05, Math.round(letterSpacing * 1000) / 1000))
+      : defaultCodePreview.letterSpacing,
+  };
+}
 
 const defaults: DisplaySettings = {
   todoAutoOpen: true,
@@ -116,6 +152,7 @@ const defaults: DisplaySettings = {
   soundOnChatError: true,
   soundOnToolConfirm: true,
   fonts: { ...defaultFonts },
+  codePreview: { ...defaultCodePreview },
 };
 
 function load(): DisplaySettings {
@@ -123,7 +160,12 @@ function load(): DisplaySettings {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (raw) {
       const parsed = JSON.parse(raw);
-      const merged = { ...defaults, ...parsed, fonts: { ...defaultFonts, ...parsed.fonts } };
+      const merged = {
+        ...defaults,
+        ...parsed,
+        fonts: { ...defaultFonts, ...parsed.fonts },
+        codePreview: clampCodePreviewTypography(parsed.codePreview),
+      };
       if (parsed.showThinkingProcess === undefined) {
         merged.showThinkingProcess =
           parsed.hideThinkingBlocks === false || parsed.thinkingAutoOpen === true;
@@ -133,7 +175,7 @@ function load(): DisplaySettings {
       return merged;
     }
   } catch { /* ignore */ }
-  return { ...defaults, fonts: { ...defaultFonts } };
+  return { ...defaults, fonts: { ...defaultFonts }, codePreview: { ...defaultCodePreview } };
 }
 
 function save(s: DisplaySettings) {
@@ -154,6 +196,21 @@ export function useDisplaySettings() {
     applyFonts(state.fonts);
   }
 
+  function setCodePreview<K extends keyof CodePreviewTypography>(
+    key: K,
+    value: CodePreviewTypography[K],
+  ) {
+    state.codePreview = clampCodePreviewTypography({ ...state.codePreview, [key]: value });
+    save({ ...state });
+    applyCodePreviewTypography(state.codePreview);
+  }
+
+  function resetCodePreview() {
+    state.codePreview = { ...defaultCodePreview };
+    save({ ...state });
+    applyCodePreviewTypography(state.codePreview);
+  }
+
   function setShowThinkingProcess(value: boolean) {
     state.showThinkingProcess = value;
     state.hideThinkingBlocks = !value;
@@ -161,7 +218,7 @@ export function useDisplaySettings() {
     save({ ...state });
   }
 
-  return { state, set, setFont, setShowThinkingProcess };
+  return { state, set, setFont, setCodePreview, resetCodePreview, setShowThinkingProcess };
 }
 
 /* ---- Font CSS-variable application ---- */
@@ -209,7 +266,16 @@ function applyFonts(fonts: Record<FontSlot, string>) {
   }
 }
 
-/** Call once from App.vue to apply saved font overrides on startup */
+function applyCodePreviewTypography(codePreview: CodePreviewTypography) {
+  const root = document.documentElement;
+  const cp = clampCodePreviewTypography(codePreview);
+  root.style.setProperty("--code-preview-font-size", `${cp.fontSize}px`);
+  root.style.setProperty("--code-preview-line-height", String(cp.lineHeight));
+  root.style.setProperty("--code-preview-letter-spacing", `${cp.letterSpacing}em`);
+}
+
+/** Call once from App.vue to apply saved display typography on startup */
 export function initFonts() {
   applyFonts(state.fonts);
+  applyCodePreviewTypography(state.codePreview);
 }
