@@ -31,19 +31,28 @@ updatedAt: 1778307069687
 
 ## 审查范围
 
-1. 默认范围：`git diff --name-only HEAD`
-2. 仅审查 `Assets`、`Assets.Lua`、`Packages`、`Players`、`ProjectSettings` 目录文件
-3. 仅审查文本文件，跳过二进制与临时文件
-4. 若存在已暂存内容，结合 `git diff --cached` 一并审查
+**优先级（从高到低）：附件引用 → 用户显式路径 → 全量 git diff**
+
+1. **附件引用优先**：用户消息含 `<locus-references>` 或 `<locus-local-files>` 时，**默认以附件路径为审查范围**。文件夹审查其下文本源码；单文件审查其自身。此时：
+   - **不要**主动执行 `git diff --name-only HEAD` 或 `git diff --stat` 扩大范围
+   - **不要**读取附件路径外的文件，除非落入下方「直接依赖例外」或用户明确要求全量审查
+   - 报告开头须写明「审查范围」及选用依据（附件 / 用户指定 / 全量 diff）
+2. **直接依赖例外**：仅当附件内代码直接 import/调用外部模块，且**不读外部定义就无法判断正确性**时，可追加读取**最小必要**的直接依赖文件；须在报告中列出附加路径及原因（例如 `HjTcpNetwork` → `DnsCacheManager`）
+3. **全量 diff 触发条件**：满足任一才使用 `git diff --name-only HEAD`（及 `--cached`）作为范围：
+   - 用户明确要求「审查全部变更」「git diff」「待提交内容」「整个工作区」等
+   - 消息中**无** `<locus-references>` / `<locus-local-files>`，且用户未给出具体路径
+4. 默认全量范围下，仅审查 `Assets`、`Assets.Lua`、`Packages`、`Players`、`ProjectSettings` 目录文件
+5. 仅审查文本文件，跳过二进制与临时文件
 
 ## 审查流程
 
-1. 收集变更文件与核心 diff
-2. **读取 CLAUDE.md 和项目文档** 以获取项目编码标准
-3. 按「通用检查清单」逐项审查
-4. 对 Lua 与 Unity C# 变更追加「项目专项检查」
-5. 按统一分级标准标注问题严重度
-6. 输出结构化报告与最终结论
+1. **先判定范围**：检查是否有 `<locus-references>` / `<locus-local-files>` 或用户显式路径；有则按附件/路径收集文件，无则再收集 git diff
+2. 收集目标文件与核心 diff（附件范围下仅 diff 附件内文件的改动，可用 `git diff HEAD -- <path>`）
+3. **读取 CLAUDE.md 和项目文档** 以获取项目编码标准
+4. 按「通用检查清单」逐项审查
+5. 对 Lua 与 Unity C# 变更追加「项目专项检查」
+6. 按统一分级标准标注问题严重度
+7. 输出结构化报告与最终结论
 
 ## 通用检查清单
 
@@ -260,6 +269,7 @@ BLOCK / PASS_WITH_RISKS / PASS
 ## 执行原则
 
 - 只基于证据下结论，不做无依据猜测
+- **附件引用不是「必读参考」而是默认审查边界**；不得因 git status、memory 或 Skill 默认习惯而擅自扩大范围
 - 优先报高价值问题，避免泛泛而谈
 - 给出可落地修复建议，不只指出问题
 - 绝不批准存在已确认安全漏洞的代码

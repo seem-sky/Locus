@@ -32,6 +32,18 @@ export interface InspectorPropertyAttributeInfo {
   value?: string;
 }
 
+export interface InspectorPropertyTargetSnapshot {
+  kind: string;
+  path?: string | null;
+  scenePath?: string | null;
+  objectPath?: string | null;
+  objectFileId?: number | null;
+  targetFileId?: number | null;
+  componentType?: string | null;
+  componentIndex?: number | null;
+  propertyPath?: string | null;
+}
+
 export interface InspectorSelectOption {
   label: string;
   value: string;
@@ -50,6 +62,8 @@ export type InspectorSelectOptionInput = {
 
 export interface InspectorPropertySnapshot {
   propertyPath: string;
+  bindingTarget?: InspectorPropertyTargetSnapshot | null;
+  target?: InspectorPropertyTargetSnapshot | null;
   displayName?: string;
   name?: string;
   type?: string;

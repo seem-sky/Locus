@@ -72,6 +72,31 @@ fn grep_tool_original_command(pattern: &str, path: &str, include: Option<&str>) 
     }
 }
 
+fn read_tool_original_command(file_path: &str, offset: usize, limit: usize) -> String {
+    format!("read(filePath={file_path:?}, offset={offset}, limit={limit})")
+}
+
+/// Metadata for the built-in `read` tool (no RTK rewrite path).
+pub fn read_tool_native_meta(file_path: &str, offset: usize, limit: usize) -> HeadroomRewriteMeta {
+    let original_command = read_tool_original_command(file_path, offset, limit);
+    if !super::enabled() {
+        return HeadroomRewriteMeta {
+            enabled: false,
+            available: false,
+            rewritten: false,
+            original_command,
+            executed_command: None,
+        };
+    }
+    HeadroomRewriteMeta {
+        enabled: true,
+        available: super::library_available(),
+        rewritten: false,
+        original_command,
+        executed_command: Some("native file read".to_string()),
+    }
+}
+
 /// Metadata when the built-in `grep` tool falls back to the native Rust searcher.
 pub fn grep_tool_native_meta(pattern: &str, path: &str, include: Option<&str>) -> HeadroomRewriteMeta {
     let original_command = grep_tool_original_command(pattern, path, include);
@@ -243,6 +268,21 @@ mod tests {
         let meta = rewrite_with_meta("git status");
         assert!(!meta.enabled);
         assert_eq!(meta.original_command, "git status");
+        if let Some(value) = prior {
+            std::env::set_var("LOCUS_HEADROOM_DISABLED", value);
+        } else {
+            std::env::remove_var("LOCUS_HEADROOM_DISABLED");
+        }
+    }
+
+    #[test]
+    fn read_tool_native_meta_passthrough_when_disabled() {
+        let prior = std::env::var("LOCUS_HEADROOM_DISABLED").ok();
+        std::env::set_var("LOCUS_HEADROOM_DISABLED", "1");
+        let meta = read_tool_native_meta("src/main.rs", 1, 2000);
+        assert!(!meta.enabled);
+        assert!(!meta.rewritten);
+        assert!(meta.original_command.contains("src/main.rs"));
         if let Some(value) = prior {
             std::env::set_var("LOCUS_HEADROOM_DISABLED", value);
         } else {

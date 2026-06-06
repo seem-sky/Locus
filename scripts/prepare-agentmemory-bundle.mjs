@@ -116,6 +116,293 @@ function isPreToolGuardV7Applied(source) {
   return source.includes("/* locus-pre-tool-guard-v7 */");
 }
 
+function isSemanticSeedApplied(source) {
+  return source.includes("/* locus-semantic-seed-v1 */");
+}
+
+function isSemanticThresholdApplied(source) {
+  return source.includes("/* locus-semantic-threshold-v1 */");
+}
+
+const SEMANTIC_SEED_HELPERS = `/* locus-semantic-seed-v1 */
+async function locusSeedSemanticFromSummary(kv, summary) {
+\tif (!summary?.sessionId) return;
+\tconst candidates = [];
+\tif (Array.isArray(summary.keyDecisions)) {
+\t\tfor (const decision of summary.keyDecisions) {
+\t\t\tconst fact = String(decision).trim();
+\t\t\tif (fact.length >= 8) candidates.push({ fact, confidence: 0.62 });
+\t\t}
+\t}
+\tif (Array.isArray(summary.concepts)) {
+\t\tfor (const concept of summary.concepts) {
+\t\t\tconst fact = String(concept).trim();
+\t\t\tif (fact.length >= 3) candidates.push({ fact, confidence: 0.5 });
+\t\t}
+\t}
+\tconst narrative = typeof summary.narrative === "string" ? summary.narrative.trim() : "";
+\tif (narrative.length >= 24) {
+\t\tcandidates.push({
+\t\t\tfact: narrative.length > 240 ? narrative.slice(0, 240) + "…" : narrative,
+\t\t\tconfidence: 0.58
+\t\t});
+\t}
+\tif (candidates.length === 0) return;
+\tconst existingSemantic = await kv.list(KV.semantic).catch(() => []);
+\tconst now = (/* @__PURE__ */ new Date()).toISOString();
+\tfor (const item of candidates.slice(0, 16)) {
+\t\tconst fact = item.fact;
+\t\tconst existing = existingSemantic.find((entry) => entry.fact && entry.fact.toLowerCase() === fact.toLowerCase());
+\t\tif (existing) {
+\t\t\texisting.accessCount = (existing.accessCount || 0) + 1;
+\t\t\texisting.lastAccessedAt = now;
+\t\t\texisting.updatedAt = now;
+\t\t\texisting.confidence = Math.max(existing.confidence || 0, item.confidence);
+\t\t\tconst sources = new Set([...(existing.sourceSessionIds || []), summary.sessionId]);
+\t\t\texisting.sourceSessionIds = [...sources];
+\t\t\tif (summary.project && !existing.project) existing.project = summary.project;
+\t\t\tawait kv.set(KV.semantic, existing.id, existing);
+\t\t} else {
+\t\t\tconst sem = {
+\t\t\t\tid: generateId("sem"),
+\t\t\t\tfact,
+\t\t\t\tconfidence: item.confidence,
+\t\t\t\tsourceSessionIds: [summary.sessionId],
+\t\t\t\tsourceMemoryIds: [],
+\t\t\t\taccessCount: 1,
+\t\t\t\tlastAccessedAt: now,
+\t\t\t\tstrength: item.confidence,
+\t\t\t\tcreatedAt: now,
+\t\t\t\tupdatedAt: now,
+\t\t\t\tproject: summary.project
+\t\t\t};
+\t\t\tawait kv.set(KV.semantic, sem.id, sem);
+\t\t\texistingSemantic.push(sem);
+\t\t}
+\t}
+}
+`;
+
+function isSemanticUpsertApplied(source) {
+  return source.includes("/* locus-semantic-upsert-v1 */");
+}
+
+function isSummariesListApplied(source) {
+  return source.includes("/* locus-summaries-list-v1 */");
+}
+
+function patchAgentmemorySummariesList(source) {
+  if (isSummariesListApplied(source)) {
+    return null;
+  }
+  const needle = `\tsdk.registerFunction("api::procedural-list", async (req) => {`;
+  const replacement = `\t/* locus-summaries-list-v1 */
+\tsdk.registerFunction("api::summaries-list", async (req) => {
+\t\tconst authErr = checkAuth(req, secret);
+\t\tif (authErr) return authErr;
+\t\tlet summaries = await kv.list(KV.summaries).catch(() => []);
+\t\tconst project = req.query_params?.project;
+\t\tif (project) summaries = summaries.filter((summary) => summary.project === project);
+\t\treturn {
+\t\t\tstatus_code: 200,
+\t\t\tbody: { summaries }
+\t\t};
+\t});
+\tsdk.registerTrigger({
+\t\ttype: "http",
+\t\tfunction_id: "api::summaries-list",
+\t\tconfig: {
+\t\t\tapi_path: "/agentmemory/summaries",
+\t\t\thttp_method: "GET"
+\t\t}
+\t});
+\tsdk.registerFunction("api::procedural-list", async (req) => {`;
+  if (!source.includes(needle)) {
+    return null;
+  }
+  return source.replace(needle, replacement);
+}
+
+function patchAgentmemorySemanticUpsert(source) {
+  if (isSemanticUpsertApplied(source)) {
+    return null;
+  }
+  const needle = `\tsdk.registerTrigger({
+\t\ttype: "http",
+\t\tfunction_id: "api::semantic-list",
+\t\tconfig: {
+\t\t\tapi_path: "/agentmemory/semantic",
+\t\t\thttp_method: "GET"
+\t\t}
+\t});
+\tsdk.registerFunction("api::procedural-list", async (req) => {`;
+  const replacement = `\tsdk.registerTrigger({
+\t\ttype: "http",
+\t\tfunction_id: "api::semantic-list",
+\t\tconfig: {
+\t\t\tapi_path: "/agentmemory/semantic",
+\t\t\thttp_method: "GET"
+\t\t}
+\t});
+\t/* locus-semantic-upsert-v1 */
+\tsdk.registerFunction("api::semantic-upsert", async (req) => {
+\t\tconst authErr = checkAuth(req, secret);
+\t\tif (authErr) return authErr;
+\t\tconst body = req.body || {};
+\t\tconst items = Array.isArray(body.facts) ? body.facts : body.fact ? [body] : [];
+\t\tif (items.length === 0) return {
+\t\t\tstatus_code: 400,
+\t\t\tbody: {
+\t\t\t\tsuccess: false,
+\t\t\t\terror: "facts required"
+\t\t\t}
+\t\t};
+\t\tconst existingSemantic = await kv.list(KV.semantic).catch(() => []);
+\t\tconst now = (/* @__PURE__ */ new Date()).toISOString();
+\t\tlet upserted = 0;
+\t\tfor (const item of items.slice(0, 32)) {
+\t\t\tconst fact = String(item.fact || "").trim();
+\t\t\tif (fact.length < 3) continue;
+\t\t\tconst parsedConf = typeof item.confidence === "number" ? item.confidence : 0.55;
+\t\t\tconst confidence = Number.isFinite(parsedConf) ? parsedConf : 0.55;
+\t\t\tconst sessionId = item.sessionId || body.sessionId;
+\t\t\tconst project = item.project || body.project;
+\t\t\tconst existing = existingSemantic.find((entry) => entry.fact && entry.fact.toLowerCase() === fact.toLowerCase());
+\t\t\tif (existing) {
+\t\t\t\texisting.accessCount = (existing.accessCount || 0) + 1;
+\t\t\t\texisting.lastAccessedAt = now;
+\t\t\t\texisting.updatedAt = now;
+\t\t\t\texisting.confidence = Math.max(existing.confidence || 0, confidence);
+\t\t\t\tif (sessionId) {
+\t\t\t\t\tconst sources = new Set([...(existing.sourceSessionIds || []), sessionId]);
+\t\t\t\t\texisting.sourceSessionIds = [...sources];
+\t\t\t\t}
+\t\t\t\tif (project && !existing.project) existing.project = project;
+\t\t\t\tawait kv.set(KV.semantic, existing.id, existing);
+\t\t\t} else {
+\t\t\t\tconst sem = {
+\t\t\t\t\tid: generateId("sem"),
+\t\t\t\t\tfact,
+\t\t\t\t\tconfidence,
+\t\t\t\t\tsourceSessionIds: sessionId ? [sessionId] : [],
+\t\t\t\t\tsourceMemoryIds: [],
+\t\t\t\t\taccessCount: 1,
+\t\t\t\t\tlastAccessedAt: now,
+\t\t\t\t\tstrength: confidence,
+\t\t\t\t\tcreatedAt: now,
+\t\t\t\t\tupdatedAt: now,
+\t\t\t\t\tproject
+\t\t\t\t};
+\t\t\t\tawait kv.set(KV.semantic, sem.id, sem);
+\t\t\t\texistingSemantic.push(sem);
+\t\t\t}
+\t\t\tupserted++;
+\t\t}
+\t\treturn {
+\t\t\tstatus_code: 200,
+\t\t\tbody: {
+\t\t\t\tsuccess: true,
+\t\t\t\tupserted
+\t\t\t}
+\t\t};
+\t});
+\tsdk.registerTrigger({
+\t\ttype: "http",
+\t\tfunction_id: "api::semantic-upsert",
+\t\tconfig: {
+\t\t\tapi_path: "/agentmemory/semantic/upsert",
+\t\t\thttp_method: "POST"
+\t\t}
+\t});
+\tsdk.registerFunction("api::procedural-list", async (req) => {`;
+  if (!source.includes(needle)) {
+    return null;
+  }
+  return source.replace(needle, replacement);
+}
+
+function patchAgentmemorySemanticSeed(source) {
+  let next = source;
+  if (!isSemanticSeedApplied(next)) {
+    const registerNeedle = "function registerSummarizeFunction(sdk, kv, provider, metricsStore) {";
+    if (next.includes(registerNeedle)) {
+      next = next.replace(registerNeedle, `${SEMANTIC_SEED_HELPERS}${registerNeedle}`);
+    }
+    const summarizeNeedle = `\t\t\tawait kv.set(KV.summaries, sessionId, summary);
+\t\t\tawait safeAudit(kv, "compress", "mem::summarize", [sessionId], {`;
+    const summarizeReplacement = `\t\t\tawait kv.set(KV.summaries, sessionId, summary);
+\t\t\tawait locusSeedSemanticFromSummary(kv, summary);
+\t\t\tawait safeAudit(kv, "compress", "mem::summarize", [sessionId], {`;
+    if (next.includes(summarizeNeedle)) {
+      next = next.replace(summarizeNeedle, summarizeReplacement);
+    }
+  }
+  return next === source ? null : next;
+}
+
+function patchAgentmemorySemanticThreshold(source) {
+  if (isSemanticThresholdApplied(source)) {
+    return null;
+  }
+  let next = source;
+  const thresholdNeedle = `\t\t\tif (summaries.length >= 5) {`;
+  const thresholdReplacement = `\t\t\t/* locus-semantic-threshold-v1 */
+\t\t\tif (summaries.length >= 1) {`;
+  if (next.includes(thresholdNeedle)) {
+    next = next.replace(thresholdNeedle, thresholdReplacement);
+  }
+  next = next.replace(
+    `reason: "fewer than 5 summaries"`,
+    `reason: "no summaries"`,
+  );
+  return next === source ? null : next;
+}
+
+function patchAgentmemoryProfileRefresh(source) {
+  const needle = `\t\t\tbody: await sdk.trigger({
+\t\t\t\tfunction_id: "mem::profile",
+\t\t\t\tpayload: { project }
+\t\t\t})`;
+  const replacement = `\t\t\t/* locus-profile-refresh */
+\t\t\tbody: await sdk.trigger({
+\t\t\t\tfunction_id: "mem::profile",
+\t\t\t\tpayload: {
+\t\t\t\t\tproject,
+\t\t\t\t\trefresh: req.query_params?.["refresh"] === "true"
+\t\t\t\t}
+\t\t\t})`;
+  if (source.includes("/* locus-profile-refresh */")) {
+    return source;
+  }
+  if (source.includes(needle)) {
+    return source.replace(needle, replacement);
+  }
+  return source;
+}
+
+function repairSummarizeCorruption(source) {
+  const corruptBlock = `logger.warn("Failed to parse summary XML", { sessionId });
+/* locus-replay-v2 */-compress
+\t\t\t\tconst synthetic = buildSyntheticCompression(data.raw);
+\t\t\t\tawait kv.set(KV.observations(data.sessionId), data.observationId, synthetic);
+\t\t\t\tgetSearchIndex().add(synthetic);
+\t\t\t\treturn {
+\t\t\t\t\tsuccess: true,
+\t\t\t\t\tcompressed: synthetic,
+\t\t\t\t\tqualityScore: 0,
+\t\t\t\t\tfallback: "synthetic"
+\t\t\t\t};`;
+  const fixedBlock = `logger.warn("Failed to parse summary XML", { sessionId });
+\t\t\t\treturn {
+\t\t\t\t\tsuccess: false,
+\t\t\t\t\terror: "parse_failed"
+\t\t\t\t};`;
+  if (source.includes(corruptBlock)) {
+    return source.replace(corruptBlock, fixedBlock);
+  }
+  return source;
+}
+
 const PRE_TOOL_GUARD_V5_HELPERS = `/* locus-pre-tool-guard-v5 */
 function locusNormalizeHookType(hookType) {
 \tif (typeof hookType !== "string") return "";
@@ -401,10 +688,31 @@ function patchAgentmemoryIndexFile(indexPath) {
     isPreToolGuardV5Applied(source) &&
     isPreToolGuardV6Applied(source) &&
     isPreToolGuardV7Applied(source) &&
+    isSemanticSeedApplied(source) &&
+    isSemanticThresholdApplied(source) &&
+    isSemanticUpsertApplied(source) &&
+    isSummariesListApplied(source) &&
     source.includes("locus-observations-hydrate") &&
     source === original
   ) {
     return false;
+  }
+
+  const semanticSeed = patchAgentmemorySemanticSeed(source);
+  if (semanticSeed) {
+    source = semanticSeed;
+  }
+  const semanticThreshold = patchAgentmemorySemanticThreshold(source);
+  if (semanticThreshold) {
+    source = semanticThreshold;
+  }
+  const semanticUpsert = patchAgentmemorySemanticUpsert(source);
+  if (semanticUpsert) {
+    source = semanticUpsert;
+  }
+  const summariesList = patchAgentmemorySummariesList(source);
+  if (summariesList) {
+    source = summariesList;
   }
 
   const v5 = patchAgentmemoryPreToolGuardV5(source);
@@ -627,23 +935,9 @@ function rawFromCompressed(obs) {
     source = source.replace(/^function rawFromCompressed\(obs\) \{[\s\S]*?\n\}/m, rawFromCompressedReplacement);
   }
 
-  const compressFailNeedle = `\t\t\t\treturn {
-\t\t\t\t\tsuccess: false,
-\t\t\t\t\terror: "parse_failed"
-\t\t\t\t};`;
-  const compressFailReplacement = `${marker}-compress
-\t\t\t\tconst synthetic = buildSyntheticCompression(data.raw);
-\t\t\t\tawait kv.set(KV.observations(data.sessionId), data.observationId, synthetic);
-\t\t\t\tgetSearchIndex().add(synthetic);
-\t\t\t\treturn {
-\t\t\t\t\tsuccess: true,
-\t\t\t\t\tcompressed: synthetic,
-\t\t\t\t\tqualityScore: 0,
-\t\t\t\t\tfallback: "synthetic"
-\t\t\t\t};`;
-  if (!source.includes(`${marker}-compress`) && source.includes(compressFailNeedle)) {
-    source = source.replace(compressFailNeedle, compressFailReplacement);
-  }
+  // mem::compress already falls back to synthetic compression upstream; do not patch generic
+  // `parse_failed` returns — that needle also appears in mem::summarize and mem::enrich-window.
+  source = repairSummarizeCorruption(source);
 
   const hydrateMarker = "/* locus-replay-v3-hydrate */";
   const hydrateReplacement = `${hydrateMarker}
@@ -695,6 +989,9 @@ function projectTimeline(observations) {`,
   if (!source.includes("locus-observations-hydrate") && source.includes(obsApiNeedle)) {
     source = source.replace(obsApiNeedle, obsApiReplacement.replace("hydrateObservationFields({ ...o })", "/* locus-observations-hydrate */ hydrateObservationFields({ ...o })"));
   }
+
+  source = repairSummarizeCorruption(source);
+  source = patchAgentmemoryProfileRefresh(source);
 
   if (source === original) {
     return false;

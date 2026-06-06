@@ -41,13 +41,19 @@ impl AgentMemoryState {
             .fetch_timeline(anchor, project_ref, before, after)
     }
 
-    pub fn fetch_profile(&self, working_dir: &str) -> Result<Value, String> {
+    pub fn fetch_profile(&self, working_dir: &str, refresh: bool) -> Result<Value, String> {
         self.ensure_ready()?;
         let project = normalize_project_path(working_dir);
         if project.is_empty() {
             return Err("working directory is required".to_string());
         }
-        self.client.fetch_profile(&project)
+        let body = self.client.fetch_profile(&project, refresh)?;
+        normalize_profile_response(&body)
+    }
+
+    pub fn fetch_config_flags(&self) -> Result<Value, String> {
+        self.ensure_ready()?;
+        self.client.fetch_config_flags()
     }
 
     pub fn fetch_file_history(
@@ -82,6 +88,15 @@ impl AgentMemoryState {
         self.client.run_consolidate_pipeline(tier, force)
     }
 
+    pub fn run_consolidate_memories(
+        &self,
+        project: Option<&str>,
+        min_observations: Option<usize>,
+    ) -> Result<Value, String> {
+        self.ensure_ready()?;
+        self.client.run_consolidate_memories(project, min_observations)
+    }
+
     pub fn query_graph(
         &self,
         query: Option<&str>,
@@ -108,7 +123,8 @@ impl AgentMemoryState {
 
     pub fn fetch_graph_stats(&self) -> Result<Value, String> {
         self.ensure_ready()?;
-        self.client.graph_stats()
+        let body = self.client.graph_stats()?;
+        Ok(normalize_graph_stats_response(&body))
     }
 
     pub fn forget_memory_by_id(&self, memory_id: &str) -> Result<Value, String> {
@@ -163,4 +179,100 @@ impl AgentMemoryState {
         }
         self.client.list_observations(session_id)
     }
+}
+
+fn normalize_profile_response(body: &serde_json::Value) -> Result<serde_json::Value, String> {
+    let profile = body.get("profile").unwrap_or(body);
+    if profile.is_null() {
+        let reason = body
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .unwrap_or("no_profile");
+        return Err(format!("agentmemory profile unavailable: {reason}"));
+    }
+    let top_concepts = profile
+        .get("topConcepts")
+        .and_then(|v| v.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    item.get("concept")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let top_files = profile
+        .get("topFiles")
+        .and_then(|v| v.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    item.get("file")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let recent_activity = profile
+        .get("recentActivity")
+        .and_then(|v| v.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(str::to_string))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let summary = recent_activity
+        .first()
+        .cloned()
+        .or_else(|| {
+            profile
+                .get("conventions")
+                .and_then(|v| v.as_array())
+                .and_then(|items| items.first())
+                .and_then(|item| item.as_str())
+                .map(str::to_string)
+        });
+    Ok(serde_json::json!({
+        "project": profile.get("project"),
+        "sessionCount": profile.get("sessionCount"),
+        "totalObservations": profile.get("totalObservations"),
+        "concepts": top_concepts,
+        "topFiles": top_files,
+        "conventions": profile.get("conventions"),
+        "commonErrors": profile.get("commonErrors"),
+        "recentActivity": recent_activity,
+        "summary": summary,
+        "updatedAt": profile.get("updatedAt"),
+        "cached": body.get("cached").and_then(|v| v.as_bool()).unwrap_or(false),
+    }))
+}
+
+fn normalize_graph_stats_response(body: &serde_json::Value) -> serde_json::Value {
+    let node_count = body
+        .get("totalNodes")
+        .or_else(|| body.get("nodeCount"))
+        .and_then(|v| v.as_u64());
+    let edge_count = body
+        .get("totalEdges")
+        .or_else(|| body.get("edgeCount"))
+        .and_then(|v| v.as_u64());
+    let enabled = body
+        .get("enabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(node_count.unwrap_or(0) > 0 || edge_count.unwrap_or(0) > 0);
+    serde_json::json!({
+        "nodeCount": node_count,
+        "edgeCount": edge_count,
+        "nodesByType": body.get("nodesByType"),
+        "edgesByType": body.get("edgesByType"),
+        "enabled": enabled,
+        "healthy": enabled && node_count.unwrap_or(0) > 0,
+    })
 }

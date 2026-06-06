@@ -6,6 +6,21 @@ export const UNITY_OBJECT_REFERENCE_SEARCH_ROOTS = [
   "ProjectSettings",
 ] as const;
 
+const BROAD_OBJECT_QUERY_TYPES = [
+  "scene",
+  "prefab",
+  "material",
+  "animation",
+  "controller",
+  "genericAsset",
+  "script",
+  "texture",
+  "audio",
+  "shader",
+  "model",
+  "otherYaml",
+].join("|");
+
 export interface UnityObjectReferenceFilter {
   referenceTypeFullName?: string;
   referenceTypeAssembly?: string;
@@ -42,6 +57,62 @@ const TEXTURE_EXTENSIONS = [
   "hdr",
 ];
 const MODEL_EXTENSIONS = ["fbx", "obj", "blend", "dae", "3ds", "max"];
+const FONT_EXTENSIONS = ["ttf", "otf", "fontsettings"];
+const VIDEO_EXTENSIONS = ["mp4", "mov", "webm", "avi", "mpeg", "mpg"];
+const COMPONENT_REFERENCE_TYPE_NAMES = [
+  "animator",
+  "articulationbody",
+  "audiosource",
+  "billboardrenderer",
+  "boxcollider",
+  "camera",
+  "canvas",
+  "canvasrenderer",
+  "capsulecollider",
+  "cloth",
+  "collider",
+  "collider2d",
+  "dropdown",
+  "effector2d",
+  "graphic",
+  "image",
+  "inputfield",
+  "joint",
+  "joint2d",
+  "lensflare",
+  "light",
+  "meshcollider",
+  "meshfilter",
+  "meshrenderer",
+  "offmeshlink",
+  "panelinputconfiguration",
+  "particlesystem",
+  "particlesystemforcefield",
+  "projector",
+  "rawimage",
+  "recttransform",
+  "reflectionprobe",
+  "renderer",
+  "rigidbody",
+  "rigidbody2d",
+  "scrollbar",
+  "scrollrect",
+  "selectable",
+  "skinnedmeshrenderer",
+  "skybox",
+  "slider",
+  "spherecollider",
+  "spriterenderer",
+  "terrain",
+  "terraincollider",
+  "text",
+  "tilemap",
+  "tilemapcollider2d",
+  "tilemaprenderer",
+  "transform",
+  "uidocument",
+  "visualeffect",
+];
 
 const TYPE_RULES: UnityObjectReferenceTypeRule[] = [
   {
@@ -55,6 +126,16 @@ const TYPE_RULES: UnityObjectReferenceTypeRule[] = [
     queryType: "audio",
     extensions: AUDIO_EXTENSIONS,
     kinds: ["audio"],
+  },
+  {
+    typeNames: ["font"],
+    queryType: "otherYaml",
+    extensions: FONT_EXTENSIONS,
+  },
+  {
+    typeNames: ["videoclip"],
+    queryType: "otherYaml",
+    extensions: VIDEO_EXTENSIONS,
   },
   {
     typeNames: ["audiomixer"],
@@ -79,6 +160,26 @@ const TYPE_RULES: UnityObjectReferenceTypeRule[] = [
     queryType: "texture",
     extensions: TEXTURE_EXTENSIONS,
     kinds: ["texture"],
+  },
+  {
+    typeNames: ["rendertexture", "customrendertexture"],
+    queryType: "rendertexture",
+    extensions: ["rendertexture"],
+  },
+  {
+    typeNames: ["texture2darray"],
+    queryType: "texture2darray",
+    extensions: ["asset"],
+  },
+  {
+    typeNames: ["texture3d"],
+    queryType: "texture3d",
+    extensions: ["asset"],
+  },
+  {
+    typeNames: ["cubemap"],
+    queryType: "cubemap",
+    extensions: ["cubemap"],
   },
   {
     typeNames: ["sprite"],
@@ -106,6 +207,31 @@ const TYPE_RULES: UnityObjectReferenceTypeRule[] = [
     kinds: ["animatorController"],
   },
   {
+    typeNames: ["avatar"],
+    queryType: "avatar",
+    extensions: MODEL_EXTENSIONS,
+    kinds: ["model"],
+    subAssetTypeNames: ["avatar"],
+    requireSubAsset: true,
+  },
+  {
+    typeNames: ["avatarmask"],
+    queryType: "avatarmask",
+    extensions: ["mask"],
+  },
+  {
+    typeNames: ["billboardasset"],
+    queryType: "billboardasset",
+    extensions: ["asset"],
+    kinds: ["genericAsset"],
+    scriptableObject: true,
+  },
+  {
+    typeNames: ["playableasset", "timelineasset"],
+    queryType: "playableasset",
+    extensions: ["playable", "asset"],
+  },
+  {
     typeNames: ["shader"],
     queryType: "shader",
     extensions: ["shader", "compute", "cginc", "hlsl", "glsl"],
@@ -124,6 +250,12 @@ const TYPE_RULES: UnityObjectReferenceTypeRule[] = [
     kinds: ["prefab"],
   },
   {
+    typeNames: COMPONENT_REFERENCE_TYPE_NAMES,
+    queryType: "prefab",
+    extensions: ["prefab"],
+    kinds: ["prefab"],
+  },
+  {
     typeNames: ["mesh"],
     queryType: "model",
     extensions: MODEL_EXTENSIONS,
@@ -131,8 +263,87 @@ const TYPE_RULES: UnityObjectReferenceTypeRule[] = [
     subAssetTypeNames: ["mesh"],
   },
   {
-    typeNames: ["physicmaterial", "physicmaterial2d", "physicsmaterial2d"],
-    extensions: ["physicmaterial", "physicsmaterial2d"],
+    typeNames: ["physicmaterial", "physicsmaterial", "physicmaterial2d", "physicsmaterial2d"],
+    queryType: "physicmaterial",
+    extensions: ["physicmaterial", "physicsmaterial", "physicsmaterial2d"],
+  },
+  {
+    typeNames: ["flare"],
+    queryType: "flare",
+    extensions: ["flare"],
+  },
+  {
+    typeNames: ["lightmapparameters"],
+    queryType: "lightmapparameters",
+    extensions: ["giparams"],
+  },
+  {
+    typeNames: ["terraindata"],
+    queryType: "terraindata",
+    extensions: ["asset"],
+  },
+  {
+    typeNames: ["terrainlayer"],
+    queryType: "terrainlayer",
+    extensions: ["terrainlayer", "asset"],
+  },
+  {
+    typeNames: ["tilebase"],
+    queryType: "tilebase",
+    extensions: ["asset"],
+  },
+  {
+    typeNames: ["visualeffectasset"],
+    queryType: "visualeffectasset",
+    extensions: ["vfx"],
+  },
+  {
+    typeNames: ["visualtreeasset"],
+    queryType: "visualtreeasset",
+    extensions: ["uxml"],
+  },
+  {
+    typeNames: ["stylesheet"],
+    queryType: "stylesheet",
+    extensions: ["uss", "tss", "asset"],
+  },
+  {
+    typeNames: ["themestylesheet"],
+    queryType: "themestylesheet",
+    extensions: ["tss", "asset"],
+  },
+  {
+    typeNames: ["panelsettings"],
+    queryType: "panelsettings",
+    extensions: ["asset"],
+    kinds: ["genericAsset"],
+    scriptableObject: true,
+  },
+  {
+    typeNames: ["paneltextsettings"],
+    queryType: "paneltextsettings",
+    extensions: ["asset"],
+    kinds: ["genericAsset"],
+    scriptableObject: true,
+  },
+  {
+    typeNames: ["fontasset"],
+    queryType: "fontasset",
+    extensions: ["asset"],
+    kinds: ["genericAsset"],
+    scriptableObject: true,
+  },
+  {
+    typeNames: ["spriteasset"],
+    queryType: "spriteasset",
+    extensions: ["asset"],
+    kinds: ["genericAsset"],
+    scriptableObject: true,
+  },
+  {
+    typeNames: ["textasset"],
+    queryType: "textasset",
+    extensions: ["txt", "bytes", "json", "xml", "yaml", "yml", "csv", "asset"],
   },
   {
     typeNames: ["scriptableobject"],
@@ -224,7 +435,9 @@ export function unityObjectReferenceSearchQuery(
   const shortName = normalizeUnityObjectReferenceType(filter.referenceTypeFullName);
   const tokens: string[] = [];
   const typeKey = unityObjectReferenceTypeKey(shortName);
-  if (rule.scriptableObject && shortName && typeKey !== "scriptableobject") {
+  if (!query && rule.broad) {
+    tokens.push(`t:${BROAD_OBJECT_QUERY_TYPES}`);
+  } else if (rule.scriptableObject && shortName && typeKey !== "scriptableobject") {
     tokens.push(`t:${shortName}`);
   } else if (rule.queryType) {
     tokens.push(`t:${rule.queryType}`);

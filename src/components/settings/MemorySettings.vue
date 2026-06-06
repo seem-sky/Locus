@@ -287,7 +287,28 @@ const profileSummary = computed(() => {
       : typeof record.narrative === "string"
         ? record.narrative
         : null;
+  if (!summary && concepts.length === 0 && topFiles.length === 0) {
+    return null;
+  }
   return { concepts, topFiles, summary };
+});
+
+const featureFlagRows = computed(() => {
+  const flags = insights.value?.featureFlags ?? [];
+  const keys = [
+    "CONSOLIDATION_ENABLED",
+    "GRAPH_EXTRACTION_ENABLED",
+    "AGENTMEMORY_AUTO_COMPRESS",
+  ];
+  return keys.map((key) => {
+    const flag = flags.find((item) => item.key === key);
+    return {
+      key,
+      label: flag?.label ?? key,
+      enabled: flag?.enabled ?? false,
+      needsLlm: flag?.needsLlm ?? true,
+    };
+  });
 });
 
 const patternItems = computed(() => {
@@ -336,7 +357,10 @@ const graphSummary = computed(() => {
       : typeof record.enabled === "boolean"
         ? record.enabled
         : null;
-  return { nodes, edges, healthy };
+  if ((nodes ?? 0) === 0 && (edges ?? 0) === 0 && healthy !== true) {
+    return null;
+  }
+  return { nodes: nodes ?? 0, edges: edges ?? 0, healthy };
 });
 
 async function loadAdvancedInsights() {
@@ -622,14 +646,16 @@ onMounted(async () => {
       v-if="hasWorkspace && serviceStatus?.available"
       class="memory-advanced-panel"
     >
-      <div class="memory-actions-header">
+      <div class="memory-advanced-header">
         <button
           type="button"
           class="memory-advanced-toggle"
           @click="insightsExpanded = !insightsExpanded"
         >
-          <span class="memory-service-title">{{ t("memory.advanced.title") }}</span>
-          <span class="memory-service-detail">{{ insightsExpanded ? "▾" : "▸" }}</span>
+          <span class="memory-advanced-toggle-main">
+            <span class="memory-service-title">{{ t("memory.advanced.title") }}</span>
+            <span class="memory-advanced-chevron">{{ insightsExpanded ? "▾" : "▸" }}</span>
+          </span>
         </button>
         <div class="memory-advanced-toolbar">
           <BaseButton
@@ -661,8 +687,20 @@ onMounted(async () => {
             {{ insights.errors.join(" · ") }}
           </div>
 
+          <div v-if="featureFlagRows.length" class="memory-advanced-flags">
+            <span
+              v-for="flag in featureFlagRows"
+              :key="flag.key"
+              class="memory-tag-chip"
+              :class="flag.enabled ? 'is-on' : 'is-off'"
+              :title="flag.key"
+            >
+              {{ flag.label }}: {{ flag.enabled ? "ON" : "OFF" }}
+            </span>
+          </div>
+
           <div class="memory-advanced-grid">
-            <section class="memory-advanced-card">
+            <section class="memory-advanced-card sessions-card">
               <h3>{{ t("memory.advanced.sessions") }}</h3>
               <div v-if="sessionRows.length === 0" class="memory-service-detail">
                 {{ t("memory.advanced.sessionsEmpty") }}
@@ -682,7 +720,7 @@ onMounted(async () => {
               </ul>
             </section>
 
-            <section class="memory-advanced-card">
+            <section class="memory-advanced-card profile-card">
               <h3>{{ t("memory.advanced.profile") }}</h3>
               <div v-if="!profileSummary" class="memory-service-detail">
                 {{ t("memory.advanced.profileEmpty") }}
@@ -706,7 +744,7 @@ onMounted(async () => {
               </template>
             </section>
 
-            <section class="memory-advanced-card">
+            <section class="memory-advanced-card graph-card">
               <h3>{{ t("memory.advanced.graph") }}</h3>
               <div v-if="!graphSummary" class="memory-service-detail">
                 {{ t("memory.advanced.graphEmpty") }}
@@ -859,13 +897,17 @@ onMounted(async () => {
   display: flex;
   flex-direction: column;
   gap: 16px;
+  min-width: 0;
+  max-width: 100%;
 }
 
 .settings-section-header {
   display: flex;
+  flex-wrap: wrap;
   align-items: flex-start;
   justify-content: space-between;
   gap: 12px;
+  min-width: 0;
 }
 
 .settings-section-desc {
@@ -897,31 +939,68 @@ onMounted(async () => {
   border: 1px solid var(--border-color);
   border-radius: 8px;
   background: color-mix(in srgb, var(--panel-bg) 94%, var(--bg-color) 6%);
+  min-width: 0;
+  overflow: hidden;
+}
+
+.memory-advanced-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
 }
 
 .memory-advanced-toggle {
-  display: inline-flex;
+  flex: 1 1 160px;
+  min-width: 0;
+  display: flex;
   align-items: center;
-  gap: 8px;
   padding: 0;
   border: none;
   background: transparent;
   color: inherit;
   cursor: pointer;
+  text-align: left;
+}
+
+.memory-advanced-toggle-main {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.memory-advanced-chevron {
+  flex-shrink: 0;
+  font-size: 12px;
+  color: var(--text-secondary);
 }
 
 .memory-advanced-toolbar {
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
-  margin-left: auto;
+  flex: 0 1 auto;
+  justify-content: flex-end;
+}
+
+.memory-advanced-flags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 10px;
 }
 
 .memory-advanced-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 12px;
   margin-top: 12px;
+  width: 100%;
+  min-width: 0;
+  align-items: start;
 }
 
 .memory-advanced-card {
@@ -929,6 +1008,10 @@ onMounted(async () => {
   border: 1px solid var(--border-color);
   border-radius: 6px;
   background: color-mix(in srgb, var(--panel-bg) 90%, var(--bg-color) 10%);
+  min-width: 0;
+  width: 100%;
+  box-sizing: border-box;
+  overflow: hidden;
 }
 
 .memory-advanced-card.wide {
@@ -949,6 +1032,12 @@ onMounted(async () => {
   display: flex;
   flex-direction: column;
   gap: 8px;
+  min-width: 0;
+}
+
+.memory-advanced-list > li {
+  min-width: 0;
+  word-break: break-word;
 }
 
 .memory-advanced-list.compact {
@@ -957,9 +1046,14 @@ onMounted(async () => {
   color: var(--text-secondary);
 }
 
+.memory-advanced-list.compact > li {
+  word-break: break-all;
+}
+
 .memory-advanced-row-title {
   font-size: 13px;
   font-weight: 600;
+  word-break: break-word;
 }
 
 .memory-advanced-text {
@@ -978,10 +1072,14 @@ onMounted(async () => {
 
 .memory-advanced-metrics {
   display: flex;
-  flex-direction: column;
-  gap: 4px;
+  flex-wrap: wrap;
+  gap: 6px 14px;
   font-size: 12px;
   color: var(--text-secondary);
+}
+
+.memory-advanced-card.graph-card .memory-advanced-metrics {
+  row-gap: 4px;
 }
 
 .memory-actions-header {
@@ -1144,6 +1242,20 @@ onMounted(async () => {
   background: color-mix(in srgb, var(--accent-color) 10%, transparent);
 }
 
+.memory-tag-chip.is-on {
+  border-color: color-mix(in srgb, var(--status-good-fg, #3dd68c) 35%, var(--border-color));
+  color: var(--status-good-fg, #3dd68c);
+  background: color-mix(in srgb, var(--status-good-fg, #3dd68c) 8%, transparent);
+  cursor: default;
+}
+
+.memory-tag-chip.is-off {
+  border-color: var(--border-color);
+  color: var(--text-tertiary, var(--text-secondary));
+  opacity: 0.85;
+  cursor: default;
+}
+
 .memory-settings-empty {
   padding: 24px;
   text-align: center;
@@ -1294,5 +1406,57 @@ onMounted(async () => {
   display: flex;
   justify-content: flex-end;
   gap: 8px;
+}
+
+@media (max-width: 860px) {
+  .memory-service-panel {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .memory-service-actions {
+    width: 100%;
+  }
+
+  .memory-advanced-header {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .memory-advanced-toggle {
+    flex: none;
+    width: 100%;
+  }
+
+  .memory-advanced-toolbar {
+    width: 100%;
+    justify-content: flex-start;
+  }
+
+  .memory-action-item {
+    flex-direction: column;
+    align-items: stretch;
+  }
+}
+
+/* 高级洞察三栏：宽屏三等分，中屏 2+1，窄屏单列 */
+@media (max-width: 1080px) {
+  .memory-advanced-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .memory-advanced-card.graph-card {
+    grid-column: 1 / -1;
+  }
+}
+
+@media (max-width: 640px) {
+  .memory-advanced-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .memory-advanced-card.graph-card {
+    grid-column: auto;
+  }
 }
 </style>

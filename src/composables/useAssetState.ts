@@ -709,7 +709,7 @@ export function useAssetState(props: AssetProps) {
       targetCache.value = new Map();
     }
     try {
-      const payload = await previewWorkspaceAsset(nextNode.path);
+      const payload = await previewWorkspaceAsset(nextNode.path, { textScope: "full" });
       if (session !== previewSession) return;
       previewPayload.value = payload;
       previewNode.value = nextNode;

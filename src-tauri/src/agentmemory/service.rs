@@ -183,6 +183,11 @@ impl AgentMemoryService {
         for (key, value) in llm_env.vars {
             cmd.env(key, value);
         }
+        if llm_env.configured {
+            cmd.env("AGENTMEMORY_AUTO_COMPRESS", "true");
+            cmd.env("CONSOLIDATION_ENABLED", "true");
+            cmd.env("GRAPH_EXTRACTION_ENABLED", "true");
+        }
 
         let child = cmd
             .spawn()

@@ -49,8 +49,16 @@ export function searchWorkspaceAssets(
   return ipcInvoke<AssetSearchResult[]>("search_workspace_assets", payload);
 }
 
-export function previewWorkspaceAsset(filePath: string): Promise<AssetPreviewPayload> {
-  return ipcInvoke<AssetPreviewPayload>("preview_workspace_asset", { filePath });
+export type AssetTextPreviewScope = "snippet" | "full";
+
+export function previewWorkspaceAsset(
+  filePath: string,
+  options?: { textScope?: AssetTextPreviewScope },
+): Promise<AssetPreviewPayload> {
+  return ipcInvoke<AssetPreviewPayload>("preview_workspace_asset", {
+    filePath,
+    textScope: options?.textScope,
+  });
 }
 
 export interface AssetThumbnailPreview {

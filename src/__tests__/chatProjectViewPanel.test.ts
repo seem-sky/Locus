@@ -28,7 +28,7 @@ describe("chat project view panel", () => {
     expect(chatStore).toContain("function closeFloatingAssetPreview()");
 
     expect(chatView).toContain("ChatFloatingAssetPreview");
-    expect(chatView).toContain("floatingAssetPreview && workingDir");
+    expect(chatView).toContain("showFloatingAssetPreview");
 
     expect(workspace).toContain("ChatProjectViewPanel");
     expect(panel).toContain("<AssetView :working-dir=\"workingDir\" embedded />");
@@ -51,8 +51,12 @@ describe("chat project view panel", () => {
     expect(zh).toContain('"asset.legacyExplorer.dblClickToPreview": "双击打开预览"');
 
     expect(floatingPreview).toContain("chat-floating-asset-preview");
-    expect(floatingPreview).toContain("inset: 0");
-    expect(chatView).toMatch(/<\/RichChatInput>\s*<\/div>\s*<ChatFloatingAssetPreview/);
+    expect(floatingPreview).toContain("flex: 1 1 0");
+    expect(floatingPreview).not.toContain("inset: 0");
+    expect(chatView).toContain("showFloatingAssetPreview");
+    expect(chatView).toContain('v-show="!showFloatingAssetPreview"');
+    expect(chatView).toContain("chat-view-stack");
+    expect(chatView).toMatch(/<\/div>\s*<ChatFloatingAssetPreview/);
     expect(floatingPreview).not.toContain("chat-floating-asset-preview-header");
     expect(floatingPreview).not.toContain("chat.floatingAssetPreview.dragHint");
     expect(floatingPreview).toContain("data-composer-asset-ref-drop");
@@ -60,6 +64,13 @@ describe("chat project view panel", () => {
     expect(floatingPreview).toContain("@drop=\"onPreviewDrop\"");
     expect(floatingPreview).toContain("useWorkspaceAssetPreview");
     expect(floatingPreview).toContain("AssetPreviewHost");
+
+    const workspacePreview = read("src/composables/useWorkspaceAssetPreview.ts");
+    expect(workspacePreview).toContain('textScope: "full"');
+
+    const codePreviewMenu = read("src/composables/useCodePreviewSelectionMenu.ts");
+    expect(codePreviewMenu).toContain("closeFloatingAssetPreview");
+    expect(codePreviewMenu).toContain("stageChatPrefillAppend");
 
     expect(assetRefDrag).toContain("LOCUS_ASSET_REF_DRAG_MIME");
     expect(assetRefDrag).toContain("draggingAssetRefPath");

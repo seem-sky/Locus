@@ -1,6 +1,9 @@
 //! Persisted READ/PLAN ambiguous-tool whitelist (app storage).
 
-use super::{effective_tool_args, normalize_bash_whitelist_key, resolve_effective_tool_name};
+use super::{
+    bash_command_matches_whitelist_entry, bash_whitelist_storage_key, effective_tool_args,
+    resolve_effective_tool_name,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashSet;
@@ -21,10 +24,22 @@ pub struct WorkflowAmbiguousWhitelist {
 impl WorkflowAmbiguousWhitelist {
     pub fn load_from_dir(data_dir: &Path) -> Self {
         let path = data_dir.join(WORKFLOW_TOOL_WHITELIST_FILENAME);
-        std::fs::read_to_string(&path)
+        let mut list = std::fs::read_to_string(&path)
             .ok()
-            .and_then(|raw| serde_json::from_str(&raw).ok())
-            .unwrap_or_default()
+            .and_then(|raw| serde_json::from_str::<Self>(&raw).ok())
+            .unwrap_or_default();
+        list.compact_bash_command_entries();
+        list
+    }
+
+    /// Collapse stored bash lines to prefix keys where possible (e.g. long grep → `grep -rn`).
+    fn compact_bash_command_entries(&mut self) {
+        let keys: Vec<String> = self
+            .bash_commands
+            .drain()
+            .map(|entry| bash_whitelist_storage_key(&entry))
+            .collect();
+        self.bash_commands = keys.into_iter().collect();
     }
 
     pub fn save_to_dir(&self, data_dir: &Path) -> Result<(), String> {
@@ -44,7 +59,8 @@ impl WorkflowAmbiguousWhitelist {
             };
             return self
                 .bash_commands
-                .contains(&normalize_bash_whitelist_key(command));
+                .iter()
+                .any(|entry| bash_command_matches_whitelist_entry(command, entry));
         }
         self.tools.contains(&effective)
     }
@@ -56,9 +72,7 @@ impl WorkflowAmbiguousWhitelist {
             let Some(command) = effective_args.get("command").and_then(|v| v.as_str()) else {
                 return false;
             };
-            return self
-                .bash_commands
-                .insert(normalize_bash_whitelist_key(command));
+            return self.bash_commands.insert(bash_whitelist_storage_key(command));
         }
         self.tools.insert(effective)
     }
@@ -76,6 +90,20 @@ mod tests {
         assert!(list.is_whitelisted(
             "bash",
             &serde_json::json!({"command": "foo.sh --bar"})
+        ));
+    }
+
+    #[test]
+    fn bash_whitelist_prefix_matches_grep_variants() {
+        let mut list = WorkflowAmbiguousWhitelist::default();
+        let long = r#"grep -rn "pb.decode/" Assets.Lua/ 2>/dev/null | head -10"#;
+        list.add("bash", &serde_json::json!({"command": long}));
+        assert!(list.bash_commands.iter().any(|e| e == "grep -rn"));
+        let other = r#"grep -rn "string_unpack/" "H:/texas-game/Assets.Lua/Core/" 2>/dev/null | head -20"#;
+        assert!(list.is_whitelisted("bash", &serde_json::json!({"command": other})));
+        assert!(!list.is_whitelisted(
+            "bash",
+            &serde_json::json!({"command": "grep -r foo"})
         ));
     }
 }

@@ -288,11 +288,20 @@ export interface AgentMemorySessionRow {
   endedAt?: string | null;
 }
 
+export type AgentMemoryFeatureFlag = {
+  key: string;
+  label?: string;
+  enabled?: boolean;
+  needsLlm?: boolean;
+  description?: string;
+};
+
 export interface AgentMemoryInsights {
   sessions: unknown;
   profile?: unknown;
   patterns?: unknown;
   graphStats?: unknown;
+  featureFlags?: AgentMemoryFeatureFlag[];
   errors: string[];
 }
 
@@ -339,6 +348,7 @@ export function agentmemoryInsights(workingDir: string): Promise<AgentMemoryInsi
     profile?: unknown;
     patterns?: unknown;
     graph_stats?: unknown;
+    feature_flags?: unknown;
     errors: string[];
   }>("agentmemory_insights", {
     request: { workingDir },
@@ -347,8 +357,23 @@ export function agentmemoryInsights(workingDir: string): Promise<AgentMemoryInsi
     profile: response.profile,
     patterns: response.patterns,
     graphStats: response.graph_stats,
+    featureFlags: parseFeatureFlags(response.feature_flags),
     errors: response.errors ?? [],
   }));
+}
+
+function parseFeatureFlags(raw: unknown): AgentMemoryFeatureFlag[] {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .filter((item): item is Record<string, unknown> => !!item && typeof item === "object")
+    .map((item) => ({
+      key: String(item.key ?? ""),
+      label: typeof item.label === "string" ? item.label : undefined,
+      enabled: typeof item.enabled === "boolean" ? item.enabled : undefined,
+      needsLlm: typeof item.needsLlm === "boolean" ? item.needsLlm : undefined,
+      description: typeof item.description === "string" ? item.description : undefined,
+    }))
+    .filter((item) => item.key.length > 0);
 }
 
 export { parseSessionRows };

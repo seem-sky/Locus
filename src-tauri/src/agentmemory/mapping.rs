@@ -356,6 +356,31 @@ pub fn category_from_concepts(concepts: &[String]) -> Option<MemoryCategory> {
             return MemoryCategory::from_str(raw);
         }
     }
+    category_from_tags(&user_tags_from_concepts(concepts))
+}
+
+/// Infer Locus category from agentmemory tags when `locus-category:*` concepts are missing.
+pub fn category_from_tags(tags: &[String]) -> Option<MemoryCategory> {
+    if tags.iter().any(|tag| tag == "preference") {
+        return Some(MemoryCategory::User);
+    }
+    if tags
+        .iter()
+        .any(|tag| matches!(tag.as_str(), "feedback" | "correction" | "avoidance"))
+    {
+        return Some(MemoryCategory::Feedback);
+    }
+    if tags.iter().any(|tag| {
+        matches!(
+            tag.as_str(),
+            "project" | "session-summary" | "session-outcome" | "architecture" | "workflow"
+        )
+    }) {
+        return Some(MemoryCategory::Topic);
+    }
+    if tags.iter().any(|tag| tag == "reference") {
+        return Some(MemoryCategory::Reference);
+    }
     None
 }
 
@@ -595,6 +620,26 @@ mod tests {
             "read",
             &serde_json::json!({"path": "README.md"}),
         ));
+    }
+
+    #[test]
+    fn category_from_tags_maps_locus_memory_kinds() {
+        assert_eq!(
+            category_from_tags(&["preference".to_string()]),
+            Some(MemoryCategory::User)
+        );
+        assert_eq!(
+            category_from_tags(&["correction".to_string(), "feedback".to_string()]),
+            Some(MemoryCategory::Feedback)
+        );
+        assert_eq!(
+            category_from_tags(&["session-summary".to_string()]),
+            Some(MemoryCategory::Topic)
+        );
+        assert_eq!(
+            category_from_tags(&["reference".to_string()]),
+            Some(MemoryCategory::Reference)
+        );
     }
 
     #[test]

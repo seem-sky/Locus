@@ -36,8 +36,22 @@ export interface UnitySerializedPropertyAttributeInfo {
   value?: string;
 }
 
+export interface UnitySerializedPropertyTargetSnapshot {
+  kind: string;
+  path?: string | null;
+  scenePath?: string | null;
+  objectPath?: string | null;
+  objectFileId?: number | null;
+  targetFileId?: number | null;
+  componentType?: string | null;
+  componentIndex?: number | null;
+  propertyPath?: string | null;
+}
+
 export interface UnitySerializedPropertySnapshot {
   propertyPath: string;
+  bindingTarget?: UnitySerializedPropertyTargetSnapshot | null;
+  target?: UnitySerializedPropertyTargetSnapshot | null;
   displayName?: string;
   name?: string;
   type?: string;
@@ -78,6 +92,7 @@ export interface UnitySerializedPropertyCommitEvent {
   propertyPath: string;
   value: unknown;
   property: UnitySerializedPropertySnapshot;
+  target?: UnitySerializedPropertyTargetSnapshot | null;
   writeMode?: "commit" | "preview";
 }
 

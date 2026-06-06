@@ -75,13 +75,12 @@ function onPreviewDrop(event: DragEvent) {
 
 <style scoped>
 .chat-floating-asset-preview {
-  position: absolute;
-  inset: 0;
-  z-index: 12;
-  display: flex;
-  flex-direction: column;
+  flex: 1 1 0;
+  width: 100%;
   min-width: 0;
   min-height: 0;
+  display: flex;
+  flex-direction: column;
   overflow: hidden;
   border: none;
   border-radius: 0;
@@ -98,6 +97,8 @@ function onPreviewDrop(event: DragEvent) {
 }
 
 .chat-floating-asset-preview-body :deep(.aph-root) {
-  height: 100%;
+  flex: 1 1 0;
+  min-height: 0;
+  width: 100%;
 }
 </style>

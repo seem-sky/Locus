@@ -18,8 +18,8 @@ pub use settings::{
     HeadroomProxyRuntimeStatus, HeadroomProxySource, HeadroomSettings, HeadroomSettingsStatus,
 };
 pub use rewrite::{
-    augment_path_with_headroom_rtk, grep_tool_native_meta, rewrite_bash_with_meta, rewrite_with_meta,
-    try_execute_rtk_grep, HeadroomRewriteMeta,
+    augment_path_with_headroom_rtk, grep_tool_native_meta, read_tool_native_meta,
+    rewrite_bash_with_meta, rewrite_with_meta, try_execute_rtk_grep, HeadroomRewriteMeta,
 };
 
 use serde::Serialize;

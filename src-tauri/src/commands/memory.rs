@@ -496,11 +496,15 @@ pub async fn agentmemory_replay_session(
         ));
     }
     let replayed = tauri::async_runtime::spawn_blocking(move || {
-        memory_store.replay_tool_observations_from_session_tree(
+        let replayed = memory_store.replay_tool_observations_from_session_tree(
             &session_store,
             &session_id,
             &working_dir,
-        )
+        )?;
+        if replayed > 0 {
+            memory_store.finalize_session_insights(&session_id, &working_dir)?;
+        }
+        Ok::<usize, AppError>(replayed)
     })
     .await
     .map_err(|e| {
@@ -1224,6 +1228,7 @@ pub struct AgentMemoryInsightsResponse {
     pub profile: Option<serde_json::Value>,
     pub patterns: Option<serde_json::Value>,
     pub graph_stats: Option<serde_json::Value>,
+    pub feature_flags: Option<serde_json::Value>,
     pub errors: Vec<String>,
 }
 
@@ -1269,6 +1274,8 @@ fn fetch_agentmemory_insights(
     working_dir: &str,
 ) -> Result<AgentMemoryInsightsResponse, String> {
     store.ensure_ready()?;
+    store.spawn_backfill_pending_crystals(working_dir);
+    store.spawn_backfill_semantic(Some(working_dir));
     let mut errors = Vec::new();
 
     let sessions = match store.list_sessions() {
@@ -1279,10 +1286,18 @@ fn fetch_agentmemory_insights(
         }
     };
 
-    let profile = match store.fetch_profile(working_dir) {
+    let profile = match store.fetch_profile(working_dir, false) {
         Ok(value) => Some(value),
         Err(error) => {
             errors.push(format!("profile: {error}"));
+            None
+        }
+    };
+
+    let feature_flags = match store.fetch_config_flags() {
+        Ok(value) => Some(value.get("flags").cloned().unwrap_or(value)),
+        Err(error) => {
+            errors.push(format!("flags: {error}"));
             None
         }
     };
@@ -1308,6 +1323,7 @@ fn fetch_agentmemory_insights(
         profile,
         patterns,
         graph_stats,
+        feature_flags,
         errors,
     })
 }

@@ -1382,6 +1382,69 @@ pub fn normalize_bash_whitelist_key(command: &str) -> String {
     command.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// Short prefix stored when whitelisting common read-only search/git/cargo bash invocations.
+pub fn extract_bash_whitelist_prefix(command: &str) -> Option<String> {
+    let segment = command.split('|').next()?.trim();
+    if segment.is_empty() {
+        return None;
+    }
+    let tokens = split_shell_words(segment);
+    if tokens.is_empty() {
+        return None;
+    }
+    let cmd = tokens[0].to_ascii_lowercase();
+
+    const FLAG_RUN_PREFIX: &[&str] = &[
+        "grep", "egrep", "fgrep", "zgrep", "bzgrep", "rg", "ripgrep", "ag", "ack", "findstr",
+    ];
+    if FLAG_RUN_PREFIX.contains(&cmd.as_str()) {
+        let mut end = 1usize;
+        while end < tokens.len() && tokens[end].starts_with('-') {
+            end += 1;
+        }
+        if end > 1 {
+            return Some(tokens[..end].join(" "));
+        }
+        return Some(cmd);
+    }
+
+    if is_git_executable(&cmd) {
+        if tokens.len() >= 2 {
+            let mut end = 2usize;
+            while end < tokens.len() && tokens[end].starts_with('-') {
+                end += 1;
+            }
+            return Some(tokens[..end].join(" "));
+        }
+    }
+
+    if cmd == "cargo" && tokens.len() >= 2 && !tokens[1].starts_with('-') {
+        return Some(format!("{} {}", tokens[0], tokens[1]));
+    }
+
+    None
+}
+
+/// Key written to the persisted bash whitelist (prefix when extractable, else full command).
+pub fn bash_whitelist_storage_key(command: &str) -> String {
+    extract_bash_whitelist_prefix(command)
+        .map(|prefix| normalize_bash_whitelist_key(&prefix))
+        .unwrap_or_else(|| normalize_bash_whitelist_key(command))
+}
+
+/// Whether a bash command matches a whitelist entry (exact or prefix: entry + space + more).
+pub fn bash_command_matches_whitelist_entry(command: &str, entry: &str) -> bool {
+    let cmd = normalize_bash_whitelist_key(command);
+    let key = normalize_bash_whitelist_key(entry);
+    if cmd == key {
+        return true;
+    }
+    if cmd.len() <= key.len() {
+        return false;
+    }
+    cmd.starts_with(&key) && cmd.as_bytes().get(key.len()) == Some(&b' ')
+}
+
 /// READ/PLAN: ambiguous tools (cannot classify as read vs edit) require user approval before run.
 pub fn workflow_ambiguous_tool_requires_user_confirm(
     gate: &WorkflowGate,
@@ -1399,6 +1462,46 @@ pub fn workflow_ambiguous_tool_requires_user_confirm(
         return false;
     }
     classify_tool_workflow_kind(tool_name, args) == ToolWorkflowKind::Ambiguous
+}
+
+/// READ/PLAN: whitelisted bash/tools skip workflow ambiguous and per-tool permission confirms.
+pub fn workflow_read_plan_whitelist_skips_tool_confirm(
+    gate: &WorkflowGate,
+    tool_name: &str,
+    args: &Value,
+    persisted_whitelist: &WorkflowAmbiguousWhitelist,
+) -> bool {
+    if !gate.strict {
+        return false;
+    }
+    if !matches!(gate.phase, CodeEditPhase::Read | CodeEditPhase::Plan) {
+        return false;
+    }
+    let effective = resolve_effective_tool_name(tool_name, args);
+    let effective_args = effective_tool_args(tool_name, args);
+    if effective == "bash" && bash_rm_requires_user_confirm(&effective_args) {
+        return false;
+    }
+    persisted_whitelist.is_whitelisted(tool_name, args)
+}
+
+/// Whether the tool confirm card may offer "add to READ/PLAN whitelist".
+pub fn workflow_read_plan_whitelist_offerable(
+    gate: &WorkflowGate,
+    tool_name: &str,
+    args: &Value,
+    workflow_ambiguous_requires_confirm: bool,
+) -> bool {
+    if !gate.strict {
+        return false;
+    }
+    if !matches!(gate.phase, CodeEditPhase::Read | CodeEditPhase::Plan) {
+        return false;
+    }
+    if tool_name == "bash" && bash_rm_requires_user_confirm(args) {
+        return false;
+    }
+    workflow_ambiguous_requires_confirm || tool_name == "bash"
 }
 
 pub const WORKFLOW_AMBIGUOUS_TOOL_CONFIRM_NOTE: &str = "READ/PLAN 阶段：无法判定该工具是只读探索还是修改代码。请确认是否执行。";
@@ -2092,6 +2195,28 @@ mod tests {
         assert!(!whitelist.is_whitelisted(
             "bash",
             &serde_json::json!({"command": "other_script.sh"})
+        ));
+    }
+
+    #[test]
+    fn bash_whitelist_prefix_entry_matches_longer_grep_command() {
+        let mut list = WorkflowAmbiguousWhitelist::default();
+        list.bash_commands.insert("grep -rn".to_string());
+        let cmd = r#"grep -rn "xlua" Assets.Lua/ 2>/dev/null | head -10"#;
+        assert!(list.is_whitelisted("bash", &serde_json::json!({"command": cmd})));
+    }
+
+    #[test]
+    fn read_plan_whitelist_skips_grep_bash_confirm() {
+        let gate = WorkflowGate::with_strict(true);
+        let mut list = WorkflowAmbiguousWhitelist::default();
+        list.bash_commands.insert("grep -rn".to_string());
+        let args = serde_json::json!({"command": r#"grep -rn "foo" Assets/"#});
+        assert!(workflow_read_plan_whitelist_skips_tool_confirm(
+            &gate, "bash", &args, &list
+        ));
+        assert!(workflow_read_plan_whitelist_offerable(
+            &gate, "bash", &args, false
         ));
     }
 

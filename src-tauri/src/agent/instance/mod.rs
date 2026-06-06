@@ -18,7 +18,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 
 use crate::agent::definition::{AgentDef, AgentDefRegistry};
 use crate::agent::session_language::{
@@ -9128,16 +9128,14 @@ impl AgentInstance {
             let working_dir = self.working_dir.clone();
             let store = store.clone();
             match tauri::async_runtime::spawn_blocking(move || {
-                if let Err(error) = memory_store.replay_tool_observations_from_session_tree(
-                    &store,
-                    &session_id,
-                    &working_dir,
-                ) {
-                    eprintln!(
-                        "[agentmemory] replay tool observations failed for session {session_id}: {error}"
-                    );
-                }
-                memory_store.session_end(&session_id, Some(&working_dir))
+                memory_store
+                    .finalize_session_on_close(&store, &session_id, &working_dir)
+                    .map_err(|error| {
+                        eprintln!(
+                            "[agentmemory] finalize session on agent run end failed for {session_id}: {error}"
+                        );
+                        error
+                    })
             })
             .await
             {
@@ -9426,6 +9424,8 @@ impl AgentInstance {
         knowledge_governance_requires_confirm: bool,
         workflow_ambiguous_requires_confirm: bool,
         bash_rm_requires_confirm: bool,
+        workflow_whitelist_offered: bool,
+        workflow_whitelist_skip: bool,
     ) -> ToolConfirmAssessment {
         let mut reasons = Vec::new();
         if let Some(reason) = Self::permission_confirm_reason(global_mode, tool_mode, tool_name) {
@@ -9441,8 +9441,17 @@ impl AgentInstance {
             reasons.push(ToolConfirmReason::DestructiveBashRm);
         }
 
+        if workflow_whitelist_skip {
+            reasons.retain(|reason| {
+                !matches!(
+                    reason,
+                    ToolConfirmReason::UserPermission | ToolConfirmReason::WorkflowAmbiguous
+                )
+            });
+        }
+
         let mut workflow_notes = Vec::new();
-        if workflow_ambiguous_requires_confirm {
+        if workflow_ambiguous_requires_confirm && !workflow_whitelist_skip {
             workflow_notes.push(
                 crate::agent::workflow::WORKFLOW_AMBIGUOUS_TOOL_CONFIRM_NOTE.to_string(),
             );
@@ -9455,8 +9464,6 @@ impl AgentInstance {
         } else {
             Some(workflow_notes.join("\n\n"))
         };
-        let workflow_whitelist_offered = workflow_ambiguous_requires_confirm
-            && !(tool_name == "bash" && bash_rm_requires_confirm);
 
         ToolConfirmAssessment {
             reasons,
@@ -9480,7 +9487,11 @@ impl AgentInstance {
         let state: tauri::State<crate::WorkflowToolWhitelist> = app_handle.state();
         let mut whitelist = state.0.write().await;
         whitelist.add(tool_name, args);
-        whitelist.save_to_dir(&data_dir)
+        whitelist.save_to_dir(&data_dir)?;
+        let payload =
+            crate::commands::WorkflowToolWhitelistPayload::from(whitelist.clone());
+        let _ = app_handle.emit("workflow-tool-whitelist-updated", payload);
+        Ok(())
     }
 
     fn parse_tool_confirm_answer(answer: &str) -> ToolConfirmDecision {
@@ -9581,6 +9592,32 @@ impl AgentInstance {
                 })
                 .flatten()
                 .unwrap_or(false);
+        let workflow_whitelist_skip = WorkflowGate::applies(&self.def.id, mode)
+            && self
+                .with_dev_workflow_gate(mode, |gate| {
+                    Some(
+                        crate::agent::workflow::workflow_read_plan_whitelist_skips_tool_confirm(
+                            gate,
+                            tool_name,
+                            args,
+                            &workflow_whitelist,
+                        ),
+                    )
+                })
+                .flatten()
+                .unwrap_or(false);
+        let workflow_whitelist_offered = WorkflowGate::applies(&self.def.id, mode)
+            && self
+                .with_dev_workflow_gate(mode, |gate| {
+                    Some(crate::agent::workflow::workflow_read_plan_whitelist_offerable(
+                        gate,
+                        tool_name,
+                        args,
+                        workflow_ambiguous_requires_confirm,
+                    ))
+                })
+                .flatten()
+                .unwrap_or(false);
         let bash_rm_requires_confirm = tool_name == "bash"
             && crate::agent::workflow::bash_rm_requires_user_confirm(args);
 
@@ -9588,6 +9625,7 @@ impl AgentInstance {
             && !knowledge_governance_requires_confirm
             && !workflow_ambiguous_requires_confirm
             && !bash_rm_requires_confirm
+            && !workflow_whitelist_skip
         {
             eprintln!(
                 "[Agent {}] tool confirm skipped for '{}' (global_mode=auto)",
@@ -9607,6 +9645,8 @@ impl AgentInstance {
             knowledge_governance_requires_confirm,
             workflow_ambiguous_requires_confirm,
             bash_rm_requires_confirm,
+            workflow_whitelist_offered,
+            workflow_whitelist_skip,
         );
 
         if assessment.reasons.is_empty() {
@@ -16732,6 +16772,8 @@ Audit and export a plugin.
             true,
             false,
             false,
+            false,
+            false,
         );
         assert_eq!(
             assessment.reasons,
@@ -16750,6 +16792,25 @@ Audit and export a plugin.
             false,
             false,
             false,
+            false,
+            false,
+        );
+        assert!(assessment.reasons.is_empty());
+    }
+
+    #[test]
+    fn read_plan_whitelist_skips_bash_permission_confirm() {
+        let assessment = AgentInstance::assess_tool_confirmation(
+            "ask",
+            Some("ask"),
+            "bash",
+            r#"{"command":"grep -rn \"foo\" Assets.Lua/"}"#,
+            None,
+            false,
+            false,
+            false,
+            true,
+            true,
         );
         assert!(assessment.reasons.is_empty());
     }
@@ -16765,6 +16826,8 @@ Audit and export a plugin.
             false,
             false,
             true,
+            false,
+            false,
         );
         assert_eq!(
             assessment.reasons,

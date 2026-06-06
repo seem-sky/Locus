@@ -66,7 +66,7 @@ export function useWorkspaceAssetPreview(
     targetCache.value = new Map();
 
     try {
-      const payload = await previewWorkspaceAsset(normalizedPath);
+      const payload = await previewWorkspaceAsset(normalizedPath, { textScope: "full" });
       if (session !== previewSession) return;
       previewPayload.value = payload;
       const defaultTargetId = defaultStructuredTargetId(payload);

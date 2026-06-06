@@ -716,7 +716,7 @@ fn memory_profile() -> ToolDef {
                     Err(result) => return result,
                 };
                 run_store_json(&ctx, "memory_profile", move |store| {
-                    store.fetch_profile(&working_dir)
+                    store.fetch_profile(&working_dir, false)
                 })
                 .await
             })

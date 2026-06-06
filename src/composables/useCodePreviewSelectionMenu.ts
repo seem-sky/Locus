@@ -1,6 +1,7 @@
 import { ref } from "vue";
 import { t } from "../i18n";
 import { useCopyFeedback } from "./useCopyFeedback";
+import { useChatStore } from "../stores/chat";
 import { useUiStore } from "../stores/ui";
 import { useNotificationStore } from "../stores/notification";
 import {
@@ -19,6 +20,7 @@ export interface CodePreviewSelectionMenuState {
 }
 
 export function useCodePreviewSelectionMenu(defaultMeta: () => CodePreviewSelectionMeta) {
+  const chatStore = useChatStore();
   const uiStore = useUiStore();
   const notificationStore = useNotificationStore();
   const { copyText } = useCopyFeedback();
@@ -68,6 +70,7 @@ export function useCodePreviewSelectionMenu(defaultMeta: () => CodePreviewSelect
       { text: current.text, lineRange: current.lineRange },
       current.meta,
     );
+    chatStore.closeFloatingAssetPreview();
     uiStore.setTab("chat");
     uiStore.stageChatPrefillAppend(payload);
   }

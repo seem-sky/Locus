@@ -251,6 +251,8 @@ export interface ViewBindingTarget {
   path?: string | null;
   scenePath?: string | null;
   objectPath?: string | null;
+  objectFileId?: number | null;
+  targetFileId?: number | null;
   componentType?: string | null;
   componentIndex?: number | null;
   propertyPath?: string | null;

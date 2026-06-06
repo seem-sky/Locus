@@ -1,5 +1,5 @@
 {
-  "description": "Read a workspace file.\n- Text files return file content (up to 2000 lines by default)\n- Use offset and limit to page through large text files\n- PNG, JPEG, GIF, and WebP images return an image attachment; offset and limit are ignored for images\n- This tool only reads files; use list for directories\n- Do not use this tool for documents under Locus/knowledge, including Memory. Use knowledge_list, knowledge_query, or knowledge_read instead",
+  "description": "Read a workspace file.\n- Text files return file content (up to 2000 lines by default)\n- Use offset and limit to page through large text files\n- When Headroom is enabled and output exceeds the compress threshold, large read results are compressed through headroom-ai (requires headroom proxy or HEADROOM_API_KEY)\n- PNG, JPEG, GIF, and WebP images return an image attachment; offset and limit are ignored for images\n- This tool only reads files; use list for directories\n- Do not use this tool for documents under Locus/knowledge, including Memory. Use knowledge_list, knowledge_query, or knowledge_read instead",
   "parameters": {
     "type": "object",
     "properties": {

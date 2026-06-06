@@ -4,6 +4,7 @@ pub mod client;
 pub mod llm_env;
 pub mod mapping;
 pub mod resolve;
+pub mod semantic;
 pub mod service;
 
 pub use actions::{
@@ -190,6 +191,15 @@ impl AgentMemoryState {
             project_arg,
             agent_id,
         )?;
+        if matches!(entry.scope, MemoryScope::Project) && !project.is_empty() {
+            semantic::mirror_memory_content_to_semantic(
+                &self.client,
+                &entry.content,
+                Some(project.as_str()),
+                0.55,
+                "mirror project memory to semantic",
+            );
+        }
         let scope = entry.scope;
         entry_from_remember_response(entry, &body, scope, &project)
     }
@@ -581,6 +591,88 @@ impl AgentMemoryState {
     }
 
     /// Backfill agentmemory timeline from persisted Locus tool results (parent + subagent sessions).
+    /// Auto-save session memory candidates (preference / feedback / topic / reference) into agentmemory.
+    pub fn persist_session_memory_candidates(
+        &self,
+        store: &SessionStore,
+        session_id: &str,
+        working_dir: &str,
+    ) -> Result<usize, String> {
+        if working_dir.trim().is_empty() {
+            return Ok(0);
+        }
+        let _ = self.ensure_ready();
+        let messages = store.get_messages(session_id)?;
+        let Some(candidates) = crate::memory::evaluate_memory_proposal_from_session(&messages) else {
+            return Ok(0);
+        };
+        let mut existing_keys = self
+            .list(
+                working_dir,
+                None,
+                &MemoryListFilter {
+                    category: None,
+                    scope: None,
+                    tags: None,
+                    query: None,
+                    limit: Some(500),
+                    offset: None,
+                },
+            )
+            .map(|entries| {
+                entries
+                    .iter()
+                    .map(|entry| memory_content_dedupe_key(&entry.content))
+                    .collect::<HashSet<_>>()
+            })
+            .unwrap_or_default();
+        let mut saved = 0usize;
+        for (category, content, tags, _confidence) in candidates {
+            if !mapping::should_include_memory_content(&content) {
+                continue;
+            }
+            let key = memory_content_dedupe_key(&content);
+            if existing_keys.contains(&key) {
+                continue;
+            }
+            let item = crate::session::models::MemoryProposalItem {
+                category,
+                content: content.clone(),
+                tags,
+                scope: crate::memory::default_scope_for_category(category),
+            };
+            let entry = crate::memory::build_memory_entry_from_proposal_item(
+                &item,
+                Some(session_id.to_string()),
+            );
+            match self.create(working_dir, None, entry, None) {
+                Ok(_) => {
+                    existing_keys.insert(key);
+                    saved += 1;
+                    if category == MemoryCategory::Feedback {
+                        let project = normalize_project_path(working_dir);
+                        if !project.is_empty() {
+                            let _ = self.client.save_lesson(
+                                &content,
+                                Some(session_id),
+                                Some(0.65),
+                                Some(project.as_str()),
+                                &item.tags,
+                            );
+                        }
+                    }
+                }
+                Err(error) => {
+                    eprintln!(
+                        "[agentmemory] auto-persist memory candidate failed session={session_id} category={}: {error}",
+                        category.as_str()
+                    );
+                }
+            }
+        }
+        Ok(saved)
+    }
+
     pub fn replay_tool_observations_from_session_tree(
         &self,
         store: &SessionStore,
@@ -835,17 +927,35 @@ impl AgentMemoryState {
             return Ok(());
         }
         let _ = self.client.session_end(session_id);
-        let summarize_body = self.client.summarize_session(session_id).ok();
-        if let (Some(working_dir), Some(body)) = (
-            working_dir.map(str::trim).filter(|value| !value.is_empty()),
-            summarize_body.as_ref(),
-        ) {
-            self.create_actions_from_session_summary(body, session_id, working_dir);
-        }
-        if session_end_auto_consolidate_enabled() {
-            let _ = self
-                .client
-                .run_consolidate_pipeline(Some("all"), Some(false));
+        let summarize_body = match self.client.summarize_session(session_id) {
+            Ok(body) => Some(body),
+            Err(error) => {
+                eprintln!("[agentmemory] summarize failed for session {session_id}: {error}");
+                None
+            }
+        };
+        if let Some(working_dir) = working_dir.map(str::trim).filter(|value| !value.is_empty()) {
+            if let Some(body) = summarize_body.as_ref() {
+                if body.get("success").and_then(|v| v.as_bool()) == Some(false) {
+                    let reason = body
+                        .get("error")
+                        .or_else(|| body.get("reason"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown");
+                    eprintln!(
+                        "[agentmemory] summarize skipped for session {session_id}: {reason}"
+                    );
+                }
+                self.apply_session_summary_outcomes(body, session_id, working_dir);
+            }
+            self.spawn_backfill_pending_crystals(working_dir);
+            self.spawn_backfill_semantic(Some(working_dir));
+            if session_end_auto_consolidate_enabled() {
+                let project = normalize_project_path(working_dir);
+                if !project.is_empty() {
+                    self.spawn_session_end_consolidate(Some(project));
+                }
+            }
         }
         if let Ok(mut guard) = self.started_sessions.lock() {
             guard.remove(session_id);
@@ -853,26 +963,385 @@ impl AgentMemoryState {
         Ok(())
     }
 
-    fn create_actions_from_session_summary(
+    /// Backfill crystals for session-summary actions still pending crystallization.
+    pub fn backfill_pending_crystals(&self, working_dir: &str) -> Result<(), String> {
+        if working_dir.trim().is_empty() {
+            return Ok(());
+        }
+        self.ensure_ready()?;
+        backfill_pending_session_crystals_sync(&self.client, working_dir);
+        Ok(())
+    }
+
+    /// Run [`backfill_pending_crystals`] in the background (LLM-backed, may take minutes).
+    pub fn spawn_backfill_pending_crystals(&self, working_dir: &str) {
+        if working_dir.trim().is_empty() {
+            return;
+        }
+        let Ok(()) = self.ensure_ready() else {
+            return;
+        };
+        let client = self.client.clone();
+        let working_dir = working_dir.to_string();
+        std::thread::spawn(move || {
+            backfill_pending_session_crystals_sync(&client, &working_dir);
+        });
+    }
+
+    /// Re-upsert semantic facts from stored summaries (fast, no LLM).
+    pub fn spawn_backfill_semantic(&self, working_dir: Option<&str>) {
+        let Ok(()) = self.ensure_ready() else {
+            return;
+        };
+        let client = self.client.clone();
+        let working_dir = working_dir.map(|value| value.to_string());
+        std::thread::spawn(move || {
+            semantic::backfill_semantic_from_stored_summaries_sync(
+                &client,
+                working_dir.as_deref(),
+            );
+        });
+    }
+
+    /// Replay tool results, summarize, and persist proposals when a chat session is archived or closed.
+    pub fn finalize_session_on_close(
+        &self,
+        store: &SessionStore,
+        session_id: &str,
+        working_dir: &str,
+    ) -> Result<(), String> {
+        if working_dir.trim().is_empty() {
+            return Ok(());
+        }
+        if let Err(error) =
+            self.replay_tool_observations_from_session_tree(store, session_id, working_dir)
+        {
+            eprintln!("[agentmemory] replay on session close failed for {session_id}: {error}");
+        }
+        self.session_end(session_id, Some(working_dir))?;
+        if let Err(error) = self.persist_session_memory_candidates(store, session_id, working_dir)
+        {
+            eprintln!(
+                "[agentmemory] persist memory candidates on session close failed for {session_id}: {error}"
+            );
+        }
+        Ok(())
+    }
+
+    /// After replaying tool observations, run summarize → memories/lessons/crystals for one session.
+    pub fn finalize_session_insights(&self, session_id: &str, working_dir: &str) -> Result<(), String> {
+        if working_dir.trim().is_empty() {
+            return Ok(());
+        }
+        self.ensure_ready()?;
+        match self.client.summarize_session(session_id) {
+            Ok(body) => {
+                if body.get("success").and_then(|v| v.as_bool()) == Some(false) {
+                    let reason = body
+                        .get("error")
+                        .or_else(|| body.get("reason"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown");
+                    eprintln!(
+                        "[agentmemory] finalize summarize skipped for session {session_id}: {reason}"
+                    );
+                }
+                self.apply_session_summary_outcomes(&body, session_id, working_dir);
+            }
+            Err(error) => {
+                eprintln!(
+                    "[agentmemory] finalize summarize failed for session {session_id}: {error}"
+                );
+            }
+        }
+        backfill_pending_session_crystals_sync(&self.client, working_dir);
+        self.spawn_backfill_semantic(Some(working_dir));
+        Ok(())
+    }
+
+    fn apply_session_summary_outcomes(
         &self,
         summarize_body: &serde_json::Value,
         session_id: &str,
         working_dir: &str,
     ) {
+        if summarize_body.get("success").and_then(|v| v.as_bool()) != Some(true) {
+            return;
+        }
+        let parent_action_id =
+            self.create_actions_from_session_summary(summarize_body, session_id, working_dir);
+        self.remember_session_summary_memories(summarize_body, session_id, working_dir);
+        self.persist_session_summary_lessons(summarize_body, session_id, working_dir);
+        self.persist_session_summary_semantic(summarize_body, session_id, working_dir);
+        self.spawn_session_summary_crystallize(
+            summarize_body.clone(),
+            session_id.to_string(),
+            working_dir.to_string(),
+            parent_action_id,
+        );
+    }
+
+    /// Consolidation can take 60s+ (LLM); run in background so session_end returns promptly.
+    fn spawn_session_end_consolidate(&self, project: Option<String>) {
+        let client = self.client.clone();
+        std::thread::spawn(move || {
+            if let Err(error) = client.run_consolidate_pipeline(Some("all"), Some(true)) {
+                eprintln!("[agentmemory] session-end consolidate-pipeline failed: {error}");
+            }
+            let Some(project) = project.filter(|value| !value.is_empty()) else {
+                return;
+            };
+            if let Err(error) = client.run_consolidate_memories(Some(project.as_str()), Some(3)) {
+                eprintln!("[agentmemory] session-end consolidate failed: {error}");
+            }
+            if let Err(error) = client.fetch_profile(&project, true) {
+                eprintln!("[agentmemory] session-end profile refresh failed: {error}");
+            }
+            backfill_pending_session_crystals_sync(&client, &project);
+        });
+    }
+
+    /// Persist session summary narrative and key decisions into agentmemory Memories.
+    fn remember_session_summary_memories(
+        &self,
+        summarize_body: &serde_json::Value,
+        session_id: &str,
+        working_dir: &str,
+    ) {
+        if summarize_body.get("success").and_then(|v| v.as_bool()) != Some(true) {
+            return;
+        }
+        let Some(summary) = summarize_body.get("summary") else {
+            return;
+        };
+        let project = normalize_project_path(working_dir);
+        if project.is_empty() {
+            return;
+        }
+        let session_concept = format!("locus-session:{session_id}");
+        if self.session_summary_memories_exist(&session_concept) {
+            return;
+        }
+
+        let title = summary
+            .get("title")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let narrative = summary
+            .get("narrative")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        if let (Some(title), Some(narrative)) = (title, narrative) {
+            let content = format!("{title}\n\n{narrative}");
+            if mapping::should_include_memory_content(&content) {
+                let concepts = build_concepts(
+                    MemoryCategory::Topic,
+                    MemoryScope::Project,
+                    false,
+                    &[
+                        session_concept.clone(),
+                        "locus:session-summary".to_string(),
+                    ],
+                );
+                if let Err(error) = self.client.remember(
+                    &content,
+                    category_to_agent_type(MemoryCategory::Topic),
+                    &concepts,
+                    Some(project.as_str()),
+                    Some("locus"),
+                ) {
+                    eprintln!(
+                        "[agentmemory] session summary memory remember failed for {session_id}: {error}"
+                    );
+                }
+            }
+        }
+
+        let key_decisions = summary
+            .get("keyDecisions")
+            .and_then(|v| v.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str().map(str::trim).filter(|s| !s.is_empty()))
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for decision in key_decisions {
+            if !mapping::should_include_memory_content(&decision) {
+                continue;
+            }
+            let concepts = build_concepts(
+                MemoryCategory::Reference,
+                MemoryScope::Project,
+                false,
+                &[
+                    session_concept.clone(),
+                    "locus:session-decision".to_string(),
+                    "reference".to_string(),
+                ],
+            );
+            if let Err(error) = self.client.remember(
+                &decision,
+                category_to_agent_type(MemoryCategory::Reference),
+                &concepts,
+                Some(project.as_str()),
+                Some("locus"),
+            ) {
+                eprintln!(
+                    "[agentmemory] session decision memory remember failed for {session_id}: {error}"
+                );
+            }
+        }
+    }
+
+    /// Write summarize key decisions into agentmemory Lessons (KV.mem:lessons).
+    fn persist_session_summary_lessons(
+        &self,
+        summarize_body: &serde_json::Value,
+        session_id: &str,
+        working_dir: &str,
+    ) {
+        if summarize_body.get("success").and_then(|v| v.as_bool()) != Some(true) {
+            return;
+        }
+        let Some(summary) = summarize_body.get("summary") else {
+            return;
+        };
+        let project = normalize_project_path(working_dir);
+        if project.is_empty() {
+            return;
+        }
+        let context = summary
+            .get("title")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(session_id);
+        let key_decisions = summary
+            .get("keyDecisions")
+            .and_then(|v| v.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str().map(str::trim).filter(|s| !s.is_empty()))
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for decision in key_decisions {
+            if !mapping::should_include_memory_content(&decision) {
+                continue;
+            }
+            if let Err(error) = self.client.save_lesson(
+                &decision,
+                Some(context),
+                Some(0.6),
+                Some(project.as_str()),
+                &[
+                    "locus:session-decision".to_string(),
+                    format!("locus-session:{session_id}"),
+                ],
+            ) {
+                eprintln!(
+                    "[agentmemory] session decision lesson save failed for {session_id}: {error}"
+                );
+            }
+        }
+    }
+
+    /// Write summarize key decisions / concepts / narrative into agentmemory semantic KV.
+    fn persist_session_summary_semantic(
+        &self,
+        summarize_body: &serde_json::Value,
+        session_id: &str,
+        working_dir: &str,
+    ) {
+        if summarize_body.get("success").and_then(|v| v.as_bool()) != Some(true) {
+            return;
+        }
+        let Some(summary) = summarize_body.get("summary") else {
+            return;
+        };
+        let project = normalize_project_path(working_dir);
+        let facts = semantic::semantic_facts_from_summary(summary);
+        semantic::upsert_semantic_facts_checked(
+            &self.client,
+            &facts,
+            Some(session_id),
+            if project.is_empty() {
+                None
+            } else {
+                Some(project.as_str())
+            },
+            &format!("session semantic upsert for {session_id}"),
+        );
+    }
+
+    fn session_summary_memories_exist(&self, session_concept: &str) -> bool {
+        let Ok(body) = self.client.list_memories(true, Some(500)) else {
+            return false;
+        };
+        let memories = body
+            .get("memories")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        memories.iter().any(|memory| {
+            memory
+                .get("concepts")
+                .and_then(|v| v.as_array())
+                .map(|items| {
+                    items.iter().any(|item| {
+                        item.as_str() == Some(session_concept)
+                    })
+                })
+                .unwrap_or(false)
+        })
+    }
+
+    fn find_session_summary_parent_action(
+        &self,
+        working_dir: &str,
+        session_id: &str,
+    ) -> Option<String> {
+        let session_tag = format!("locus:session-id:{session_id}");
+        let actions = self.list_actions(working_dir, None).ok()?;
+        actions
+            .into_iter()
+            .find(|action| {
+                action.tags.iter().any(|tag| tag == &session_tag)
+                    && action
+                        .tags
+                        .iter()
+                        .any(|tag| tag == "locus:session-summary")
+            })
+            .map(|action| action.id)
+    }
+
+    fn create_actions_from_session_summary(
+        &self,
+        summarize_body: &serde_json::Value,
+        session_id: &str,
+        working_dir: &str,
+    ) -> Option<String> {
         let session_tag = format!("locus:session-id:{session_id}");
         if let Ok(existing) = self.list_actions(working_dir, None) {
             let already_created = existing
                 .iter()
                 .any(|action| action.tags.iter().any(|tag| tag == &session_tag));
             if already_created {
-                return;
+                return self.find_session_summary_parent_action(working_dir, session_id);
             }
         }
 
         let Some(batch) =
             actions::summary_action_batch_from_response(summarize_body, session_id, working_dir)
         else {
-            return;
+            return None;
         };
         match self.create_action(batch.parent) {
             Ok(parent) => {
@@ -884,13 +1353,71 @@ impl AgentMemoryState {
                         );
                     }
                 }
+                Some(parent.id)
             }
             Err(err) => {
                 eprintln!(
                     "[agentmemory] session summary action create failed for {session_id}: {err}"
                 );
+                None
             }
         }
+    }
+
+    /// Crystallize requires completed actions; run in background after marking session summary done.
+    fn spawn_session_summary_crystallize(
+        &self,
+        summarize_body: serde_json::Value,
+        session_id: String,
+        working_dir: String,
+        parent_action_id: Option<String>,
+    ) {
+        let Some(parent_action_id) = parent_action_id else {
+            return;
+        };
+        if summarize_body.get("success").and_then(|v| v.as_bool()) != Some(true) {
+            return;
+        }
+        let client = self.client.clone();
+        std::thread::spawn(move || {
+            let project = normalize_project_path(&working_dir);
+            if project.is_empty() {
+                return;
+            }
+            if let Ok(body) = client.get_action(&parent_action_id) {
+                if body
+                    .get("action")
+                    .and_then(|value| value.get("crystallizedInto"))
+                    .is_some()
+                {
+                    return;
+                }
+            }
+            let result_text = summarize_body
+                .get("summary")
+                .and_then(|summary| summary.get("narrative"))
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("Session completed");
+            if let Err(error) = client.update_action(serde_json::json!({
+                "actionId": parent_action_id,
+                "status": "done",
+                "result": result_text,
+            })) {
+                eprintln!(
+                    "[agentmemory] session summary action mark-done failed for {session_id}: {error}"
+                );
+                return;
+            }
+            crystallize_actions_or_log(
+                &client,
+                std::slice::from_ref(&parent_action_id),
+                Some(session_id.as_str()),
+                Some(project.as_str()),
+                &format!("session summary for {session_id}"),
+            );
+        });
     }
 
     pub fn list_actions(
@@ -1022,6 +1549,106 @@ impl AgentMemoryState {
 
 pub type SharedAgentMemoryState = Arc<AgentMemoryState>;
 
+fn memory_content_dedupe_key(content: &str) -> String {
+    content
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+        .chars()
+        .take(96)
+        .collect()
+}
+
+fn crystallize_actions_or_log(
+    client: &AgentMemoryClient,
+    action_ids: &[String],
+    session_id: Option<&str>,
+    project: Option<&str>,
+    log_context: &str,
+) {
+    match client.crystallize_actions(action_ids, session_id, project) {
+        Ok(body) => {
+            if body.get("success").and_then(|v| v.as_bool()) != Some(true) {
+                let error = body
+                    .get("error")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("crystallize returned success=false");
+                eprintln!("[agentmemory] {log_context}: {error}");
+            }
+        }
+        Err(error) => {
+            eprintln!("[agentmemory] {log_context}: {error}");
+        }
+    }
+}
+
+fn action_already_crystallized(client: &AgentMemoryClient, action_id: &str) -> bool {
+    client
+        .get_action(action_id)
+        .ok()
+        .and_then(|body| {
+            body.get("action")
+                .and_then(|action| action.get("crystallizedInto"))
+                .and_then(|value| value.as_str())
+                .map(|value| !value.trim().is_empty())
+        })
+        .unwrap_or(false)
+}
+
+/// Backfill crystals for session-summary actions left pending by older Locus builds.
+fn backfill_pending_session_crystals_sync(client: &AgentMemoryClient, working_dir: &str) {
+    let project = normalize_project_path(working_dir);
+    if project.is_empty() {
+        return;
+    }
+    let Ok(body) = client.list_actions(None, None, None) else {
+        return;
+    };
+    let mut actions = actions::parse_action_list(&body);
+    actions.retain(|action| {
+        action_project_matches_workspace(action.project.as_deref(), &project)
+            && action.tags.iter().any(|tag| tag == "locus:session-summary")
+    });
+    for action in actions {
+        if action_already_crystallized(client, &action.id) {
+            continue;
+        }
+        let session_id = action
+            .tags
+            .iter()
+            .find_map(|tag| tag.strip_prefix("locus:session-id:"))
+            .map(str::to_string)
+            .unwrap_or_else(|| action.id.clone());
+        let result_text = action
+            .description
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("Session completed");
+        if action.status != "done" && action.status != "cancelled" {
+            if let Err(error) = client.update_action(serde_json::json!({
+                "actionId": action.id,
+                "status": "done",
+                "result": result_text,
+            })) {
+                eprintln!(
+                    "[agentmemory] backfill mark-done failed for action {}: {error}",
+                    action.id
+                );
+                continue;
+            }
+        }
+        crystallize_actions_or_log(
+            client,
+            std::slice::from_ref(&action.id),
+            Some(session_id.as_str()),
+            Some(project.as_str()),
+            &format!("backfill crystallize for action {}", action.id),
+        );
+    }
+}
+
 /// Session-end consolidation is opt-out via `LOCUS_AGENTMEMORY_SESSION_END_CONSOLIDATE=0|false`.
 fn session_end_auto_consolidate_enabled() -> bool {
     match std::env::var("LOCUS_AGENTMEMORY_SESSION_END_CONSOLIDATE")
@@ -1036,12 +1663,28 @@ fn session_end_auto_consolidate_enabled() -> bool {
 #[cfg(test)]
 mod session_end_tests {
     use super::session_end_auto_consolidate_enabled;
+    use serde_json::json;
 
     #[test]
     fn session_end_consolidate_respects_opt_out_env() {
         std::env::set_var("LOCUS_AGENTMEMORY_SESSION_END_CONSOLIDATE", "false");
         assert!(!session_end_auto_consolidate_enabled());
         std::env::remove_var("LOCUS_AGENTMEMORY_SESSION_END_CONSOLIDATE");
+    }
+
+    #[test]
+    fn crystallize_success_body_is_recognized() {
+        let body = json!({ "success": true, "crystal": { "id": "crys-1" } });
+        assert_eq!(body.get("success").and_then(|v| v.as_bool()), Some(true));
+    }
+
+    #[test]
+    fn crystallize_failure_body_is_recognized() {
+        let body = json!({
+            "success": false,
+            "error": "action act-1 has status \"pending\", expected \"done\" or \"cancelled\""
+        });
+        assert_eq!(body.get("success").and_then(|v| v.as_bool()), Some(false));
     }
 }
 

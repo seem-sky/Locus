@@ -165,6 +165,9 @@ const projectViewFabTitle = computed(() =>
     : t("chat.projectView.show"),
 );
 const floatingAssetPreview = computed(() => chatStore.floatingAssetPreview);
+const showFloatingAssetPreview = computed(
+  () => !!floatingAssetPreview.value && !!props.workingDir?.trim(),
+);
 
 const chatDiffViewerRef = ref<InstanceType<typeof FileDiffViewer> | null>(null);
 const chatDiffTabOptions = computed(() => [
@@ -2415,6 +2418,7 @@ onUnmounted(() => {
       class="chat-view"
       :class="{ 'is-vertical-layout': isVerticalLayout }"
     >
+      <div v-show="!showFloatingAssetPreview" class="chat-view-stack">
       <SessionCompactPicker
         v-if="showSessionCompactPicker"
         :sessions="sessions"
@@ -2672,13 +2676,14 @@ onUnmounted(() => {
         </template>
       </RichChatInput>
     </div>
+      </div>
 
-    <ChatFloatingAssetPreview
-      v-if="floatingAssetPreview && workingDir"
-      :working-dir="workingDir"
-      :path="floatingAssetPreview.path"
-      :name="floatingAssetPreview.name"
-    />
+      <ChatFloatingAssetPreview
+        v-if="showFloatingAssetPreview"
+        :working-dir="workingDir!"
+        :path="floatingAssetPreview!.path"
+        :name="floatingAssetPreview!.name"
+      />
     </div><!-- /chat-view -->
 
     <Teleport to="body">
@@ -3146,6 +3151,15 @@ onUnmounted(() => {
   position: relative;
   background: var(--msg-assistant-bg);
   contain: layout;
+}
+
+.chat-view-stack {
+  flex: 1 1 0;
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  min-width: 0;
+  min-height: 0;
 }
 
 .chat-view.is-vertical-layout {

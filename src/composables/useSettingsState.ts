@@ -48,6 +48,7 @@ import {
   customEndpointTestStatusForReply,
   normalizeCustomEndpointTestErrorMessage,
 } from "../services/customEndpointTestResult";
+import { listen } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { normalizeAppError } from "../services/errors";
 import { useNotificationStore } from "../stores/notification";
@@ -1250,8 +1251,18 @@ export function useSettingsState(emit: SettingsEmit) {
     if (e.key === "Escape") cancelEditEndpoint();
   }
 
+  let unlistenWorkflowWhitelistUpdated: (() => void) | undefined;
+
   // ── Init ─────────────────────────────────────────────────────────────
   onMounted(async () => {
+    unlistenWorkflowWhitelistUpdated = await listen<WorkflowToolWhitelistPayload>(
+      "workflow-tool-whitelist-updated",
+      (event) => {
+        workflowToolWhitelist.value = normalizeWorkflowWhitelistPayload(event.payload);
+        setWarmup("settings:workflowToolWhitelist", workflowToolWhitelist.value);
+        workflowWhitelistReady.value = true;
+      },
+    );
     // Use background warmup cache if available
     const cachedProviders = getWarmup<ProviderStatus[]>("settings:providers");
     const cachedCodex = getWarmup<RemoteCodexStatus>("settings:codexStatus");
@@ -1300,6 +1311,8 @@ export function useSettingsState(emit: SettingsEmit) {
 
   onUnmounted(() => {
     stopCodexPolling();
+    unlistenWorkflowWhitelistUpdated?.();
+    unlistenWorkflowWhitelistUpdated = undefined;
   });
 
   // ── Public API ───────────────────────────────────────────────────────

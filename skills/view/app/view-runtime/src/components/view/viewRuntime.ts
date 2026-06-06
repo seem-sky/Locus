@@ -65,15 +65,16 @@ import {
   unityVectorKeysForType,
 } from "../unity/unitySerializedValue";
 import type {
+  ViewBindingApplyWrite,
   ViewBindingApplyRequest,
   ViewBindingApplyResult,
-  ViewBindingApplyWrite,
   ViewBindingDiscoverRequest,
   ViewBindingDiscoverResult,
   ViewBindingReadRequest,
   ViewBindingReadResult,
   ViewBindingWriteRequest,
   ViewBindingWriteResult,
+  ViewSerializedPropertySnapshot,
   ViewCallScriptResult,
   ViewFrontendLogEntry,
   ViewLlmCallRequest,
@@ -87,7 +88,6 @@ import type {
   ViewSessionQueueInputResult,
   ViewSessionWaitRequest,
   ViewSessionWaitResult,
-  ViewSerializedPropertySnapshot,
   ViewRuntimeUpdateEvent,
 } from "../../services/view";
 import type {

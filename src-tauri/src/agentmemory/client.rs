@@ -6,6 +6,8 @@ use serde_json::{json, Value};
 
 const DEFAULT_BASE_URL: &str = "http://127.0.0.1:3111";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// LLM-backed consolidate / summarize can exceed 30s (observed ~55s+ on pipeline).
+const LONG_REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
 
 #[derive(Debug, Clone)]
 pub struct AgentMemoryClient {
@@ -43,6 +45,7 @@ impl AgentMemoryClient {
     pub fn new(base_url: String, secret: Option<String>) -> Self {
         let http = Client::builder()
             .timeout(REQUEST_TIMEOUT)
+            .no_proxy()
             .build()
             .unwrap_or_else(|_| Client::new());
         Self {
@@ -77,17 +80,37 @@ impl AgentMemoryClient {
         path: &str,
         body: Option<Value>,
     ) -> Result<Value, String> {
+        self.send_json_with_timeout(method, path, body, REQUEST_TIMEOUT)
+    }
+
+    fn send_json_with_timeout(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<Value>,
+        timeout: Duration,
+    ) -> Result<Value, String> {
         let method_label = method.as_str().to_string();
         let mut request = self
             .http
-            .request(method, self.url(path))
-            .headers(self.auth_headers());
+            .request(method.clone(), self.url(path))
+            .headers(self.auth_headers())
+            .timeout(timeout);
         if let Some(payload) = body {
             request = request.json(&payload);
         }
-        let response = request
-            .send()
-            .map_err(|e| format!("agentmemory request failed: {}", e))?;
+        let response = request.send().map_err(|e| {
+            if e.is_timeout() {
+                format!(
+                    "agentmemory request timed out after {}s: {} {}",
+                    timeout.as_secs(),
+                    method_label,
+                    path
+                )
+            } else {
+                format!("agentmemory request failed: {e}")
+            }
+        })?;
         let status = response.status();
         let text = response
             .text()
@@ -260,10 +283,11 @@ impl AgentMemoryClient {
     }
 
     pub fn summarize_session(&self, session_id: &str) -> Result<Value, String> {
-        self.send_json(
+        self.send_json_with_timeout(
             reqwest::Method::POST,
             "/agentmemory/summarize",
             Some(json!({ "sessionId": session_id })),
+            LONG_REQUEST_TIMEOUT,
         )
     }
 
@@ -310,6 +334,42 @@ impl AgentMemoryClient {
             body["agentId"] = json!(agent_id);
         }
         self.send_json(reqwest::Method::POST, "/agentmemory/remember", Some(body))
+    }
+
+    pub fn save_lesson(
+        &self,
+        content: &str,
+        context: Option<&str>,
+        confidence: Option<f64>,
+        project: Option<&str>,
+        tags: &[String],
+    ) -> Result<Value, String> {
+        let mut body = json!({ "content": content });
+        if let Some(context) = context.filter(|value| !value.trim().is_empty()) {
+            body["context"] = json!(context);
+        }
+        if let Some(confidence) = confidence {
+            body["confidence"] = json!(confidence);
+        }
+        if let Some(project) = project.filter(|value| !value.trim().is_empty()) {
+            body["project"] = json!(project);
+        }
+        if !tags.is_empty() {
+            body["tags"] = json!(tags);
+        }
+        self.send_json(reqwest::Method::POST, "/agentmemory/lessons", Some(body))
+    }
+
+    pub fn upsert_semantic_facts(&self, body: serde_json::Value) -> Result<Value, String> {
+        self.send_json(
+            reqwest::Method::POST,
+            "/agentmemory/semantic/upsert",
+            Some(body),
+        )
+    }
+
+    pub fn list_summaries(&self) -> Result<Value, String> {
+        self.send_json(reqwest::Method::GET, "/agentmemory/summaries", None)
     }
 
     pub fn forget(&self, memory_id: &str) -> Result<Value, String> {
@@ -544,12 +604,19 @@ impl AgentMemoryClient {
         self.send_json(reqwest::Method::POST, "/agentmemory/timeline", Some(body))
     }
 
-    pub fn fetch_profile(&self, project: &str) -> Result<Value, String> {
-        let path = format!(
+    pub fn fetch_profile(&self, project: &str, refresh: bool) -> Result<Value, String> {
+        let mut path = format!(
             "/agentmemory/profile?project={}",
             urlencoding_encode(project)
         );
+        if refresh {
+            path.push_str("&refresh=true");
+        }
         self.send_json(reqwest::Method::GET, &path, None)
+    }
+
+    pub fn fetch_config_flags(&self) -> Result<Value, String> {
+        self.send_json(reqwest::Method::GET, "/agentmemory/config/flags", None)
     }
 
     pub fn fetch_file_context(
@@ -584,6 +651,47 @@ impl AgentMemoryClient {
         self.send_json(reqwest::Method::GET, &path, None)
     }
 
+    pub fn run_consolidate_memories(
+        &self,
+        project: Option<&str>,
+        min_observations: Option<usize>,
+    ) -> Result<Value, String> {
+        let mut body = json!({});
+        if let Some(project) = project.filter(|value| !value.trim().is_empty()) {
+            body["project"] = json!(project);
+        }
+        if let Some(min_observations) = min_observations {
+            body["minObservations"] = json!(min_observations);
+        }
+        self.send_json_with_timeout(
+            reqwest::Method::POST,
+            "/agentmemory/consolidate",
+            Some(body),
+            LONG_REQUEST_TIMEOUT,
+        )
+    }
+
+    pub fn crystallize_actions(
+        &self,
+        action_ids: &[String],
+        session_id: Option<&str>,
+        project: Option<&str>,
+    ) -> Result<Value, String> {
+        let mut body = json!({ "actionIds": action_ids });
+        if let Some(session_id) = session_id.filter(|value| !value.trim().is_empty()) {
+            body["sessionId"] = json!(session_id);
+        }
+        if let Some(project) = project.filter(|value| !value.trim().is_empty()) {
+            body["project"] = json!(project);
+        }
+        self.send_json_with_timeout(
+            reqwest::Method::POST,
+            "/agentmemory/crystals/create",
+            Some(body),
+            LONG_REQUEST_TIMEOUT,
+        )
+    }
+
     pub fn run_consolidate_pipeline(
         &self,
         tier: Option<&str>,
@@ -596,10 +704,11 @@ impl AgentMemoryClient {
         if let Some(force) = force {
             body["force"] = json!(force);
         }
-        self.send_json(
+        self.send_json_with_timeout(
             reqwest::Method::POST,
             "/agentmemory/consolidate-pipeline",
             Some(body),
+            LONG_REQUEST_TIMEOUT,
         )
     }
 

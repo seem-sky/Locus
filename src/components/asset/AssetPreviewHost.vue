@@ -246,6 +246,15 @@ async function onTreeSelect(targetId: string) {
   overflow: hidden;
   background: var(--panel-bg);
 }
+
+.aph-body > :deep(.atv-root),
+.aph-body > :deep(.aph-structured),
+.aph-body > :deep(.aph-binary-wrap),
+.aph-body > :deep(.aph-binary-info-wrap) {
+  flex: 1 1 0;
+  min-height: 0;
+  align-self: stretch;
+}
 .aph-state {
   flex: 1;
   display: flex;

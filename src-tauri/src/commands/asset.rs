@@ -1300,6 +1300,42 @@ pub async fn search_workspace_assets(
 const TEXT_SNIPPET_MAX_LINES: usize = 200;
 /// Hard byte cap for the snippet to defend against very long lines.
 const TEXT_SNIPPET_MAX_BYTES: usize = 32 * 1024;
+/// Dedicated asset preview panels request the full file within this byte cap.
+const TEXT_FULL_MAX_BYTES: usize = 4 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TextPreviewScope {
+    Snippet,
+    Full,
+}
+
+impl TextPreviewScope {
+    fn from_optional(value: Option<&str>) -> Self {
+        match value.map(str::trim).filter(|s| !s.is_empty()) {
+            Some("full") => Self::Full,
+            _ => Self::Snippet,
+        }
+    }
+
+    fn limits(self) -> TextReadLimits {
+        match self {
+            Self::Snippet => TextReadLimits {
+                max_lines: Some(TEXT_SNIPPET_MAX_LINES),
+                max_bytes: TEXT_SNIPPET_MAX_BYTES,
+            },
+            Self::Full => TextReadLimits {
+                max_lines: None,
+                max_bytes: TEXT_FULL_MAX_BYTES,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TextReadLimits {
+    max_lines: Option<usize>,
+    max_bytes: usize,
+}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1728,22 +1764,15 @@ fn resolve_workspace_path(
     Ok((canonical, rel_path))
 }
 
-/// Read up to `TEXT_SNIPPET_MAX_LINES` lines / `TEXT_SNIPPET_MAX_BYTES` bytes
-/// from `path`, returning a snippet plus truncation info.
+/// Read text from `path` within `scope` limits, returning content plus
+/// truncation info.
 ///
-/// **Streaming**: this function never loads more than ~`TEXT_SNIPPET_MAX_BYTES`
-/// + one trailing line into memory. Pointing the asset preview at a 2 GiB log
-/// file used to OOM because the previous implementation called
-/// `std::fs::read` first and only enforced the budgets afterwards.
-///
-/// `total_lines` is the number of lines actually emitted in `snippet`. When
-/// the file is fully read (`truncated == false`) it is the file's true line
-/// count; when truncated it is the lower-bound shown count. We deliberately do
-/// not scan the rest of the file just to compute a precise total — that would
-/// reintroduce the DoS we just fixed.
-fn read_text_snippet(path: &Path) -> Result<AssetTextPreview, AppError> {
+/// **Streaming**: this function never loads more than the configured byte
+/// budget + one trailing line into memory.
+fn read_text_preview(path: &Path, scope: TextPreviewScope) -> Result<AssetTextPreview, AppError> {
     use std::io::{BufRead, BufReader, Read};
 
+    let limits = scope.limits();
     let file = std::fs::File::open(path).map_err(|e| {
         AppError::new(
             "asset.preview.read_failed",
@@ -1752,13 +1781,16 @@ fn read_text_snippet(path: &Path) -> Result<AssetTextPreview, AppError> {
     })?;
     let mut reader = BufReader::new(file);
 
-    let mut snippet = String::with_capacity(TEXT_SNIPPET_MAX_BYTES.min(8 * 1024));
+    let mut snippet = String::with_capacity(limits.max_bytes.min(8 * 1024));
     let mut emitted_lines: u32 = 0;
     let mut truncated = false;
     let mut buf: Vec<u8> = Vec::with_capacity(1024);
 
     loop {
-        if (emitted_lines as usize) >= TEXT_SNIPPET_MAX_LINES {
+        if limits
+            .max_lines
+            .is_some_and(|max| (emitted_lines as usize) >= max)
+        {
             // Probe for any remaining byte to set the truncated flag.
             let mut probe = [0u8; 1];
             if reader.read(&mut probe).map(|n| n > 0).unwrap_or(false) {
@@ -1788,11 +1820,11 @@ fn read_text_snippet(path: &Path) -> Result<AssetTextPreview, AppError> {
         }
 
         // Byte budget enforcement, *before* push.
-        if snippet.len().saturating_add(line.len()).saturating_add(1) > TEXT_SNIPPET_MAX_BYTES {
+        if snippet.len().saturating_add(line.len()).saturating_add(1) > limits.max_bytes {
             // First-line-too-long edge case: still emit a UTF-8-safe prefix so
             // the user gets *something* instead of an empty preview card.
             if emitted_lines == 0 {
-                let remaining = TEXT_SNIPPET_MAX_BYTES.saturating_sub(snippet.len() + 1);
+                let remaining = limits.max_bytes.saturating_sub(snippet.len() + 1);
                 let mut take = remaining.min(line.len());
                 while take > 0 && !line.is_char_boundary(take) {
                     take -= 1;
@@ -1823,6 +1855,10 @@ fn read_text_snippet(path: &Path) -> Result<AssetTextPreview, AppError> {
         total_lines: emitted_lines,
         language,
     })
+}
+
+fn read_text_snippet(path: &Path) -> Result<AssetTextPreview, AppError> {
+    read_text_preview(path, TextPreviewScope::Snippet)
 }
 
 /// Build the binary-info stub payload for a file. Used for any non-text asset
@@ -2804,6 +2840,7 @@ pub async fn render_workspace_asset_preview_frame(
 #[tauri::command]
 pub async fn preview_workspace_asset(
     file_path: String,
+    text_scope: Option<String>,
     workspace: State<'_, Arc<Workspace>>,
     ref_graph_state: State<'_, AssetDbState>,
     binary_cache: State<'_, Arc<BinaryCache>>,
@@ -2818,6 +2855,7 @@ pub async fn preview_workspace_asset(
     }
     let workspace_root = PathBuf::from(&cwd);
     let (canonical, asset_rel_path) = resolve_workspace_path(&workspace_root, &file_path)?;
+    let text_scope = TextPreviewScope::from_optional(text_scope.as_deref());
 
     let ext = canonical
         .extension()
@@ -2831,7 +2869,7 @@ pub async fn preview_workspace_asset(
         // Text path: read snippet inline. (Slice 3a does not yet share state
         // with `commands::knowledge::preview_workspace_file`; the snippet
         // budgets are matched manually so users see consistent output.)
-        let preview = read_text_snippet(&canonical)?;
+        let preview = read_text_preview(&canonical, text_scope)?;
         return Ok(AssetPreviewPayload::Text(preview));
     }
 
@@ -2872,7 +2910,7 @@ pub async fn preview_workspace_asset(
     // extensionless configs) and for Unity YAML assets whose structured parse
     // failed above — show a streamed snippet instead of a metadata-only card.
     if !is_known_binary_ext(&ext) && file_snippet_looks_textual(&canonical) {
-        let preview = read_text_snippet(&canonical)?;
+        let preview = read_text_preview(&canonical, text_scope)?;
         return Ok(AssetPreviewPayload::Text(preview));
     }
 
@@ -2950,6 +2988,28 @@ mod tests {
     }
 
     #[test]
+    fn read_text_preview_full_reads_entire_small_file() {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("sample.txt");
+        {
+            let mut file = std::fs::File::create(&path).expect("create file");
+            for i in 0..300 {
+                writeln!(file, "line {i}").expect("write line");
+            }
+        }
+
+        let snippet = read_text_preview(&path, TextPreviewScope::Snippet).expect("snippet");
+        let full = read_text_preview(&path, TextPreviewScope::Full).expect("full");
+
+        assert!(snippet.truncated);
+        assert_eq!(snippet.total_lines, TEXT_SNIPPET_MAX_LINES as u32);
+        assert!(!full.truncated);
+        assert_eq!(full.total_lines, 300);
+        assert!(full.snippet.contains("line 299"));
+    }
+
     #[test]
     fn text_language_for_ext_includes_common_workspace_text_types() {
         assert_eq!(text_language_for_ext("lua"), Some("lua"));

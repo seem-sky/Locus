@@ -1717,8 +1717,38 @@ pub async fn rename_session(
 pub async fn archive_session(
     session_id: String,
     store: State<'_, Arc<SessionStore>>,
+    memory_store: State<'_, Arc<crate::agentmemory::AgentMemoryState>>,
+    workspace: State<'_, Arc<Workspace>>,
 ) -> Result<(), AppError> {
-    store.archive_session(&session_id).map_err(Into::into)
+    store.archive_session(&session_id).map_err(AppError::from)?;
+    let working_dir = workspace.path.read().await.clone();
+    if working_dir.trim().is_empty() {
+        return Ok(());
+    }
+    let memory_store = memory_store.inner().clone();
+    let store = store.inner().clone();
+    let session_id_for_finalize = session_id.clone();
+    let session_id_for_log = session_id.clone();
+    tauri::async_runtime::spawn(async move {
+        match tauri::async_runtime::spawn_blocking(move || {
+            memory_store.finalize_session_on_close(&store, &session_id_for_finalize, &working_dir)
+        })
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                eprintln!(
+                    "[agentmemory] archive finalize failed for {session_id_for_log}: {error}"
+                );
+            }
+            Err(error) => {
+                eprintln!(
+                    "[agentmemory] archive finalize join failed for {session_id_for_log}: {error}"
+                );
+            }
+        }
+    });
+    Ok(())
 }
 
 #[tauri::command]
@@ -1746,7 +1776,34 @@ pub async fn unarchive_session(
 pub async fn delete_session(
     session_id: String,
     store: State<'_, Arc<SessionStore>>,
+    memory_store: State<'_, Arc<crate::agentmemory::AgentMemoryState>>,
+    workspace: State<'_, Arc<Workspace>>,
 ) -> Result<(), AppError> {
+    let working_dir = workspace.path.read().await.clone();
+    let memory_store = memory_store.inner().clone();
+    let store = store.inner().clone();
+    let store_for_finalize = store.clone();
+    let session_id_for_delete = session_id.clone();
+    if !working_dir.trim().is_empty() {
+        tauri::async_runtime::spawn_blocking(move || {
+            if let Err(error) = memory_store.finalize_session_on_close(
+                &store_for_finalize,
+                &session_id_for_delete,
+                &working_dir,
+            ) {
+                eprintln!(
+                    "[agentmemory] delete finalize failed for {session_id_for_delete}: {error}"
+                );
+            }
+        })
+        .await
+        .map_err(|error| {
+            AppError::new(
+                "session.delete_finalize_join_failed",
+                format!("Failed to finalize session before delete: {error}"),
+            )
+        })?;
+    }
     store.delete_session(&session_id).map_err(AppError::from)?;
     crate::llm::codex::invalidate_cached_session(&session_id);
     Ok(())

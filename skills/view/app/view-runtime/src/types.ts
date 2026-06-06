@@ -19,6 +19,43 @@ export interface SessionSummary {
 
 export type ServerToolKind = "web_search";
 
+export interface HeadroomRewriteMeta {
+  enabled: boolean;
+  available: boolean;
+  rewritten: boolean;
+  originalCommand: string;
+  executedCommand?: string;
+}
+
+export interface HeadroomCompressMeta {
+  enabled: boolean;
+  available: boolean;
+  compressed: boolean;
+  originalChars: number;
+  compressedChars?: number;
+  tokensBefore?: number;
+  tokensAfter?: number;
+  tokensSaved?: number;
+  compressionRatio?: number;
+  transformsApplied?: string[];
+  ccrHashes?: string[];
+  error?: string;
+}
+
+export interface HeadroomExecutionMetaPayload {
+  rewrite: HeadroomRewriteMeta;
+  compress?: HeadroomCompressMeta;
+}
+
+/** @deprecated Legacy RTK-only meta shape */
+export interface RtkRewriteMeta extends HeadroomRewriteMeta {}
+
+export interface ToolExecutionMeta {
+  headroom?: HeadroomExecutionMetaPayload;
+  /** @deprecated Legacy RTK meta */
+  rtk?: RtkRewriteMeta;
+}
+
 export interface ToolCallInfo {
   id: string;
   name: string;
@@ -29,43 +66,8 @@ export interface ToolCallInfo {
   outcome?: ToolCallOutcome;
   recordedOutput?: string;
   nestedToolCalls?: ToolCallInfo[];
+  executionMeta?: ToolExecutionMeta;
 }
-
-export type ToolCallOutcome = "done" | "error" | "interrupted";
-
-export interface RenderOrderKey {
-  runId: string;
-  seq: number;
-}
-
-export type AssistantRenderPart =
-  | {
-      kind: "thinking";
-      id: string;
-      order: RenderOrderKey;
-      content: string;
-      active?: boolean;
-      duration?: number;
-      signature?: string;
-    }
-  | {
-      kind: "text";
-      id: string;
-      order: RenderOrderKey;
-      content: string;
-    }
-  | {
-      kind: "toolCall";
-      id: string;
-      order: RenderOrderKey;
-      toolCall: ToolCallInfo;
-    }
-  | {
-      kind: "knowledgeProposal";
-      id: string;
-      order: RenderOrderKey;
-      message: ChatMessage;
-    };
 
 export interface ImageAttachment {
   data: string;
@@ -125,9 +127,51 @@ export interface UnityConnectionStatus {
 
 export interface SkillIntentItem {
   dirName: string;
-  source: string;
+  source: "app" | "project" | "pluginApp" | "pluginProject";
   name: string;
 }
+
+export type ToolCallOutcome = "done" | "error" | "interrupted";
+
+export interface RenderOrderKey {
+  runId: string;
+  seq: number;
+}
+
+export type AssistantRenderPart =
+  | {
+      kind: "thinking";
+      id: string;
+      order: RenderOrderKey;
+      content: string;
+      active?: boolean;
+      duration?: number;
+      signature?: string;
+    }
+  | {
+      kind: "text";
+      id: string;
+      order: RenderOrderKey;
+      content: string;
+    }
+  | {
+      kind: "toolCall";
+      id: string;
+      order: RenderOrderKey;
+      toolCall: ToolCallInfo;
+    }
+  | {
+      kind: "knowledgeProposal";
+      id: string;
+      order: RenderOrderKey;
+      message: ChatMessage;
+    }
+  | {
+      kind: "memoryProposal";
+      id: string;
+      order: RenderOrderKey;
+      message: ChatMessage;
+    };
 
 export interface UserIntentMeta {
   kind: "user_intent_v1";
@@ -176,6 +220,51 @@ export interface KnowledgeProposal {
   updatedAt: number;
 }
 
+export type MemoryCategory = "user" | "feedback" | "topic" | "reference";
+export type MemoryScope = "project" | "user";
+export type MemoryProposalStatus = KnowledgeProposalStatus;
+
+export interface MemoryEntry {
+  id: string;
+  category: MemoryCategory;
+  scope: MemoryScope;
+  content: string;
+  tags: string[];
+  pinned: boolean;
+  pinWeight: number;
+  accessCount: number;
+  lastAccessedAt: number;
+  createdAt: number;
+  updatedAt: number;
+  sourceSessionId?: string;
+  linkedDocPath?: string;
+}
+
+export interface MemoryProposalItem {
+  category: MemoryCategory;
+  content: string;
+  tags: string[];
+  scope: MemoryScope;
+}
+
+export interface MemoryProposal {
+  proposalId: string;
+  status: MemoryProposalStatus;
+  confidence: number;
+  verify: KnowledgeProposalVerify;
+  estTokens: number;
+  items: MemoryProposalItem[];
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface MemoryRetrieveHit {
+  entry: MemoryEntry;
+  score: number;
+  keywordScore: number;
+  semanticScore: number;
+}
+
 export interface ChatMessage {
   id: string;
   role: "user" | "assistant" | "tool";
@@ -195,6 +284,7 @@ export interface ChatMessage {
   thinkingSignature?: string;
   intentMeta?: UserIntentMeta;
   knowledgeProposal?: KnowledgeProposal;
+  memoryProposal?: MemoryProposal;
   renderParts?: AssistantRenderPart[];
 }
 
@@ -466,6 +556,40 @@ export interface ProxyStatus {
   routes: ProxyRoute[];
 }
 
+export interface HeadroomSettings {
+  enabled: boolean;
+  contextCompressEnabled: boolean;
+  baseUrl: string;
+  apiKey: string;
+  rtkPath: string;
+  minCompressChars: number;
+}
+
+export type HeadroomProxySource =
+  | "disabled"
+  | "cloud"
+  | "bundled"
+  | "external"
+  | "notConfigured";
+
+export interface HeadroomProxyRuntimeStatus {
+  source: HeadroomProxySource;
+  running: boolean;
+  healthStatus: string;
+  endpoint: string;
+  runtimeDetail: string;
+  autostartEnabled: boolean;
+  bundlePresent: boolean;
+  error?: string;
+}
+
+export interface HeadroomSettingsStatus {
+  settings: HeadroomSettings;
+  libraryAvailable: boolean;
+  contextLibraryAvailable: boolean;
+  proxy: HeadroomProxyRuntimeStatus;
+}
+
 export interface AuthUrlInfo {
   url: string;
 }
@@ -653,6 +777,7 @@ export type StreamEvent = { runId: string } & (
       output: string;
       outcome: ToolCallOutcome;
       images?: ImageAttachment[];
+      executionMeta?: ToolExecutionMeta;
     }
   | {
       type: "toolCallDelta";
@@ -689,6 +814,7 @@ export type StreamEvent = { runId: string } & (
       output: string;
       outcome: ToolCallOutcome;
       images?: ImageAttachment[];
+      executionMeta?: ToolExecutionMeta;
     }
   | {
       type: "toolCallRoundDone";
@@ -701,6 +827,7 @@ export type StreamEvent = { runId: string } & (
       renderParts?: AssistantRenderPart[];
     }
   | { type: "knowledgeProposal"; sessionId: string; message: ChatMessage }
+  | { type: "memoryProposal"; sessionId: string; message: ChatMessage }
   | {
       type: "usageUpdate";
       sessionId: string;
@@ -799,6 +926,9 @@ export interface BasicToolConfirmDisplay {
   kind: "basic";
   toolName: string;
   arguments: string;
+  workflowNote?: string;
+  /** READ/PLAN ambiguous tool confirm — offer session whitelist. */
+  workflowWhitelistOffered?: boolean;
 }
 
 export type KnowledgeToolConfirmDirectoryMode = "auto" | "approval";
@@ -858,7 +988,7 @@ export interface SkillManifest {
   description: string;
   argumentHint: string;
   dirName: string;
-  source: string;
+  source: "app" | "project";
   relPath: string;
   updatedAt: number;
   skillEnabled: boolean;
@@ -2315,6 +2445,7 @@ export interface ToolCallDisplay {
   images?: ImageAttachment[];
   progress?: ToolCallProgress | null;
   nestedToolCalls?: ToolCallDisplay[];
+  executionMeta?: ToolExecutionMeta;
 }
 
 export interface ToolCallProgress {
