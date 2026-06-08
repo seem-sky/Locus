@@ -68,6 +68,7 @@ const {
   errorMessage,
   send,
   insertQueuedFollowUp,
+  deleteQueuedFollowUp,
   cancel,
   answerQuestion,
   answerToolConfirm,
@@ -192,6 +193,7 @@ function handleSelectAgent(agentId: string) {
     @update:input-value="inputText = $event"
     @send="send"
     @insert-queued-follow-up="insertQueuedFollowUp"
+    @delete-queued-follow-up="deleteQueuedFollowUp"
     @cancel="cancel"
     @clear="resetSession"
     @answer-question="answerQuestion"

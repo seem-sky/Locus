@@ -38,6 +38,7 @@ export interface UnitySerializedPropertyAttributeInfo {
 
 export interface UnitySerializedPropertyTargetSnapshot {
   kind: string;
+  guid?: string | null;
   path?: string | null;
   scenePath?: string | null;
   objectPath?: string | null;
@@ -45,6 +46,9 @@ export interface UnitySerializedPropertyTargetSnapshot {
   targetFileId?: number | null;
   componentType?: string | null;
   componentIndex?: number | null;
+  targetTypeFullName?: string | null;
+  targetTypeAssembly?: string | null;
+  targetTypeName?: string | null;
   propertyPath?: string | null;
 }
 
@@ -107,6 +111,8 @@ export interface UnityNumberConstraintOptions {
   rangeMin?: number;
   rangeMax?: number;
 }
+
+export const UNITY_FLOAT_DRAG_STEP = 0.01;
 
 type VectorKey = "x" | "y" | "z" | "w" | "width" | "height";
 
@@ -245,6 +251,17 @@ export function constrainUnityNumberValue(
   }
   if (isUnityIntegerPropertyType(type)) next = Math.round(next);
   return normalizeUnityNumberPrecision(next);
+}
+
+export function constrainUnityNumberDragValue(
+  type: string | null | undefined,
+  value: number,
+  options: UnityNumberConstraintOptions = {},
+): number {
+  const constrained = constrainUnityNumberValue(type, value, options);
+  if (isUnityIntegerPropertyType(type)) return constrained;
+  const rounded = Math.round(constrained / UNITY_FLOAT_DRAG_STEP) * UNITY_FLOAT_DRAG_STEP;
+  return constrainUnityNumberValue(type, rounded, options);
 }
 
 export function formatUnityNumberValue(

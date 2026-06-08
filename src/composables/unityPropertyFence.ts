@@ -6,6 +6,7 @@ export interface UnityPropertyFenceEntry {
   source: string;
   target: UnitySerializedPropertyTarget;
   objectLabel: string;
+  objectTitle: string;
   propertyLabel: string;
 }
 
@@ -19,6 +20,16 @@ export interface UnityPropertyFenceParseResult {
   entries: UnityPropertyFenceEntry[];
   issues: UnityPropertyFenceIssue[];
 }
+
+export interface UnityPropertyFenceBlock<TItem = UnityPropertyFenceEntry> {
+  id: string;
+  entry: UnityPropertyFenceEntry;
+  items: TItem[];
+}
+
+export type UnityPropertyFenceUnitySelection =
+  | { kind: "asset"; path: string }
+  | { kind: "sceneObject"; scenePath: string; objectPath: string };
 
 interface UnityObjectPathParts {
   rawPath: string;
@@ -70,6 +81,89 @@ export function parseUnityPropertyFence(source: string): UnityPropertyFenceParse
   });
 
   return { entries, issues };
+}
+
+export function groupUnityPropertyFenceItems<TItem>(
+  items: TItem[],
+  entryForItem: (item: TItem) => UnityPropertyFenceEntry,
+): UnityPropertyFenceBlock<TItem>[] {
+  const blocks: UnityPropertyFenceBlock<TItem>[] = [];
+  let activeKey = "";
+
+  items.forEach((item) => {
+    const entry = entryForItem(item);
+    const key = unityPropertyFenceTargetBlockKey(entry.target);
+    const activeBlock = blocks[blocks.length - 1];
+    if (activeBlock && key === activeKey) {
+      activeBlock.items.push(item);
+      return;
+    }
+
+    blocks.push({
+      id: `${entry.id}:block:${key}`,
+      entry,
+      items: [item],
+    });
+    activeKey = key;
+  });
+
+  return blocks;
+}
+
+export function unityPropertyFenceTargetBlockKey(target: UnitySerializedPropertyTarget): string {
+  return [
+    target.kind ?? "",
+    target.path ?? "",
+    target.scenePath ?? "",
+    target.objectPath ?? "",
+    target.objectFileId ?? "",
+    target.targetFileId ?? "",
+    target.componentType ?? "",
+    target.componentIndex ?? "",
+    target.targetTypeFullName ?? "",
+    target.targetTypeName ?? "",
+  ].join("|");
+}
+
+export function unityPropertyFenceDuplicateObjectLabels(
+  entries: readonly UnityPropertyFenceEntry[],
+): Set<string> {
+  const titlesByLabel = new Map<string, Set<string>>();
+  entries.forEach((entry) => {
+    const label = normalizeObjectLabelKey(entry.objectLabel);
+    if (!label) return;
+    const title = (entry.objectTitle || entry.objectLabel).trim();
+    const titles = titlesByLabel.get(label) ?? new Set<string>();
+    titles.add(title);
+    titlesByLabel.set(label, titles);
+  });
+
+  const duplicates = new Set<string>();
+  titlesByLabel.forEach((titles, label) => {
+    if (titles.size > 1) duplicates.add(label);
+  });
+  return duplicates;
+}
+
+export function unityPropertyFenceObjectLabelKey(label: string): string {
+  return normalizeObjectLabelKey(label);
+}
+
+export function unityPropertyFenceUnitySelectionTarget(
+  target: UnitySerializedPropertyTarget,
+): UnityPropertyFenceUnitySelection | null {
+  const scenePath = stringField(target.scenePath);
+  const objectPath = stringField(target.objectPath);
+  if (scenePath && objectPath) {
+    return { kind: "sceneObject", scenePath, objectPath };
+  }
+
+  const assetPath = stringField(target.path) || scenePath;
+  if (/^(Assets|Packages)\//i.test(assetPath)) {
+    return { kind: "asset", path: assetPath };
+  }
+
+  return null;
 }
 
 function parseUnityPropertyFenceJson(
@@ -143,7 +237,8 @@ function entryFromJsonItem(
     line,
     source,
     target,
-    objectLabel: label || targetObjectLabel(target),
+    objectLabel: label || targetObjectDisplayLabel(target),
+    objectTitle: targetObjectTitle(target) || label || targetObjectDisplayLabel(target),
     propertyLabel: label || propertyPathLeaf(target.propertyPath || ""),
   });
 }
@@ -237,7 +332,8 @@ function entryFromCompactParts(
       line,
       source,
       target,
-      objectLabel: objectPath.rawPath,
+      objectLabel: unityObjectDisplayName(objectPath),
+      objectTitle: objectPath.rawPath,
       propertyLabel: selector.propertyPath,
     }),
   };
@@ -420,6 +516,37 @@ function targetObjectLabel(target: UnitySerializedPropertyTarget): string {
   return target.path || target.kind;
 }
 
+function targetObjectTitle(target: UnitySerializedPropertyTarget): string {
+  return targetObjectLabel(target);
+}
+
+function targetObjectDisplayLabel(target: UnitySerializedPropertyTarget): string {
+  const objectPath = (target.objectPath || "").trim();
+  if (objectPath) return objectPathLeaf(objectPath);
+  const path = (target.path || target.scenePath || "").trim();
+  if (path) return assetNameFromPath(path);
+  return target.kind || "Unity";
+}
+
+function unityObjectDisplayName(path: UnityObjectPathParts): string {
+  if (path.objectPath) return objectPathLeaf(path.objectPath);
+  if (path.assetPath) return assetNameFromPath(path.assetPath);
+  if (path.scenePath) return assetNameFromPath(path.scenePath);
+  return assetNameFromPath(path.rawPath);
+}
+
+function objectPathLeaf(path: string): string {
+  const normalized = path.replace(/\/+$/g, "");
+  const slash = normalized.lastIndexOf("/");
+  return slash >= 0 ? normalized.slice(slash + 1) : normalized;
+}
+
+function assetNameFromPath(path: string): string {
+  const leaf = objectPathLeaf(path);
+  const dot = leaf.lastIndexOf(".");
+  return dot > 0 ? leaf.slice(0, dot) : leaf;
+}
+
 function propertyPathLeaf(propertyPath: string): string {
   const normalized = propertyPath.trim();
   if (!normalized) return "";
@@ -453,4 +580,8 @@ function nonZeroIntegerField(value: unknown): number | null {
     return parsed === 0 ? null : parsed;
   }
   return null;
+}
+
+function normalizeObjectLabelKey(label: string): string {
+  return label.trim();
 }

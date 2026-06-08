@@ -19,6 +19,7 @@ namespace Locus
         private sealed class ViewBindingTarget
         {
             public string kind;
+            public string guid;
             public string path;
             public string scenePath;
             public string objectPath;
@@ -26,6 +27,9 @@ namespace Locus
             public long targetFileId;
             public string componentType;
             public int componentIndex;
+            public string targetTypeFullName;
+            public string targetTypeAssembly;
+            public string targetTypeName;
             public string propertyPath;
         }
 
@@ -269,7 +273,7 @@ namespace Locus
                     {
                         index = i,
                         bindingId = write.bindingId,
-                        target = write.target,
+                        target = ViewBindingTargetWithLocalFileIds(write.target, obj),
                         valueJson = write.valueJson,
                         mode = write.mode,
                         obj = obj
@@ -379,6 +383,7 @@ namespace Locus
         private static string BuildViewBindingObjectKey(ViewBindingTarget target)
         {
             return (target.kind ?? "").Trim().ToLowerInvariant() + "|" +
+                   (target.guid ?? "").Trim().ToLowerInvariant() + "|" +
                    (target.path ?? "").Trim().Replace('\\', '/') + "|" +
                    (target.scenePath ?? "").Trim().Replace('\\', '/') + "|" +
                    (target.objectPath ?? "").Trim().Replace('\\', '/') + "|" +
@@ -391,6 +396,7 @@ namespace Locus
         private static string ReadViewBinding(string bindingId, ViewBindingTarget target, int maxDepth = 0, int maxArrayItems = 0)
         {
             UnityEngine.Object obj = ResolveViewBindingObject(target);
+            target = ViewBindingTargetWithLocalFileIds(target, obj);
             var serialized = new SerializedObject(obj);
             serialized.Update();
             if (string.IsNullOrWhiteSpace(target.propertyPath))
@@ -402,20 +408,22 @@ namespace Locus
                     obj,
                     depthLimit,
                     arrayLimit);
-                SerializedPropertySnapshot snapshot = properties.Length == 1
+                SerializedPropertySnapshot objectSnapshot = properties.Length == 1
                     ? properties[0]
                     : BuildViewBindingAggregateSnapshot(target, obj, properties);
-                return BuildBindingReadJson(bindingId, target, snapshot, false, properties.Length > 1 ? properties : null);
+                return BuildBindingReadJson(bindingId, target, objectSnapshot, false, properties.Length > 1 ? properties : null);
             }
             SerializedProperty prop = serialized.FindProperty(target.propertyPath);
             if (prop == null)
                 throw new Exception("SerializedProperty not found: " + target.propertyPath);
             int propertyDepthLimit = maxDepth > 0 ? Math.Min(maxDepth, 16) : 4;
             int propertyArrayLimit = maxArrayItems > 0 ? Math.Min(maxArrayItems, 512) : 64;
+            SerializedPropertySnapshot propertySnapshot = SnapshotSerializedProperty(prop, propertyDepthLimit, propertyArrayLimit);
+            ApplyViewBindingTargetToSnapshotTree(propertySnapshot, ToSerializedPropertyBindingTarget(target));
             return BuildBindingReadJson(
                 bindingId,
                 target,
-                SnapshotSerializedProperty(prop, propertyDepthLimit, propertyArrayLimit),
+                propertySnapshot,
                 false);
         }
 
@@ -612,6 +620,7 @@ namespace Locus
             return new SerializedPropertyBindingTarget
             {
                 kind = source.kind ?? "",
+                guid = source.guid ?? "",
                 path = source.path ?? "",
                 scenePath = source.scenePath ?? "",
                 objectPath = source.objectPath ?? "",
@@ -619,6 +628,9 @@ namespace Locus
                 targetFileId = source.targetFileId,
                 componentType = source.componentType ?? "",
                 componentIndex = source.componentIndex,
+                targetTypeFullName = source.targetTypeFullName ?? "",
+                targetTypeAssembly = source.targetTypeAssembly ?? "",
+                targetTypeName = source.targetTypeName ?? "",
                 propertyPath = source.propertyPath ?? ""
             };
         }
@@ -683,6 +695,7 @@ namespace Locus
             var target = new ViewBindingTarget
             {
                 kind = source.kind,
+                guid = source.guid,
                 path = source.path,
                 scenePath = source.scenePath,
                 objectPath = source.objectPath,
@@ -690,8 +703,19 @@ namespace Locus
                 targetFileId = source.targetFileId,
                 componentType = source.componentType,
                 componentIndex = source.componentIndex,
+                targetTypeFullName = source.targetTypeFullName,
+                targetTypeAssembly = source.targetTypeAssembly,
+                targetTypeName = source.targetTypeName,
                 propertyPath = source.propertyPath
             };
+
+            Type objectType = obj != null ? obj.GetType() : null;
+            if (objectType != null)
+            {
+                target.targetTypeFullName = FieldTypeFullName(objectType);
+                target.targetTypeAssembly = FieldTypeAssembly(objectType);
+                target.targetTypeName = objectType.Name ?? "";
+            }
 
             long objectFileId;
             GameObject go = obj as GameObject;
@@ -721,6 +745,7 @@ namespace Locus
             return new ViewBindingTarget
             {
                 kind = source.kind,
+                guid = source.guid,
                 path = source.path,
                 scenePath = source.scenePath,
                 objectPath = source.objectPath,
@@ -728,6 +753,9 @@ namespace Locus
                 targetFileId = source.targetFileId,
                 componentType = "",
                 componentIndex = 0,
+                targetTypeFullName = source.targetTypeFullName,
+                targetTypeAssembly = source.targetTypeAssembly,
+                targetTypeName = source.targetTypeName,
                 propertyPath = ""
             };
         }
@@ -740,6 +768,7 @@ namespace Locus
             return new ViewBindingTarget
             {
                 kind = "component",
+                guid = source != null ? source.guid : "",
                 path = source != null ? source.path : "",
                 scenePath = source != null ? source.scenePath : "",
                 objectPath = source != null ? source.objectPath : "",
@@ -747,6 +776,9 @@ namespace Locus
                 targetFileId = 0,
                 componentType = componentType,
                 componentIndex = componentIndex,
+                targetTypeFullName = "",
+                targetTypeAssembly = "",
+                targetTypeName = "",
                 propertyPath = ""
             };
         }
@@ -758,6 +790,7 @@ namespace Locus
             return new SerializedPropertyBindingTarget
             {
                 kind = source.kind ?? "",
+                guid = source.guid ?? "",
                 path = source.path ?? "",
                 scenePath = source.scenePath ?? "",
                 objectPath = source.objectPath ?? "",
@@ -765,6 +798,9 @@ namespace Locus
                 targetFileId = source.targetFileId,
                 componentType = source.componentType ?? "",
                 componentIndex = source.componentIndex,
+                targetTypeFullName = source.targetTypeFullName ?? "",
+                targetTypeAssembly = source.targetTypeAssembly ?? "",
+                targetTypeName = source.targetTypeName ?? "",
                 propertyPath = source.propertyPath ?? ""
             };
         }
@@ -1079,19 +1115,38 @@ namespace Locus
 
         private static UnityEngine.Object ResolveAssetTarget(ViewBindingTarget target)
         {
-            string path = target.path;
+            string path = ResolveViewBindingAssetPath(target);
             UnityEngine.Object obj = !string.IsNullOrWhiteSpace(path)
                 ? AssetDatabase.LoadMainAssetAtPath(path)
                 : Selection.activeObject;
             if (obj == null)
-                throw new Exception("Asset target not found: " + (path ?? "<selection>"));
+                throw new Exception("Asset target not found: " + (!string.IsNullOrWhiteSpace(path) ? path : "<selection>"));
             return obj;
+        }
+
+        private static string ResolveViewBindingAssetPath(ViewBindingTarget target)
+        {
+            string path = (target.path ?? "").Trim().Replace('\\', '/');
+            if (string.IsNullOrWhiteSpace(path) && !string.IsNullOrWhiteSpace(target.guid))
+            {
+                string guid = (target.guid ?? "").Trim();
+                path = AssetDatabase.GUIDToAssetPath(guid);
+                if (string.IsNullOrWhiteSpace(path))
+                    throw new Exception("Asset GUID target not found: " + guid);
+            }
+
+            if (!string.IsNullOrWhiteSpace(path))
+                target.path = path;
+            return path;
         }
 
         private static GameObject ResolveGameObjectTarget(ViewBindingTarget target)
         {
-            if (IsPrefabAssetPath(target.path))
+            string assetPath = ResolveViewBindingAssetPath(target);
+            if (IsPrefabAssetPath(assetPath))
                 return ResolvePrefabAssetGameObjectTarget(target);
+            if (string.IsNullOrWhiteSpace(target.scenePath) && IsSceneAssetPath(assetPath))
+                target.scenePath = assetPath;
 
             Scene scene = ResolveScene(target.scenePath);
             bool componentTarget = string.Equals((target.kind ?? "").Trim(), "component", StringComparison.OrdinalIgnoreCase);
@@ -1157,6 +1212,12 @@ namespace Locus
                    path.Trim().Replace('\\', '/').EndsWith(".prefab", StringComparison.OrdinalIgnoreCase);
         }
 
+        private static bool IsSceneAssetPath(string path)
+        {
+            return !string.IsNullOrWhiteSpace(path) &&
+                   path.Trim().Replace('\\', '/').EndsWith(".unity", StringComparison.OrdinalIgnoreCase);
+        }
+
         private static GameObject ResolvePrefabAssetGameObjectTarget(ViewBindingTarget target)
         {
             string path = (target.path ?? "").Trim().Replace('\\', '/');
@@ -1206,7 +1267,11 @@ namespace Locus
 
         private static Component ResolveComponentTarget(ViewBindingTarget target)
         {
-            if (target.targetFileId != 0 && !IsPrefabAssetPath(target.path))
+            string assetPath = ResolveViewBindingAssetPath(target);
+            if (string.IsNullOrWhiteSpace(target.scenePath) && IsSceneAssetPath(assetPath))
+                target.scenePath = assetPath;
+
+            if (target.targetFileId != 0 && !IsPrefabAssetPath(assetPath))
             {
                 if (target.objectFileId != 0 || !string.IsNullOrWhiteSpace(target.objectPath))
                 {
@@ -1697,6 +1762,12 @@ namespace Locus
             bool saved)
         {
             SerializedPropertySnapshot snapshot = SnapshotSerializedProperty(prop);
+            UnityEngine.Object obj = prop != null && prop.serializedObject != null
+                ? prop.serializedObject.targetObject
+                : null;
+            if (obj != null)
+                target = ViewBindingTargetWithLocalFileIds(target, obj);
+            ApplyViewBindingTargetToSnapshotTree(snapshot, ToSerializedPropertyBindingTarget(target));
             return BuildBindingReadJson(bindingId, target, snapshot, saved);
         }
 
@@ -1770,6 +1841,7 @@ namespace Locus
                 return "null";
             return "{" +
                    "\"kind\":\"" + JsonEscape(target.kind) + "\"," +
+                   "\"guid\":" + NullableJsonString(target.guid) + "," +
                    "\"path\":" + NullableJsonString(target.path) + "," +
                    "\"scenePath\":" + NullableJsonString(target.scenePath) + "," +
                    "\"objectPath\":" + NullableJsonString(target.objectPath) + "," +
@@ -1777,6 +1849,9 @@ namespace Locus
                    "\"targetFileId\":" + NullableJsonLong(target.targetFileId) + "," +
                    "\"componentType\":" + NullableJsonString(target.componentType) + "," +
                    "\"componentIndex\":" + target.componentIndex.ToString(CultureInfo.InvariantCulture) + "," +
+                   "\"targetTypeFullName\":" + NullableJsonString(target.targetTypeFullName) + "," +
+                   "\"targetTypeAssembly\":" + NullableJsonString(target.targetTypeAssembly) + "," +
+                   "\"targetTypeName\":" + NullableJsonString(target.targetTypeName) + "," +
                    "\"propertyPath\":" + NullableJsonString(target.propertyPath) +
                    "}";
         }

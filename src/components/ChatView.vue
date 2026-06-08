@@ -45,6 +45,7 @@ import {
   captureScrollAnchor,
   captureLiveScrollAnchor,
   captureSessionScrollState,
+  isNearBottom,
   resolveSessionScrollTop,
   restoreLiveScrollAnchor,
   restoreScrollAnchor,
@@ -55,6 +56,7 @@ import {
 import {
   createCoalescedScrollScheduler,
   createSettledScrollScheduler,
+  createUserScrollIntentTracker,
   hasRunningToolCall,
   shouldAutoScrollToBottom,
   shouldShowWaitingPlaceholder,
@@ -276,6 +278,9 @@ function openLightbox(src: string) {
 function handleInsertQueuedFollowUp() {
   void chatStore.insertActiveQueuedFollowUp();
 }
+function handleDeleteQueuedFollowUp() {
+  void chatStore.deleteActiveQueuedFollowUp();
+}
 function closeLightbox() {
   lightboxSrc.value = "";
 }
@@ -374,9 +379,14 @@ const assetRefContextCanOpenInEditor = computed(() => {
   return !!target && !(target.kind === "knowledge" || (target.kind === "file" && target.entryKind === "folder"));
 });
 
-const assetRefContextCanOpenLocusInspector = computed(() =>
-  assetRefCtxMenu.value?.target.kind === "asset",
-);
+const assetRefContextCanOpenLocusInspector = computed(() => {
+  const target = assetRefCtxMenu.value?.target;
+  if (!target) return false;
+  if (target.kind === "sceneObject") {
+    return shouldUseUnitySceneObjectRef(target.scenePath, target.objectPath);
+  }
+  return target.kind === "asset";
+});
 
 const assetRefContextSupportsUnity = computed(() => {
   const target = assetRefCtxMenu.value?.target;
@@ -565,6 +575,7 @@ function assetContextTargetFromElement(target: Element): AssetRefContextMenuTarg
 
 function handleContentContextMenu(e: MouseEvent) {
   if (!(e.target instanceof Element)) return;
+  if (e.target.closest(".unity-property-fence, [data-md-unity-property-fence='true']")) return;
   const target = assetContextTargetFromElement(e.target);
   if (target) {
     e.preventDefault();
@@ -813,9 +824,21 @@ async function doAssetRefOpenInEditor() {
 
 async function doAssetRefOpenInLocusInspector() {
   const target = assetRefCtxMenu.value?.target;
-  if (!target || target.kind !== "asset") return;
+  if (!target || !assetRefContextCanOpenLocusInspector.value) return;
   closeAssetRefContextMenu();
   try {
+    if (target.kind === "sceneObject") {
+      const opened = await openLocusAssetInspectorWindow({
+        kind: "sceneObject",
+        scenePath: target.scenePath,
+        objectPath: target.objectPath,
+      });
+      if (!opened) {
+        await openUnitySceneObjectInspector(target.scenePath, target.objectPath);
+      }
+      return;
+    }
+    if (target.kind !== "asset") return;
     const opened = await openLocusAssetInspectorWindow({ assetPath: target.assetPath });
     if (!opened) {
       await openFileExternal(target.filePath);
@@ -1300,6 +1323,7 @@ const displayedStreamingText = ref("");
 let pendingStreamingText = "";
 let streamingTextFlushTimer: ReturnType<typeof setTimeout> | null = null;
 let sessionRestoreLayoutTimer: ReturnType<typeof setTimeout> | null = null;
+const userScrollIntent = createUserScrollIntentTracker();
 const STREAMING_TEXT_RENDER_DELAY_MS = 80;
 const STREAM_END_SCROLL_SETTLE_MS = 320;
 const SESSION_RESTORE_LAYOUT_STABILIZE_MS = 180;
@@ -1476,7 +1500,12 @@ function traceToolViewportAnchor(phase: string, anchor: HTMLElement | null | und
 }
 
 function handleBottomPanelWheel(event: WheelEvent) {
+  markMessagesUserScrollIntent();
   forwardWheelToElement(event, getMessagesElement());
+}
+
+function markMessagesUserScrollIntent() {
+  userScrollIntent.mark();
 }
 
 function captureCurrentSessionScrollState(el: HTMLElement): ReturnType<typeof captureSessionScrollState> {
@@ -1878,6 +1907,19 @@ function onMessagesScroll() {
     });
     return;
   }
+  if (!userScrollIntent.isRecent()) {
+    const el = getMessagesElement();
+    if (props.activeSessionId && el && isNearBottom(readMessageMetrics(el))) {
+      chatStore.rememberSessionScrollState(props.activeSessionId, { mode: "bottom" });
+    }
+    recordLayoutDiagnostic("chat.sessionScroll.nonUserScrollIgnored", {
+      sessionId: props.activeSessionId ?? null,
+      state: props.activeSessionId ? chatStore.getSessionScrollState(props.activeSessionId) : null,
+      metrics: readSessionScrollMetrics(),
+    });
+    return;
+  }
+
   cancelSessionRestoreFrame();
   cancelSessionRestoreLayoutStabilization();
   scrollToBottomScheduler.cancel();
@@ -2473,6 +2515,7 @@ onUnmounted(() => {
           show-user-images
           user-content-mode="asset"
           @scroll="onMessagesScroll"
+          @user-scroll-intent="markMessagesUserScrollIntent"
           @content-click="handleContentClick"
           @content-contextmenu="handleContentContextMenu"
           @open-thinking="emit('openThinking', $event)"
@@ -2514,6 +2557,15 @@ onUnmounted(() => {
           @click="handleInsertQueuedFollowUp"
         >
           {{ t('chat.input.queuedFollowUpInsert') }}
+        </BaseButton>
+        <BaseButton
+          class="queued-follow-up-delete"
+          size="sm"
+          variant="neutral"
+          type="button"
+          @click="handleDeleteQueuedFollowUp"
+        >
+          {{ t('common.delete') }}
         </BaseButton>
       </div>
 
@@ -3443,7 +3495,8 @@ onUnmounted(() => {
   white-space: nowrap;
 }
 
-.queued-follow-up-insert {
+.queued-follow-up-insert,
+.queued-follow-up-delete {
   flex: 0 0 auto;
 }
 

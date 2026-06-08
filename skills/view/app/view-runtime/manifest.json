@@ -5,7 +5,7 @@
   "files": [
     {
       "path": "src/components/view/viewRuntime.ts",
-      "bytes": 68611
+      "bytes": 80965
     },
     {
       "path": "src/components/view/viewCompiler.ts",
@@ -141,11 +141,11 @@
     },
     {
       "path": "src/components/unity/index.ts",
-      "bytes": 970
+      "bytes": 823
     },
     {
       "path": "src/components/unity/unitySerializedValue.ts",
-      "bytes": 16204
+      "bytes": 16841
     },
     {
       "path": "src/components/unity/UnityBoolField.vue",
@@ -169,15 +169,15 @@
     },
     {
       "path": "src/components/unity/UnityNumberField.vue",
-      "bytes": 8348
+      "bytes": 8785
     },
     {
       "path": "src/components/unity/UnityObjectReferenceField.vue",
-      "bytes": 18019
+      "bytes": 19105
     },
     {
       "path": "src/components/unity/UnityPropertyDraw.vue",
-      "bytes": 2936
+      "bytes": 2971
     },
     {
       "path": "src/components/unity/UnityPropertyEditor.vue",
@@ -185,11 +185,15 @@
     },
     {
       "path": "src/components/unity/UnitySerializedPropertyTree.vue",
-      "bytes": 38006
+      "bytes": 38337
     },
     {
       "path": "src/components/unity/UnityVectorField.vue",
       "bytes": 3943
+    },
+    {
+      "path": "src/components/unity/unityPropertyBinding.ts",
+      "bytes": 18953
     },
     {
       "path": "src/components/unity-preview/index.ts",
@@ -209,7 +213,7 @@
     },
     {
       "path": "src/components/unity-preview/UnityObjectPreview.vue",
-      "bytes": 65148
+      "bytes": 66038
     },
     {
       "path": "src/components/ui/BaseButton.vue",
@@ -257,11 +261,11 @@
     },
     {
       "path": "src/language/en.json",
-      "bytes": 209024
+      "bytes": 209383
     },
     {
       "path": "src/language/zh.json",
-      "bytes": 202532
+      "bytes": 202882
     },
     {
       "path": "src/services/asset.ts",
@@ -277,7 +281,7 @@
     },
     {
       "path": "src/services/view.ts",
-      "bytes": 20519
+      "bytes": 19278
     },
     {
       "path": "src/services/unity.ts",
@@ -285,7 +289,7 @@
     },
     {
       "path": "src/services/unitySerializedProperty.ts",
-      "bytes": 3495
+      "bytes": 3620
     },
     {
       "path": "src/services/unityObjectDrawer.ts",
@@ -293,11 +297,15 @@
     },
     {
       "path": "src/services/unityObjectReferencePicker.ts",
-      "bytes": 16878
+      "bytes": 18691
     },
     {
       "path": "src/services/propertyTree.ts",
-      "bytes": 59763
+      "bytes": 59901
+    },
+    {
+      "path": "src/services/unityPropertyPath.ts",
+      "bytes": 7311
     },
     {
       "path": "src/services/startupPerf.ts",
@@ -317,7 +325,7 @@
     },
     {
       "path": "src/types.ts",
-      "bytes": 69437
+      "bytes": 70042
     }
   ]
 }

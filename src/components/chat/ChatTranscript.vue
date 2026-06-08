@@ -163,6 +163,7 @@ const emit = defineEmits<{
   (e: "scroll", event: Event): void;
   (e: "contentClick", event: MouseEvent): void;
   (e: "contentContextmenu", event: MouseEvent): void;
+  (e: "userScrollIntent", event: Event): void;
   (e: "toolHandoffQuietChange", quiet: boolean): void;
   (e: "toolViewportAnchorStart", anchor: HTMLElement): void;
   (e: "toolViewportAnchorEnd", anchor: HTMLElement): void;
@@ -2317,6 +2318,33 @@ function emitScroll(event: Event) {
   emit("scroll", event);
 }
 
+const SCROLL_INTENT_KEYS = new Set([
+  "ArrowDown",
+  "ArrowUp",
+  "End",
+  "Home",
+  "PageDown",
+  "PageUp",
+  " ",
+  "Spacebar",
+]);
+
+function emitUserScrollIntent(event: Event) {
+  emit("userScrollIntent", event);
+}
+
+function emitPointerScrollIntent(event: PointerEvent) {
+  if (event.target === scrollRef.value) {
+    emit("userScrollIntent", event);
+  }
+}
+
+function emitKeyboardScrollIntent(event: KeyboardEvent) {
+  if (SCROLL_INTENT_KEYS.has(event.key)) {
+    emit("userScrollIntent", event);
+  }
+}
+
 function emitContentClick(event: MouseEvent) {
   emit("contentClick", event);
 }
@@ -2345,6 +2373,10 @@ function openImage(src: string) {
     class="chat-transcript-scroll"
     :class="`is-${variant}`"
     @scroll="emitScroll"
+    @wheel.passive="emitUserScrollIntent"
+    @touchstart.passive="emitUserScrollIntent"
+    @pointerdown="emitPointerScrollIntent"
+    @keydown="emitKeyboardScrollIntent"
     @click="emitContentClick"
     @contextmenu="emitContentContextmenu"
   >

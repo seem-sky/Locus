@@ -9,9 +9,10 @@ use uuid::Uuid;
 
 use super::models::{
     AssistantRenderPart, ChatMessage, KnowledgeProposal, KnowledgeProposalStatus, MemoryProposal,
-    MessageRole, SessionDetail, SessionEventRecord, SessionRunSummary, SessionSummary, TodoItem,
-    TodoSnapshot, ToolCallInfo,
+    MessageRole, SessionDetail, SessionEventRecord, SessionRunSummary, SessionRuntimeSnapshot,
+    SessionSummary, TodoItem, TodoSnapshot, ToolCallInfo,
 };
+use super::runtime::SessionRuntimeRegistry;
 use crate::commands::TokenUsage;
 use crate::compact;
 
@@ -20,6 +21,7 @@ pub struct SessionStore {
     conn: Arc<Mutex<Connection>>,
     tool_results_root: PathBuf,
     event_writer: Arc<SessionEventWriter>,
+    runtime: Arc<SessionRuntimeRegistry>,
 }
 
 #[derive(Debug, Clone)]
@@ -556,6 +558,7 @@ impl SessionStore {
             conn,
             tool_results_root,
             event_writer,
+            runtime: Arc::new(SessionRuntimeRegistry::default()),
         })
     }
 
@@ -1126,6 +1129,22 @@ impl SessionStore {
             .as_secs() as i64
     }
 
+    pub fn runtime_snapshot_for_session(&self, session_id: &str) -> Option<SessionRuntimeSnapshot> {
+        self.runtime.snapshot(session_id)
+    }
+
+    pub fn apply_runtime_stream_event(&self, run_id: &str, event: &crate::commands::StreamEvent) {
+        self.runtime.apply_stream_event(run_id, event);
+    }
+
+    pub fn clear_runtime_session(&self, session_id: &str) {
+        self.runtime.clear_session(session_id);
+    }
+
+    pub fn clear_runtime_run_if_current(&self, session_id: &str, run_id: &str) {
+        self.runtime.clear_run_if_current(session_id, run_id);
+    }
+
     pub fn create_session(
         &self,
         title: &str,
@@ -1479,6 +1498,7 @@ impl SessionStore {
 
         conn.execute("COMMIT", [])
             .map_err(|e| format!("Failed to commit run transaction: {}", e))?;
+        self.runtime.start_run(session_id, run_id);
         Ok(())
     }
 
@@ -1488,7 +1508,9 @@ impl SessionStore {
         status: &str,
         error_message: Option<&str>,
     ) -> Result<(), String> {
-        Self::update_run_status_on_conn(&self.conn, run_id, status, error_message)
+        Self::update_run_status_on_conn(&self.conn, run_id, status, error_message)?;
+        self.runtime.update_run_status(run_id, status);
+        Ok(())
     }
 
     fn update_run_status_on_conn(
@@ -1945,6 +1967,7 @@ impl SessionStore {
             updated_at,
             messages,
             pending_inputs: Vec::new(),
+            runtime: None,
         })
     }
 
