@@ -1,5 +1,5 @@
 {
-  "description": "Find all functions or methods that call a specific symbol (upstream callers). Use before editing a function, class, or method to assess blast radius.",
+  "description": "Find all functions or methods that call a specific symbol (upstream callers). Use before editing a function, class, or method to assess blast radius.\n- When Headroom is enabled and output exceeds the compress threshold, large results are compressed through headroom-ai (requires headroom proxy or HEADROOM_API_KEY).",
   "parameters": {
     "type": "object",
     "properties": {

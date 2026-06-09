@@ -576,6 +576,7 @@ export interface ProxyStatus {
 export interface HeadroomSettings {
   enabled: boolean;
   contextCompressEnabled: boolean;
+  alwaysCompressContext: boolean;
   baseUrl: string;
   apiKey: string;
   rtkPath: string;

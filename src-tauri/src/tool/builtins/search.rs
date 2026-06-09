@@ -272,47 +272,19 @@ pub(super) fn grep() -> ToolDef {
                 let compress_meta = if rewrite_meta.rewritten {
                     None
                 } else {
-                    let output_for_compress = output.clone();
-                    let model = ctx.llm_model.clone();
-                    let (compressed, meta) = tokio::task::spawn_blocking(move || {
-                        crate::headroom::compress_tool_output(
-                            &output_for_compress,
-                            model.as_deref(),
-                        )
-                    })
-                    .await
-                    .unwrap_or_else(|error| {
-                        (
-                            output.clone(),
-                            crate::headroom::HeadroomCompressMeta {
-                                enabled: crate::headroom::enabled(),
-                                available: false,
-                                compressed: false,
-                                original_chars: output.chars().count(),
-                                compressed_chars: None,
-                                tokens_before: None,
-                                tokens_after: None,
-                                tokens_saved: None,
-                                compression_ratio: None,
-                                transforms_applied: Vec::new(),
-                                ccr_hashes: Vec::new(),
-                                error: Some(error.to_string()),
-                            },
-                        )
-                    });
-                    if meta.compressed {
-                        output = compressed;
-                    }
-                    Some(meta)
+                    let (compressed, meta) = crate::headroom::maybe_compress_tool_output(
+                        output.clone(),
+                        ctx.llm_model.as_deref(),
+                    )
+                    .await;
+                    output = compressed;
+                    meta
                 };
-                if let Some(sink) = ctx.execution_meta_sink.as_ref() {
-                    if let Ok(mut slot) = sink.lock() {
-                        *slot = Some(crate::headroom::execution_meta_json(
-                            rewrite_meta,
-                            compress_meta,
-                        ));
-                    }
-                }
+                crate::headroom::record_execution_meta(
+                    ctx.execution_meta_sink.as_ref(),
+                    rewrite_meta,
+                    compress_meta,
+                );
 
                 ToolResult {
                     output,

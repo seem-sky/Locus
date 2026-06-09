@@ -1,5 +1,5 @@
 {
-  "description": "Fetch a URL for agent-readable content.\n- The URL must start with http:// or https://\n- Format options: \"markdown\" (default), \"html\", or \"text\"\n- For markdown output, the tool asks the original URL for markdown/text first, returns markdown or plain text directly, and converts HTML responses to markdown\n- Results are truncated at maxChars characters, default 50,000",
+  "description": "Fetch a URL for agent-readable content.\n- The URL must start with http:// or https://\n- Format options: \"markdown\" (default), \"html\", or \"text\"\n- For markdown output, the tool asks the original URL for markdown/text first, returns markdown or plain text directly, and converts HTML responses to markdown\n- Results are truncated at maxChars characters, default 50,000\n- When Headroom is enabled and output exceeds the compress threshold, large fetch results are compressed through headroom-ai (requires headroom proxy or HEADROOM_API_KEY)",
   "parameters": {
     "type": "object",
     "properties": {

@@ -22,7 +22,7 @@ pub(super) fn web_fetch() -> ToolDef {
         name: "web_fetch".to_string(),
         description: prompt.description,
         parameters: prompt.parameters,
-        execute: make_exec(|args, _ctx| {
+        execute: make_exec(|args, ctx| {
             Box::pin(async move {
                 let url = args.get("url").and_then(|v| v.as_str()).unwrap_or("");
                 let format = match parse_web_fetch_format(args.get("format")) {
@@ -90,8 +90,31 @@ pub(super) fn web_fetch() -> ToolDef {
                     content.push_str("\n\n(Content truncated)");
                 }
 
+                let format_label = match format {
+                    WebFetchFormat::Markdown => "markdown",
+                    WebFetchFormat::Html => "html",
+                    WebFetchFormat::Text => "text",
+                };
+                let original_command =
+                    format!("web_fetch(url={url:?}, format={format_label})");
+                let rewrite_meta = crate::headroom::tool_native_meta(
+                    "web_fetch",
+                    &original_command,
+                    Some("native HTTP fetch"),
+                );
+                let (body, compress_meta) = crate::headroom::maybe_compress_tool_output(
+                    content,
+                    ctx.llm_model.as_deref(),
+                )
+                .await;
+                crate::headroom::record_execution_meta(
+                    ctx.execution_meta_sink.as_ref(),
+                    rewrite_meta,
+                    compress_meta,
+                );
+
                 ToolResult {
-                    output: content,
+                    output: body,
                     is_error: false,
                 }
             })

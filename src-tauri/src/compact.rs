@@ -1776,6 +1776,7 @@ mod tests {
             outcome: None,
             recorded_output: None,
             nested_tool_calls: None,
+            execution_meta: None,
         };
         let mut task_call_with_nested = task_call.clone();
         task_call_with_nested.nested_tool_calls = Some(vec![ToolCallInfo {
@@ -1788,6 +1789,7 @@ mod tests {
             outcome: Some(crate::commands::ToolCallOutcome::Done),
             recorded_output: Some("nested output ".repeat(60_000)),
             nested_tool_calls: None,
+            execution_meta: None,
         }]);
 
         let without_nested = vec![
@@ -1848,6 +1850,7 @@ mod tests {
             outcome: None,
             recorded_output: None,
             nested_tool_calls: None,
+            execution_meta: None,
         };
         let mut tool_call_with_recorded_output = tool_call.clone();
         tool_call_with_recorded_output.recorded_output = Some("duplicated output ".repeat(80_000));

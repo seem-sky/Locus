@@ -1,5 +1,5 @@
 {
-  "description": "Analyze the active or specified Lua GC monitor session for allocation hotspots, sustained GC debt, leak risk, and phase anomalies. Use after Play Mode recording (built-in Lua GC panel or lua_gc_monitor_start). Returns rule-based alerts, tuning suggestions, and a short tail of recent samples. Pair with knowledge/skill/gc.md for static optimization patterns.",
+  "description": "Analyze the active or specified Lua GC monitor session for allocation hotspots, sustained GC debt, leak risk, and phase anomalies. Use after Play Mode recording (built-in Lua GC panel or lua_gc_monitor_start). Returns rule-based alerts, tuning suggestions, and a short tail of recent samples. Pair with knowledge/skill/gc.md for static optimization patterns.\n- When Headroom is enabled and output exceeds the compress threshold, large results are compressed through headroom-ai (requires headroom proxy or HEADROOM_API_KEY).",
   "parameters": {
     "type": "object",
     "additionalProperties": false,

@@ -1060,6 +1060,7 @@ mod tests {
                 output: "content".to_string(),
                 outcome: ToolCallOutcome::Done,
                 images: None,
+                execution_meta: None,
             },
         );
 

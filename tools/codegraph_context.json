@@ -1,5 +1,5 @@
 {
-  "description": "Build focused CodeGraph context for a task or area of the codebase. Returns markdown with relevant symbols and optional source snippets. Use before answering architecture or flow questions, or before editing unfamiliar code.",
+  "description": "Build focused CodeGraph context for a task or area of the codebase. Returns markdown with relevant symbols and optional source snippets. Use before answering architecture or flow questions, or before editing unfamiliar code.\n- When Headroom is enabled and output exceeds the compress threshold, large results are compressed through headroom-ai (requires headroom proxy or HEADROOM_API_KEY).",
   "parameters": {
     "type": "object",
     "properties": {

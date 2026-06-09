@@ -50,6 +50,29 @@ fn app_handle_or_error(
     })
 }
 
+async fn finalize_large_view_output(
+    ctx: &ToolExecutionContext,
+    tool_name: &str,
+    original_command: &str,
+    result: ToolResult,
+) -> ToolResult {
+    if result.is_error {
+        return result;
+    }
+    ToolResult {
+        output: crate::headroom::finalize_success_output(
+            tool_name,
+            original_command,
+            Some("view tool"),
+            ctx.llm_model.as_deref(),
+            ctx.execution_meta_sink.as_ref(),
+            result.output,
+        )
+        .await,
+        is_error: false,
+    }
+}
+
 async fn request_view_automation_tool(
     args: serde_json::Value,
     ctx: ToolExecutionContext,
@@ -80,9 +103,17 @@ async fn request_view_automation_tool(
         .or_else(|| args.get("timeout_ms"))
         .and_then(|value| value.as_u64())
         .unwrap_or(default_timeout_ms);
+    let original_command = format!("{tool_name}(viewId={view_id:?}, kind={kind})");
     match crate::view::request_view_automation(&app_handle, &view_id, kind, args, timeout_ms).await
     {
-        Ok(result) => json_output(&result),
+        Ok(result) => {
+            let output = json_output(&result);
+            if tool_name == "view_snapshot" {
+                finalize_large_view_output(&ctx, tool_name, &original_command, output).await
+            } else {
+                output
+            }
+        }
         Err(error) => ToolResult {
             output: error,
             is_error: true,
@@ -559,6 +590,9 @@ pub(super) fn view_console_read() -> ToolDef {
                     .map(str::trim)
                     .filter(|value| !value.is_empty())
                     .map(|value| value.to_ascii_lowercase());
+                let original_command = format!(
+                    "view_console_read(viewId={view_id:?}, limit={limit:?}, level={level:?})"
+                );
                 let request = crate::view::ViewFrontendLogReadRequest { view_id, limit };
                 match crate::view::read_view_frontend_log_sync(&working_dir, request) {
                     Ok(entries) => {
@@ -579,7 +613,13 @@ pub(super) fn view_console_read() -> ToolDef {
                                     .unwrap_or(true)
                             })
                             .collect::<Vec<_>>();
-                        json_output(&entries)
+                        finalize_large_view_output(
+                            &ctx,
+                            "view_console_read",
+                            &original_command,
+                            json_output(&entries),
+                        )
+                        .await
                     }
                     Err(error) => ToolResult {
                         output: error,

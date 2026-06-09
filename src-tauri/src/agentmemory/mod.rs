@@ -1,6 +1,7 @@
 pub mod actions;
 pub mod advanced;
 pub mod client;
+pub mod iii_config;
 pub mod llm_env;
 pub mod mapping;
 pub mod resolve;

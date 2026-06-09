@@ -1,5 +1,5 @@
 {
-  "description": "Search for symbols in the codebase using the CodeGraph index. Prefer this over grep when looking up functions, classes, methods, components, or other named symbols — returns kind, file path, line numbers, and signature. Requires a CodeGraph index (run codegraph init in the project if missing).",
+  "description": "Search for symbols in the codebase using the CodeGraph index. Prefer this over grep when looking up functions, classes, methods, components, or other named symbols — returns kind, file path, line numbers, and signature. Requires a CodeGraph index (run codegraph init in the project if missing).\n- When Headroom is enabled and output exceeds the compress threshold, large results are compressed through headroom-ai (requires headroom proxy or HEADROOM_API_KEY).",
   "parameters": {
     "type": "object",
     "properties": {

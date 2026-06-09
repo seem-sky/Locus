@@ -42,6 +42,10 @@ pub fn lua_gc_analyze() -> ToolDef {
                     .and_then(|value| value.as_u64())
                     .map(|value| value.clamp(10, 500) as usize)
                     .unwrap_or(50);
+                let original_command = format!(
+                    "lua_gc_analyze(sessionId={:?}, maxSamplePoints={max_sample_points})",
+                    session_id.as_deref()
+                );
 
                 let status = match lua_gc_monitor_status(&project_path).await {
                     Ok(status) => status,
@@ -124,10 +128,26 @@ pub fn lua_gc_analyze() -> ToolDef {
                     },
                 });
 
+                let output = serde_json::to_string_pretty(&payload).unwrap_or_else(|error| {
+                    format!("Failed to serialize lua_gc_analyze response: {}", error)
+                });
+                let rewrite_meta = crate::headroom::tool_native_meta(
+                    "lua_gc_analyze",
+                    &original_command,
+                    Some("Unity Lua GC monitor"),
+                );
+                let (body, compress_meta) = crate::headroom::maybe_compress_tool_output(
+                    output,
+                    ctx.llm_model.as_deref(),
+                )
+                .await;
+                crate::headroom::record_execution_meta(
+                    ctx.execution_meta_sink.as_ref(),
+                    rewrite_meta,
+                    compress_meta,
+                );
                 ToolResult {
-                    output: serde_json::to_string_pretty(&payload).unwrap_or_else(|error| {
-                        format!("Failed to serialize lua_gc_analyze response: {}", error)
-                    }),
+                    output: body,
                     is_error: false,
                 }
             })

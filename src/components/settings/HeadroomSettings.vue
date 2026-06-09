@@ -19,6 +19,7 @@ function defaultSettings(): HeadroomSettings {
   return {
     enabled: true,
     contextCompressEnabled: true,
+    alwaysCompressContext: false,
     baseUrl: "http://127.0.0.1:8787",
     apiKey: "",
     rtkPath: "",
@@ -130,7 +131,32 @@ async function updateEnabled(value: boolean) {
 
 async function updateContextCompress(value: boolean) {
   if (draft.value.contextCompressEnabled === value || saving.value) return;
-  draft.value = { ...draft.value, contextCompressEnabled: value };
+  draft.value = {
+    ...draft.value,
+    contextCompressEnabled: value,
+    alwaysCompressContext: value ? draft.value.alwaysCompressContext : false,
+  };
+  await persistDraft();
+}
+
+async function updateAlwaysCompressContext(value: boolean) {
+  if (draft.value.alwaysCompressContext === value || saving.value) return;
+  draft.value = {
+    ...draft.value,
+    alwaysCompressContext: value,
+    contextCompressEnabled: value ? true : draft.value.contextCompressEnabled,
+  };
+  await persistDraft();
+}
+
+async function saveMinCompressChars() {
+  if (!status.value) return;
+  const normalized = Math.max(1, Math.floor(Number(draft.value.minCompressChars) || 2000));
+  if (draft.value.minCompressChars === normalized
+    && normalized === status.value.settings.minCompressChars) {
+    return;
+  }
+  draft.value = { ...draft.value, minCompressChars: normalized };
   await persistDraft();
 }
 
@@ -207,8 +233,12 @@ const advancedDirty = computed(() => {
     draft.value.baseUrl !== saved.baseUrl
     || draft.value.apiKey !== saved.apiKey
     || draft.value.rtkPath !== saved.rtkPath
-    || draft.value.minCompressChars !== saved.minCompressChars
   );
+});
+
+const compressSettingsDirty = computed(() => {
+  if (!status.value) return false;
+  return draft.value.minCompressChars !== status.value.settings.minCompressChars;
 });
 
 onMounted(() => {
@@ -266,6 +296,7 @@ onUnmounted(() => {
       </section>
 
       <section class="headroom-block">
+        <div class="headroom-block-title">{{ t("settings.headroom.compression") }}</div>
         <div class="headroom-toggle-row">
           <div>
             <div class="headroom-toggle-label">{{ t("settings.headroom.enabled") }}</div>
@@ -288,6 +319,39 @@ onUnmounted(() => {
             @update:model-value="updateContextCompress"
           />
         </div>
+        <div class="headroom-toggle-row">
+          <div>
+            <div class="headroom-toggle-label">{{ t("settings.headroom.alwaysCompressContext") }}</div>
+            <p class="headroom-toggle-hint">{{ t("settings.headroom.alwaysCompressContextHint") }}</p>
+          </div>
+          <BaseSwitch
+            :model-value="draft.alwaysCompressContext"
+            :disabled="loading || saving || !draft.enabled || !draft.contextCompressEnabled"
+            @update:model-value="updateAlwaysCompressContext"
+          />
+        </div>
+        <label class="headroom-field headroom-threshold-field">
+          <span class="headroom-field-key">{{ t("settings.headroom.minCompressChars") }}</span>
+          <p class="headroom-toggle-hint">{{ t("settings.headroom.minCompressCharsHint") }}</p>
+          <div class="headroom-threshold-row">
+            <input
+              v-model.number="draft.minCompressChars"
+              class="headroom-input headroom-threshold-input"
+              type="number"
+              min="1"
+              step="100"
+              :disabled="loading || saving || !draft.enabled"
+              @change="saveMinCompressChars"
+            />
+            <BaseButton
+              size="sm"
+              :disabled="loading || saving || !compressSettingsDirty"
+              @click="saveMinCompressChars"
+            >
+              {{ saving ? t("common.loading") : t("settings.headroom.save") }}
+            </BaseButton>
+          </div>
+        </label>
       </section>
 
       <section class="headroom-block">
@@ -321,17 +385,6 @@ onUnmounted(() => {
               class="headroom-input"
               type="text"
               :placeholder="t('settings.headroom.rtkPathPlaceholder')"
-              :disabled="loading || saving"
-            />
-          </label>
-          <label class="headroom-field">
-            <span class="headroom-field-key">{{ t("settings.headroom.minCompressChars") }}</span>
-            <input
-              v-model.number="draft.minCompressChars"
-              class="headroom-input"
-              type="number"
-              min="1"
-              step="100"
               :disabled="loading || saving"
             />
           </label>
@@ -476,6 +529,20 @@ onUnmounted(() => {
 .headroom-actions {
   display: flex;
   justify-content: flex-end;
+}
+
+.headroom-threshold-field {
+  margin-top: 4px;
+}
+
+.headroom-threshold-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.headroom-threshold-input {
+  max-width: 160px;
 }
 
 .headroom-error {

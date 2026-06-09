@@ -1,5 +1,5 @@
 {
-  "description": "Read recent frontend console log entries captured from a Locus View host window. Use it to inspect runtime errors, warnings, and debug output.",
+  "description": "Read recent frontend console log entries captured from a Locus View host window. Use it to inspect runtime errors, warnings, and debug output.\n- When Headroom is enabled and output exceeds the compress threshold, large log output is compressed through headroom-ai (requires headroom proxy or HEADROOM_API_KEY).",
   "parameters": {
     "type": "object",
     "additionalProperties": false,

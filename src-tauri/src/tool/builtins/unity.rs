@@ -81,12 +81,31 @@ pub(super) fn unity_execute() -> ToolDef {
                 match crate::unity_bridge::unity_execute_code(&project_path, &code).await {
                     Ok(output) => {
                         let trimmed = output.trim();
+                        if trimmed.is_empty() {
+                            return ToolResult {
+                                output: "Code executed successfully (no output).".to_string(),
+                                is_error: false,
+                            };
+                        }
+                        let original_command =
+                            format!("unity_execute(request_editor_status={requested_status:?})");
+                        let rewrite_meta = crate::headroom::tool_native_meta(
+                            "unity_execute",
+                            &original_command,
+                            Some("Unity Editor execute"),
+                        );
+                        let (body, compress_meta) = crate::headroom::maybe_compress_tool_output(
+                            trimmed.to_string(),
+                            ctx.llm_model.as_deref(),
+                        )
+                        .await;
+                        crate::headroom::record_execution_meta(
+                            ctx.execution_meta_sink.as_ref(),
+                            rewrite_meta,
+                            compress_meta,
+                        );
                         ToolResult {
-                            output: if trimmed.is_empty() {
-                                "Code executed successfully (no output).".to_string()
-                            } else {
-                                trimmed.to_string()
-                            },
+                            output: body,
                             is_error: false,
                         }
                     }
@@ -173,10 +192,31 @@ pub(super) fn unity_run_states() -> ToolDef {
                 }
 
                 match crate::unity_bridge::unity_run_states(&project_path, &args).await {
-                    Ok(output) => ToolResult {
-                        output: output.trim().to_string(),
-                        is_error: false,
-                    },
+                    Ok(output) => {
+                        let trimmed = output.trim().to_string();
+                        let original_command = format!(
+                            "unity_run_states(request_editor_status={requested_status:?})"
+                        );
+                        let rewrite_meta = crate::headroom::tool_native_meta(
+                            "unity_run_states",
+                            &original_command,
+                            Some("Unity Editor run states"),
+                        );
+                        let (body, compress_meta) = crate::headroom::maybe_compress_tool_output(
+                            trimmed,
+                            ctx.llm_model.as_deref(),
+                        )
+                        .await;
+                        crate::headroom::record_execution_meta(
+                            ctx.execution_meta_sink.as_ref(),
+                            rewrite_meta,
+                            compress_meta,
+                        );
+                        ToolResult {
+                            output: body,
+                            is_error: false,
+                        }
+                    }
                     Err(e) => ToolResult {
                         output: e,
                         is_error: true,

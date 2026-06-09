@@ -1,5 +1,5 @@
 {
-  "description": "Analyze what code is affected if you change a symbol (upstream impact / blast radius). Run before modifying functions, classes, methods, or exported APIs.",
+  "description": "Analyze what code is affected if you change a symbol (upstream impact / blast radius). Run before modifying functions, classes, methods, or exported APIs.\n- When Headroom is enabled and output exceeds the compress threshold, large results are compressed through headroom-ai (requires headroom proxy or HEADROOM_API_KEY).",
   "parameters": {
     "type": "object",
     "properties": {

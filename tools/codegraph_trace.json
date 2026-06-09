@@ -1,5 +1,5 @@
 {
-  "description": "Trace the path from one symbol to another through call edges. Returns the full call chain showing how `from` reaches `to`, including intermediate hops. Use to understand how components connect or trace data/control flow.",
+  "description": "Trace the path from one symbol to another through call edges. Returns the full call chain showing how `from` reaches `to`, including intermediate hops. Use to understand how components connect or trace data/control flow.\n- When Headroom is enabled and output exceeds the compress threshold, large results are compressed through headroom-ai (requires headroom proxy or HEADROOM_API_KEY).",
   "parameters": {
     "type": "object",
     "properties": {

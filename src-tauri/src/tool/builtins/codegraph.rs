@@ -472,11 +472,35 @@ async fn run_codegraph(
         .unwrap_or(DEFAULT_TIMEOUT_SECS)
         .clamp(5, 600);
 
+    let original_command = format!("codegraph {}", cmd_args.join(" "));
+    let tool_name = cmd_args
+        .first()
+        .map(|value| format!("codegraph_{value}"))
+        .unwrap_or_else(|| "codegraph".to_string());
+
     match run_codegraph_command(cmd_args, timeout_secs).await {
-        Ok(output) => ToolResult {
-            output,
-            is_error: false,
-        },
+        Ok(output) => {
+            let rewrite_meta = crate::headroom::tool_native_meta(
+                &tool_name,
+                &original_command,
+                Some("codegraph CLI"),
+            );
+            let (mut body, compress_meta) = crate::headroom::maybe_compress_tool_output(
+                output,
+                ctx.llm_model.as_deref(),
+            )
+            .await;
+            body = cap_codegraph_output(body);
+            crate::headroom::record_execution_meta(
+                ctx.execution_meta_sink.as_ref(),
+                rewrite_meta,
+                compress_meta,
+            );
+            ToolResult {
+                output: body,
+                is_error: false,
+            }
+        }
         Err(message) => ToolResult {
             output: message,
             is_error: true,
@@ -566,12 +590,15 @@ async fn run_codegraph_command(
         combined.push_str(stderr.trim());
     }
 
-    if combined.len() > MAX_OUTPUT_CHARS {
-        combined.truncate(MAX_OUTPUT_CHARS);
-        combined.push_str("\n\n(Output truncated)");
-    }
-
     Ok(combined)
+}
+
+fn cap_codegraph_output(mut output: String) -> String {
+    if output.len() > MAX_OUTPUT_CHARS {
+        output.truncate(MAX_OUTPUT_CHARS);
+        output.push_str("\n\n(Output truncated)");
+    }
+    output
 }
 
 fn resolve_codegraph() -> Result<ResolvedCodegraph, String> {

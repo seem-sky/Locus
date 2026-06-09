@@ -4,6 +4,7 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
+  readdirSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -67,6 +68,233 @@ function agentmemoryIndexCandidates() {
     candidates.push(path.join(root, "dist", "index.mjs"));
   }
   return [...new Set(candidates.map((candidate) => path.resolve(candidate)))];
+}
+
+function isSummariesListApplied(source) {
+  return source.includes("/* locus-summaries-list-v1 */");
+}
+
+const LOCUS_DATA_DIR_MARKER = "/* locus-data-dir-v1 */";
+const LOCUS_DATA_DIR_HELPER = `${LOCUS_DATA_DIR_MARKER}
+function locusAgentmemoryDataDir() {
+\tconst explicit = process.env["AGENTMEMORY_DATA_DIR"] || process.env["AGENTMEMORY_EXPORT_ROOT"];
+\tif (typeof explicit === "string" && explicit.trim().length > 0) return resolve(explicit.trim());
+\treturn join(homedir(), ".agentmemory");
+}`;
+
+function isDataDirPatchApplied(source) {
+  return source.includes("function locusAgentmemoryDataDir()");
+}
+
+function ensureResolvePathImport(source) {
+  if (!source.includes("function locusAgentmemoryDataDir()")) {
+    return source;
+  }
+  if (/import \{[^}]*\bresolve\b[^}]*\} from "node:path";/.test(source)) {
+    return source;
+  }
+  if (source.includes('import { join } from "node:path";')) {
+    return source.replace(
+      'import { join } from "node:path";',
+      'import { join, resolve } from "node:path";',
+    );
+  }
+  return source;
+}
+
+function repairMisplacedDataDirHelper(source) {
+  const helperRegex = /\/\* locus-data-dir-v1 \*\/\r?\nfunction locusAgentmemoryDataDir\(\) \{[\s\S]*?\r?\n\}\r?\n/;
+  const match = source.match(helperRegex);
+  if (!match) {
+    return source;
+  }
+  const helper = match[0];
+  const firstRegion = source.indexOf("//#region");
+  if (firstRegion === -1) {
+    return ensureResolvePathImport(source);
+  }
+  const beforeRegion = source.slice(Math.max(0, firstRegion - helper.length - 4), firstRegion);
+  if (beforeRegion.includes("function locusAgentmemoryDataDir")) {
+    return ensureResolvePathImport(source);
+  }
+  let next = source.replace(helperRegex, "");
+  next = next.replace("//#region", `${helper}\n//#region`);
+  return ensureResolvePathImport(next);
+}
+
+function injectLocusDataDirHelper(source) {
+  if (isDataDirPatchApplied(source)) {
+    return source;
+  }
+  source = repairMisplacedDataDirHelper(source);
+  if (isDataDirPatchApplied(source)) {
+    return source;
+  }
+  const anchors = [
+    "//#region src/config.ts",
+    "//#region src/cli/doctor-diagnostics.ts",
+  ];
+  for (const anchor of anchors) {
+    if (source.includes(anchor)) {
+      return source.replace(anchor, `${LOCUS_DATA_DIR_HELPER}\n\n${anchor}`);
+    }
+  }
+  return source;
+}
+
+function patchAgentmemoryDataDirSource(source) {
+  let next = injectLocusDataDirHelper(source);
+  const before = next;
+  next = next.replace(
+    'const DATA_DIR = join(homedir(), ".agentmemory");',
+    "const DATA_DIR = locusAgentmemoryDataDir();",
+  );
+  next = next.replace(
+    'const DEFAULT_EXPORT_ROOT = join(homedir(), ".agentmemory");',
+    "const DEFAULT_EXPORT_ROOT = locusAgentmemoryDataDir();",
+  );
+  // Only replace path joins with a trailing comma (subpaths). Do not touch the
+  // helper fallback `join(homedir(), ".agentmemory");`.
+  next = next.replaceAll('join(homedir(), ".agentmemory",', "join(locusAgentmemoryDataDir(),");
+  next = next.replaceAll('resolve(homedir(), ".agentmemory")', "resolve(locusAgentmemoryDataDir())");
+  next = next.replace(
+    "function prefsDir() {\n\treturn join(homedir(), \".agentmemory\");\n}",
+    "function prefsDir() {\n\treturn locusAgentmemoryDataDir();\n}",
+  );
+  return next === before ? null : next;
+}
+
+function repairBrokenDataDirHelper(source) {
+  return source.replace(
+    "return join(locusAgentmemoryDataDir());",
+    'return join(homedir(), ".agentmemory");',
+  );
+}
+
+function patchAgentmemoryDataDirFile(filePath) {
+  if (!existsSync(filePath)) {
+    return false;
+  }
+  const source = readFileSync(filePath, "utf8");
+  let next = repairBrokenDataDirHelper(source);
+  next = repairMisplacedDataDirHelper(next);
+  next = patchAgentmemoryDataDirSource(next) ?? next;
+  next = ensureResolvePathImport(next);
+  if (next === source) {
+    return false;
+  }
+  writeFileSync(filePath, next);
+  return true;
+}
+
+function patchAgentmemoryCliDataDir(cliPath) {
+  if (!existsSync(cliPath)) {
+    return false;
+  }
+  const source = readFileSync(cliPath, "utf8");
+  let next = repairBrokenDataDirHelper(source);
+  next = repairMisplacedDataDirHelper(next);
+  if (!next.includes("{ delimiter, dirname, join, resolve }")) {
+    next = next.replace(
+      "{ delimiter, dirname, join }",
+      "{ delimiter, dirname, join, resolve }",
+    );
+  }
+  next = injectLocusDataDirHelper(next);
+  next = next.replaceAll('join(homedir(), ".agentmemory",', "join(locusAgentmemoryDataDir(),");
+  next = next.replace(
+    "function prefsDir() {\n\treturn join(homedir(), \".agentmemory\");\n}",
+    "function prefsDir() {\n\treturn locusAgentmemoryDataDir();\n}",
+  );
+  next = ensureResolvePathImport(next);
+  if (!next.includes("function locusAgentmemoryDataDir()")) {
+    return false;
+  }
+  if (next === source) {
+    return false;
+  }
+  writeFileSync(cliPath, next);
+  return true;
+}
+
+function agentmemoryDataDirPatchCandidates(bundleRoot = bundleDir) {
+  const distDir = path.join(bundleRoot, "node_modules", "@agentmemory", "agentmemory", "dist");
+  if (!existsSync(distDir)) {
+    return [];
+  }
+  return readdirSync(distDir)
+    .filter((name) => name.endsWith(".mjs") && name !== "cli.mjs")
+    .map((name) => path.join(distDir, name))
+    .filter((filePath) => {
+      try {
+        const source = readFileSync(filePath, "utf8");
+        return (
+          source.includes('join(homedir(), ".agentmemory")') ||
+          source.includes('resolve(homedir(), ".agentmemory")') ||
+          source.includes('const DATA_DIR = join(homedir(), ".agentmemory");') ||
+          source.includes("return join(locusAgentmemoryDataDir());") ||
+          (source.includes("function locusAgentmemoryDataDir()") &&
+            !/import \{[^}]*\bresolve\b[^}]*\} from "node:path";/.test(source))
+        );
+      } catch {
+        return false;
+      }
+    });
+}
+
+function cliEntryPathForBundle(bundleRoot = bundleDir) {
+  return path.join(bundleRoot, "node_modules", "@agentmemory", "agentmemory", "dist", "cli.mjs");
+}
+
+function patchAgentmemoryDataDirTree(bundleRoot) {
+  let patched = 0;
+  for (const filePath of agentmemoryDataDirPatchCandidates(bundleRoot)) {
+    if (patchAgentmemoryDataDirFile(filePath)) {
+      patched += 1;
+      console.log(`[locus] Patched agentmemory data dir (v1): ${path.relative(repoRoot, filePath)}`);
+    }
+  }
+  return patched;
+}
+
+function patchAgentmemoryDataDir() {
+  let patched = patchAgentmemoryDataDirTree(bundleDir);
+  const debugBundle = path.join(repoRoot, "src-tauri", "target", "debug", "agentmemory-bundle");
+  if (
+    existsSync(debugBundle) &&
+    path.resolve(debugBundle) !== path.resolve(bundleDir)
+  ) {
+    patched += patchAgentmemoryDataDirTree(debugBundle);
+  }
+  // cli.mjs can already reference locusAgentmemoryDataDir() without the helper
+  // if a prior patch pass only rewrote path joins — always re-apply CLI patch.
+  for (const bundleRoot of [bundleDir, debugBundle]) {
+    const cliPath = cliEntryPathForBundle(bundleRoot);
+    if (existsSync(cliPath)) {
+      const before = readFileSync(cliPath, "utf8");
+      if (patchAgentmemoryCliDataDir(cliPath)) {
+        patched += 1;
+        console.log(`[locus] Patched agentmemory CLI data dir (v1): ${path.relative(repoRoot, cliPath)}`);
+      } else if (!before.includes("function locusAgentmemoryDataDir()")) {
+        throw new Error(`agentmemory CLI data dir patch missing helper: ${cliPath}`);
+      }
+    }
+  }
+  if (patched === 0 && existsSync(agentmemoryIndexPath())) {
+    const sample = readFileSync(agentmemoryIndexPath(), "utf8");
+    if (isDataDirPatchApplied(sample)) {
+      console.log("[locus] agentmemory data dir patch (v1) already present");
+    }
+  }
+  for (const bundleRoot of [bundleDir, debugBundle]) {
+    const cliPath = cliEntryPathForBundle(bundleRoot);
+    if (!existsSync(cliPath)) continue;
+    const cliSource = readFileSync(cliPath, "utf8");
+    const misplaced = /import \{ homedir, platform \} from "node:os";\r?\n\/\* locus-data-dir-v1 \*\/\r?\nfunction locusAgentmemoryDataDir\(\)/.test(cliSource);
+    if (misplaced && patchAgentmemoryCliDataDir(cliPath)) {
+      console.log(`[locus] Repaired agentmemory CLI helper placement: ${path.relative(repoRoot, cliPath)}`);
+    }
+  }
 }
 
 function isReplayPatchApplied(source) {
@@ -1652,6 +1880,7 @@ async function main() {
 
   const cliVersion = verifyCli(nodeProgram);
   patchAgentmemoryReplay();
+  patchAgentmemoryDataDir();
   patchAgentmemoryViewer();
   writeManifest({ cliVersion, layout: "npm-plus-iii" });
   console.log(

@@ -1,5 +1,5 @@
 {
-  "description": "Read a unified knowledge document by type-prefixed path. Skill package root paths read that package's `SKILL.md`; package child docs can be read by their package-relative `.md` path. This tool returns plain-text document content in markdown form, not knowledge metadata or directory config.",
+  "description": "Read a unified knowledge document by type-prefixed path. Skill package root paths read that package's `SKILL.md`; package child docs can be read by their package-relative `.md` path. This tool returns plain-text document content in markdown form, not knowledge metadata or directory config.\n- When Headroom is enabled and output exceeds the compress threshold, large document bodies are compressed through headroom-ai (requires headroom proxy or HEADROOM_API_KEY).",
   "parameters": {
     "type": "object",
     "additionalProperties": false,

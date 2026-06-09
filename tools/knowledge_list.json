@@ -1,5 +1,5 @@
 {
-  "description": "List knowledge documents in the unified knowledge store. Use this to browse the four top-level types: design, memory, skill, and reference. Returns plain text with one canonical type-prefixed `.md` document path per line, such as `skill/build-pipeline.md`.",
+  "description": "List knowledge documents in the unified knowledge store. Use this to browse the four top-level types: design, memory, skill, and reference. Returns plain text with one canonical type-prefixed `.md` document path per line, such as `skill/build-pipeline.md`.\n- When Headroom is enabled and output exceeds the compress threshold, large listings are compressed through headroom-ai (requires headroom proxy or HEADROOM_API_KEY).",
   "parameters": {
     "type": "object",
     "additionalProperties": false,

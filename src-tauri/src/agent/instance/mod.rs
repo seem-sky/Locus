@@ -6092,7 +6092,7 @@ impl AgentInstance {
             let messages_clone = messages.clone();
             match tokio::task::spawn_blocking(move || {
                 let refs: Vec<&str> = system_parts_owned.iter().map(String::as_str).collect();
-                crate::headroom::compress_chat_messages(
+                crate::headroom::compress_prepared_messages(
                     &refs,
                     &messages_clone,
                     Some(&model_for_headroom),
@@ -6101,22 +6101,17 @@ impl AgentInstance {
             .await
             {
                 Ok((compressed, meta)) => {
+                    crate::headroom::log_round_compress_summary(
+                        &self.id,
+                        &self.session_id,
+                        run_id,
+                        0,
+                        "compact-request",
+                        &meta,
+                    );
                     if meta.compressed {
-                        eprintln!(
-                            "[Agent {}] headroom compact-request compress: tokens_before={:?} tokens_after={:?} tokens_saved={:?}",
-                            self.id,
-                            meta.tokens_before,
-                            meta.tokens_after,
-                            meta.tokens_saved,
-                        );
                         compressed
                     } else {
-                        if let Some(error) = meta.error {
-                            eprintln!(
-                                "[Agent {}] headroom compact-request compress skipped: {}",
-                                self.id, error
-                            );
-                        }
                         messages.clone()
                     }
                 }
@@ -7676,56 +7671,43 @@ impl AgentInstance {
                 compact::should_auto_compact(estimated_input_tokens, ctx_limit)
             };
             let mut preflight_compact_error: Option<String> = None;
+            let headroom_every_round = crate::headroom::always_compress_context_enabled();
+
+            if crate::headroom::context_library_available() && headroom_every_round {
+                let (compressed, _meta) = self
+                    .apply_headroom_round_context_compress(
+                        &system_parts,
+                        prepared_messages,
+                        iteration,
+                        &run_id,
+                        "every-round",
+                    )
+                    .await;
+                prepared_messages = compressed;
+                estimated_input_tokens = compact::estimate_request_tokens(
+                    &system_parts,
+                    &prepared_messages,
+                    &api_tools,
+                );
+            }
 
             if !compact_tracker.is_circuit_broken() && should_preflight_compact {
-                if crate::headroom::context_library_available() {
-                    let system_parts_for_headroom: Vec<String> =
-                        system_parts.iter().map(|part| (*part).to_string()).collect();
-                    let model_for_headroom = self.effective_model.clone();
-                    let messages_for_headroom = prepared_messages.clone();
-                    match tokio::task::spawn_blocking(move || {
-                        let refs: Vec<&str> = system_parts_for_headroom
-                            .iter()
-                            .map(String::as_str)
-                            .collect();
-                        crate::headroom::compress_chat_messages(
-                            &refs,
-                            &messages_for_headroom,
-                            Some(&model_for_headroom),
+                if crate::headroom::context_library_available() && !headroom_every_round {
+                    let (compressed, _meta) = self
+                        .apply_headroom_round_context_compress(
+                            &system_parts,
+                            prepared_messages,
+                            iteration,
+                            &run_id,
+                            "preflight",
                         )
-                    })
-                    .await
-                    {
-                        Ok((compressed, meta)) => {
-                            if meta.compressed {
-                                eprintln!(
-                                    "[Agent {}] headroom context compress: tokens_before={:?} tokens_after={:?} tokens_saved={:?} ratio={:?}",
-                                    self.id,
-                                    meta.tokens_before,
-                                    meta.tokens_after,
-                                    meta.tokens_saved,
-                                    meta.compression_ratio,
-                                );
-                                prepared_messages = compressed;
-                                estimated_input_tokens = compact::estimate_request_tokens(
-                                    &system_parts,
-                                    &prepared_messages,
-                                    &api_tools,
-                                );
-                            } else if let Some(error) = meta.error {
-                                eprintln!(
-                                    "[Agent {}] headroom context compress unavailable: {}",
-                                    self.id, error
-                                );
-                            }
-                        }
-                        Err(error) => {
-                            eprintln!(
-                                "[Agent {}] headroom context compress task failed: {}",
-                                self.id, error
-                            );
-                        }
-                    }
+                        .await;
+                    prepared_messages = compressed;
+                    estimated_input_tokens = compact::estimate_request_tokens(
+                        &system_parts,
+                        &prepared_messages,
+                        &api_tools,
+                    );
                 }
 
                 let should_still_preflight_compact = if is_codex_backend {
@@ -9909,6 +9891,97 @@ impl AgentInstance {
         }
     }
 
+    async fn apply_headroom_round_context_compress(
+        &self,
+        system_parts: &[&str],
+        prepared_messages: Vec<ChatMessage>,
+        iteration: usize,
+        run_id: &str,
+        reason: &str,
+    ) -> (Vec<ChatMessage>, crate::headroom::HeadroomCompressMeta) {
+        let original_messages = prepared_messages.clone();
+        let system_parts_owned: Vec<String> =
+            system_parts.iter().map(|part| (*part).to_string()).collect();
+        let model_for_headroom = self.effective_model.clone();
+
+        match tokio::task::spawn_blocking(move || {
+            let refs: Vec<&str> = system_parts_owned.iter().map(String::as_str).collect();
+            crate::headroom::compress_prepared_messages(
+                &refs,
+                &prepared_messages,
+                Some(&model_for_headroom),
+            )
+        })
+        .await
+        {
+            Ok((compressed, meta)) => {
+                crate::headroom::log_round_compress_summary(
+                    &self.id,
+                    &self.session_id,
+                    run_id,
+                    iteration,
+                    reason,
+                    &meta,
+                );
+                if meta.compressed {
+                    (compressed, meta)
+                } else {
+                    (original_messages, meta)
+                }
+            }
+            Err(error) => {
+                eprintln!(
+                    "[Agent {}] headroom round compress task failed: session={} run={} iteration={} reason={}: {}",
+                    self.id, self.session_id, run_id, iteration, reason, error
+                );
+                (
+                    original_messages,
+                    crate::headroom::HeadroomCompressMeta {
+                        enabled: crate::headroom::enabled(),
+                        available: false,
+                        compressed: false,
+                        original_chars: 0,
+                        compressed_chars: None,
+                        tokens_before: None,
+                        tokens_after: None,
+                        tokens_saved: None,
+                        compression_ratio: None,
+                        transforms_applied: Vec::new(),
+                        ccr_hashes: Vec::new(),
+                        error: Some(error.to_string()),
+                    },
+                )
+            }
+        }
+    }
+
+    async fn finalize_tool_output_with_headroom(
+        &self,
+        tool_name: &str,
+        original_command: &str,
+        result: ToolResult,
+    ) -> ToolResult {
+        if result.is_error {
+            return result;
+        }
+        ToolResult {
+            output: crate::headroom::finalize_success_output(
+                tool_name,
+                original_command,
+                Some("agent intercept"),
+                Some(self.effective_model.as_str()),
+                None,
+                result.output,
+            )
+            .await,
+            is_error: false,
+        }
+    }
+
+    fn summarize_tool_args(args: &serde_json::Value) -> String {
+        serde_json::to_string(args).unwrap_or_else(|_| "{}".to_string())
+    }
+
     async fn await_tool_result<F>(
         &self,
         future: F,
@@ -10183,10 +10256,31 @@ impl AgentInstance {
         } else if tc.name == "config_query" {
             ExecutedToolResult::from_tool_result(self.execute_config_query(app_handle, args))
         } else if tc.name == "knowledge_list" {
-            ExecutedToolResult::from_tool_result(self.execute_knowledge_list(args))
+            let result = self.execute_knowledge_list(args);
+            let command = format!(
+                "knowledge_list({})",
+                Self::summarize_tool_args(args)
+            );
+            ExecutedToolResult::from_tool_result(
+                self.finalize_tool_output_with_headroom("knowledge_list", &command, result)
+                    .await,
+            )
         } else if tc.name == "knowledge_query" {
-            self.await_tool_result(self.execute_knowledge_query(app_handle, &tc.id, args, run_id), None)
-                .await
+            let command = format!(
+                "knowledge_query({})",
+                Self::summarize_tool_args(args)
+            );
+            self.await_tool_result(
+                async {
+                    let result = self
+                        .execute_knowledge_query(app_handle, &tc.id, args, run_id)
+                        .await;
+                    self.finalize_tool_output_with_headroom("knowledge_query", &command, result)
+                        .await
+                },
+                None,
+            )
+            .await
         } else if tc.name == "knowledge_read" {
             self.execute_knowledge_read(app_handle, &tc.id, args, run_id)
                 .await
@@ -10226,18 +10320,67 @@ impl AgentInstance {
             self.await_executed_tool_result(self.execute_view_capture(app_handle, args))
                 .await
         } else if tc.name == "unity_ref_search" {
-            ExecutedToolResult::from_tool_result(self.execute_unity_ref_search(app_handle, args))
+            let command = format!(
+                "unity_ref_search({})",
+                Self::summarize_tool_args(args)
+            );
+            let result = self.execute_unity_ref_search(app_handle, args);
+            ExecutedToolResult::from_tool_result(
+                self.finalize_tool_output_with_headroom("unity_ref_search", &command, result)
+                    .await,
+            )
         } else if tc.name == "unity_asset_search" {
-            ExecutedToolResult::from_tool_result(self.execute_unity_asset_search(app_handle, args))
+            let command = format!(
+                "unity_asset_search({})",
+                Self::summarize_tool_args(args)
+            );
+            let result = self.execute_unity_asset_search(app_handle, args);
+            ExecutedToolResult::from_tool_result(
+                self.finalize_tool_output_with_headroom("unity_asset_search", &command, result)
+                    .await,
+            )
         } else if tc.name == "unity_yaml_list" {
-            self.await_tool_result(self.execute_unity_yaml_list(app_handle, args), None)
-                .await
+            let command = format!(
+                "unity_yaml_list({})",
+                Self::summarize_tool_args(args)
+            );
+            self.await_tool_result(
+                async {
+                    let result = self.execute_unity_yaml_list(app_handle, args).await;
+                    self.finalize_tool_output_with_headroom("unity_yaml_list", &command, result)
+                        .await
+                },
+                None,
+            )
+            .await
         } else if tc.name == "unity_yaml_search" {
-            self.await_tool_result(self.execute_unity_yaml_search(app_handle, args), None)
-                .await
+            let command = format!(
+                "unity_yaml_search({})",
+                Self::summarize_tool_args(args)
+            );
+            self.await_tool_result(
+                async {
+                    let result = self.execute_unity_yaml_search(app_handle, args).await;
+                    self.finalize_tool_output_with_headroom("unity_yaml_search", &command, result)
+                        .await
+                },
+                None,
+            )
+            .await
         } else if tc.name == "unity_yaml_read" {
-            self.await_tool_result(self.execute_unity_yaml_read(app_handle, args), None)
-                .await
+            let command = format!(
+                "unity_yaml_read({})",
+                Self::summarize_tool_args(args)
+            );
+            self.await_tool_result(
+                async {
+                    let result = self.execute_unity_yaml_read(app_handle, args).await;
+                    self.finalize_tool_output_with_headroom("unity_yaml_read", &command, result)
+                        .await
+                },
+                None,
+            )
+            .await
         } else {
             let bash_git_knowledge_assessment = if tc.name == "bash" {
                 Self::assess_bash_git_knowledge_command(
@@ -11173,10 +11316,15 @@ impl AgentInstance {
                     output.push_str("Loaded Skill document tools for the next step: ");
                     output.push_str(&activated_tools.join(", "));
                 }
-                ExecutedToolResult::from_tool_result(ToolResult {
+                let command = format!("knowledge_read({})", Self::summarize_tool_args(args));
+                let result = ToolResult {
                     output,
                     is_error: false,
-                })
+                };
+                ExecutedToolResult::from_tool_result(
+                    self.finalize_tool_output_with_headroom("knowledge_read", &command, result)
+                        .await,
+                )
             }
             Err(error) => ExecutedToolResult::from_tool_result(ToolResult {
                 output: format!("Error reading knowledge document: {}", error),

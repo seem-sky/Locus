@@ -155,6 +155,22 @@ impl AgentMemoryService {
 
         if let Some(export_root) = export_root {
             std::fs::create_dir_all(&export_root).map_err(|e| e.to_string())?;
+            let legacy_global_dir = super::iii_config::legacy_global_data_dir();
+            super::iii_config::maybe_migrate_legacy_env(&export_root, &legacy_global_dir)
+                .map_err(|e| e.to_string())?;
+            let legacy_data_dir = resolved.working_dir.join("data");
+            super::iii_config::maybe_migrate_legacy_kv(&export_root, &legacy_data_dir)
+                .map_err(|e| e.to_string())?;
+            let config_path = super::iii_config::write_iii_config(&export_root)
+                .map_err(|e| e.to_string())?;
+            cmd.env(
+                "AGENTMEMORY_DATA_DIR",
+                export_root.display().to_string(),
+            );
+            cmd.env(
+                "AGENTMEMORY_III_CONFIG",
+                config_path.display().to_string(),
+            );
             if let Some(log_path) = service_log_path(&export_root) {
                 if let Ok(log_file) = std::fs::OpenOptions::new()
                     .create(true)

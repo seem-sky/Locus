@@ -214,58 +214,21 @@ pub(super) fn read() -> ToolDef {
                             }
                             output.push_str("\n</content>");
 
-                            let mut body = output;
                             let rewrite_meta = crate::headroom::read_tool_native_meta(
                                 &file_path,
                                 offset,
                                 limit,
                             );
-                            let compress_meta = if crate::headroom::enabled()
-                                && body.chars().count() >= crate::headroom::min_compress_chars()
-                            {
-                                let output_for_compress = body.clone();
-                                let model = ctx.llm_model.clone();
-                                let (compressed, meta) = tokio::task::spawn_blocking(move || {
-                                    crate::headroom::compress_tool_output(
-                                        &output_for_compress,
-                                        model.as_deref(),
-                                    )
-                                })
-                                .await
-                                .unwrap_or_else(|error| {
-                                    (
-                                        body.clone(),
-                                        crate::headroom::HeadroomCompressMeta {
-                                            enabled: crate::headroom::enabled(),
-                                            available: false,
-                                            compressed: false,
-                                            original_chars: body.chars().count(),
-                                            compressed_chars: None,
-                                            tokens_before: None,
-                                            tokens_after: None,
-                                            tokens_saved: None,
-                                            compression_ratio: None,
-                                            transforms_applied: Vec::new(),
-                                            ccr_hashes: Vec::new(),
-                                            error: Some(error.to_string()),
-                                        },
-                                    )
-                                });
-                                if meta.compressed {
-                                    body = compressed;
-                                }
-                                Some(meta)
-                            } else {
-                                None
-                            };
-                            if let Some(sink) = ctx.execution_meta_sink.as_ref() {
-                                if let Ok(mut slot) = sink.lock() {
-                                    *slot = Some(crate::headroom::execution_meta_json(
-                                        rewrite_meta,
-                                        compress_meta,
-                                    ));
-                                }
-                            }
+                            let (body, compress_meta) = crate::headroom::maybe_compress_tool_output(
+                                output,
+                                ctx.llm_model.as_deref(),
+                            )
+                            .await;
+                            crate::headroom::record_execution_meta(
+                                ctx.execution_meta_sink.as_ref(),
+                                rewrite_meta,
+                                compress_meta,
+                            );
 
                             ToolResult {
                                 output: format!("{remap_prefix}{body}"),
@@ -852,8 +815,27 @@ pub(super) fn list() -> ToolDef {
                     output = "(empty directory)".to_string();
                 }
 
+                let original_command = format!(
+                    "list(path={root_path:?}, depth={max_depth}, max_items={max_items}, max_total={max_total}, include_files={include_files})"
+                );
+                let rewrite_meta = crate::headroom::tool_native_meta(
+                    "list",
+                    &original_command,
+                    Some("native directory list"),
+                );
+                let (body, compress_meta) = crate::headroom::maybe_compress_tool_output(
+                    output,
+                    ctx.llm_model.as_deref(),
+                )
+                .await;
+                crate::headroom::record_execution_meta(
+                    ctx.execution_meta_sink.as_ref(),
+                    rewrite_meta,
+                    compress_meta,
+                );
+
                 ToolResult {
-                    output: format!("{remap_prefix}{output}"),
+                    output: format!("{remap_prefix}{body}"),
                     is_error: false,
                 }
             })

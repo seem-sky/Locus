@@ -1,5 +1,5 @@
 {
-  "description": "Inspect an open Locus View host window and return runtime state, viewport information, focused element, and a bounded list of visible actionable DOM elements.",
+  "description": "Inspect an open Locus View host window and return runtime state, viewport information, focused element, and a bounded list of visible actionable DOM elements.\n- When Headroom is enabled and output exceeds the compress threshold, large snapshot output is compressed through headroom-ai (requires headroom proxy or HEADROOM_API_KEY).",
   "parameters": {
     "type": "object",
     "additionalProperties": false,

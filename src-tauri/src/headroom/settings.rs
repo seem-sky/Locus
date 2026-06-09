@@ -15,6 +15,8 @@ pub struct HeadroomSettings {
     pub enabled: bool,
     #[serde(default = "default_context_compress_enabled")]
     pub context_compress_enabled: bool,
+    #[serde(default = "default_always_compress_context")]
+    pub always_compress_context: bool,
     #[serde(default = "default_base_url")]
     pub base_url: String,
     #[serde(default)]
@@ -63,6 +65,7 @@ impl Default for HeadroomSettings {
         Self {
             enabled: default_enabled(),
             context_compress_enabled: default_context_compress_enabled(),
+            always_compress_context: default_always_compress_context(),
             base_url: default_base_url(),
             api_key: String::new(),
             rtk_path: default_rtk_path(),
@@ -77,6 +80,10 @@ fn default_enabled() -> bool {
 
 fn default_context_compress_enabled() -> bool {
     true
+}
+
+fn default_always_compress_context() -> bool {
+    false
 }
 
 fn default_base_url() -> String {
@@ -266,6 +273,16 @@ pub fn context_compress_enabled() -> bool {
     enabled() && current().context_compress_enabled
 }
 
+pub fn always_compress_context_enabled() -> bool {
+    if env_always_compress_context_disabled() {
+        return false;
+    }
+    if env_always_compress_context_enabled() {
+        return context_compress_enabled();
+    }
+    context_compress_enabled() && current().always_compress_context
+}
+
 pub fn base_url() -> String {
     std::env::var("HEADROOM_BASE_URL")
         .ok()
@@ -324,6 +341,26 @@ fn env_disabled() -> bool {
 fn env_context_disabled() -> bool {
     matches!(
         std::env::var("LOCUS_HEADROOM_CONTEXT_COMPRESS")
+            .ok()
+            .map(|value| value.trim().to_ascii_lowercase())
+            .as_deref(),
+        Some("0") | Some("false") | Some("no")
+    )
+}
+
+fn env_always_compress_context_enabled() -> bool {
+    matches!(
+        std::env::var("LOCUS_HEADROOM_ALWAYS_COMPRESS_CONTEXT")
+            .ok()
+            .map(|value| value.trim().to_ascii_lowercase())
+            .as_deref(),
+        Some("1") | Some("true") | Some("yes")
+    )
+}
+
+fn env_always_compress_context_disabled() -> bool {
+    matches!(
+        std::env::var("LOCUS_HEADROOM_ALWAYS_COMPRESS_CONTEXT")
             .ok()
             .map(|value| value.trim().to_ascii_lowercase())
             .as_deref(),
@@ -401,6 +438,11 @@ fn apply_process_env(settings: HeadroomSettings) {
     } else {
         std::env::set_var("LOCUS_HEADROOM_CONTEXT_COMPRESS", "0");
     }
+    if settings.always_compress_context {
+        std::env::set_var("LOCUS_HEADROOM_ALWAYS_COMPRESS_CONTEXT", "1");
+    } else {
+        std::env::remove_var("LOCUS_HEADROOM_ALWAYS_COMPRESS_CONTEXT");
+    }
 }
 
 #[cfg(test)]
@@ -429,5 +471,40 @@ mod tests {
             ..HeadroomSettings::default()
         });
         assert_eq!(settings.base_url, DEFAULT_BASE_URL);
+    }
+
+    #[test]
+    fn always_compress_requires_context_compress_enabled() {
+        let prior_always = std::env::var("LOCUS_HEADROOM_ALWAYS_COMPRESS_CONTEXT").ok();
+        let prior_context = std::env::var("LOCUS_HEADROOM_CONTEXT_COMPRESS").ok();
+        std::env::remove_var("LOCUS_HEADROOM_ALWAYS_COMPRESS_CONTEXT");
+        std::env::remove_var("LOCUS_HEADROOM_CONTEXT_COMPRESS");
+
+        if let Ok(mut guard) = settings_lock().write() {
+            *guard = HeadroomSettings {
+                always_compress_context: true,
+                context_compress_enabled: false,
+                ..HeadroomSettings::default()
+            };
+        }
+        assert!(!always_compress_context_enabled());
+
+        if let Ok(mut guard) = settings_lock().write() {
+            *guard = HeadroomSettings {
+                always_compress_context: true,
+                context_compress_enabled: true,
+                ..HeadroomSettings::default()
+            };
+        }
+        assert!(always_compress_context_enabled());
+
+        match prior_always {
+            Some(value) => std::env::set_var("LOCUS_HEADROOM_ALWAYS_COMPRESS_CONTEXT", value),
+            None => std::env::remove_var("LOCUS_HEADROOM_ALWAYS_COMPRESS_CONTEXT"),
+        }
+        match prior_context {
+            Some(value) => std::env::set_var("LOCUS_HEADROOM_CONTEXT_COMPRESS", value),
+            None => std::env::remove_var("LOCUS_HEADROOM_CONTEXT_COMPRESS"),
+        }
     }
 }
