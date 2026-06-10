@@ -99,7 +99,15 @@ bun tauri build
 bun run release:installers
 ```
 
-默认安装包保持标准命名，例如 `locus_0.2.5_x64-setup.exe`。无内嵌版本使用 `locus_0.2.5_x64-without_embed_python_git-setup.exe`。
+默认安装包保持标准命名，例如 `locus_0.3.2_x64-setup.exe`。无内嵌版本：
+
+```powershell
+bun run release:installers without_embed_python_git
+```
+
+产物为 `locus_0.3.2_x64-without_embed_python_git-setup.exe`。
+
+**Windows 构建注意：** NSIS 打包需要大量临时磁盘空间。若 C: 盘空间不足导致打包失败，构建前将 `TEMP`/`TMP` 指到仓库 `.tmp\nsis-temp`（详见 [AGENTS.md — Windows 发布安装包（NSIS）](AGENTS.md#windows-发布安装包nsis)）。
 
 ## 许可证
 

@@ -10246,6 +10246,8 @@ impl AgentInstance {
                 {
                     result.append_output(&hint);
                 }
+                self.try_emit_workflow_completion_report(app_handle, store, run_id, mode)
+                    .await;
                 result.mark_workflow_gate_handled();
             }
             result
@@ -14472,6 +14474,168 @@ impl AgentInstance {
         }
     }
 
+    async fn try_emit_workflow_completion_report(
+        &self,
+        app_handle: &AppHandle,
+        store: &SessionStore,
+        parent_run_id: &str,
+        mode: &str,
+    ) {
+        if self.is_cancel_requested() {
+            return;
+        }
+        let Some(trigger) = self
+            .with_dev_workflow_gate(mode, |gate| gate.take_completion_report_pending())
+            .flatten()
+        else {
+            return;
+        };
+
+        let ctx = match crate::agent::workflow::completion_report::collect_workflow_completion_context(
+            store,
+            &self.session_id,
+            trigger,
+        ) {
+            Ok(ctx) => ctx,
+            Err(error) => {
+                eprintln!(
+                    "[Agent {}] workflow completion report context failed for session {}: {}",
+                    self.id, self.session_id, error
+                );
+                return;
+            }
+        };
+
+        let report_run_id = format!("completion-report-{}", uuid::Uuid::new_v4());
+        emit_stream(
+            app_handle,
+            &report_run_id,
+            StreamEvent::RunStart {
+                session_id: self.session_id.clone(),
+            },
+        );
+
+        let user_prompt =
+            crate::agent::workflow::completion_report::build_completion_report_user_prompt(&ctx);
+        let user_message = ChatMessage {
+            id: uuid::Uuid::new_v4().to_string(),
+            role: MessageRole::User,
+            content: user_prompt,
+            created_at: chrono::Utc::now().timestamp_millis(),
+            prompt_prefix: None,
+            prompt_suffix: None,
+            response_id: None,
+            content_order: None,
+            thinking_order: None,
+            tool_calls: None,
+            tool_call_id: None,
+            images: None,
+            asset_refs: None,
+            thinking_content: None,
+            thinking_duration: None,
+            thinking_signature: None,
+            knowledge_proposal: None,
+            memory_proposal: None,
+            render_parts: None,
+        };
+
+        let language_instruction = self.session_language_instruction(store);
+        let system_parts = [language_instruction, crate::prompt::workflow::COMPLETION_REPORT];
+
+        let session_id = self.session_id.clone();
+        let agent_id = self.id.clone();
+        let app_handle_for_delta = app_handle.clone();
+        let report_run_id_for_delta = report_run_id.clone();
+        let report_text = match self
+            .call_llm(
+                store,
+                None,
+                &system_parts,
+                std::slice::from_ref(&user_message),
+                &[],
+                move |delta| {
+                    emit_stream(
+                        &app_handle_for_delta,
+                        &report_run_id_for_delta,
+                        StreamEvent::TextDelta {
+                            session_id: session_id.clone(),
+                            text: delta,
+                            order: Some(0),
+                            part_id: Some(format!("{report_run_id_for_delta}:text:0")),
+                            render_seq: Some(0),
+                        },
+                    );
+                },
+                |_thinking| {},
+                |_id, _name| {},
+            )
+            .await
+        {
+            Ok(result) if !result.text.trim().is_empty() => result.text.trim().to_string(),
+            Ok(_) => {
+                eprintln!(
+                    "[Agent {}] workflow completion report LLM returned empty text for session {}",
+                    agent_id, self.session_id
+                );
+                return;
+            }
+            Err(error) => {
+                eprintln!(
+                    "[Agent {}] workflow completion report LLM failed for session {}: {}",
+                    agent_id, self.session_id, error
+                );
+                crate::error::AppError::emit_background(
+                    app_handle,
+                    &crate::error::AppError::new(
+                        "workflow.completion_report_failed",
+                        "Workflow completion report could not be generated.",
+                    )
+                    .detail(error)
+                    .operation("workflow")
+                    .severity(crate::error::ErrorSeverity::Warning),
+                );
+                return;
+            }
+        };
+
+        let message_id = match store.add_message(
+            &self.session_id,
+            MessageRole::Assistant,
+            &report_text,
+        ) {
+            Ok(id) => id,
+            Err(error) => {
+                eprintln!(
+                    "[Agent {}] failed to persist workflow completion report for session {}: {}",
+                    self.id, self.session_id, error
+                );
+                return;
+            }
+        };
+
+        emit_stream(
+            app_handle,
+            &report_run_id,
+            StreamEvent::Done {
+                session_id: self.session_id.clone(),
+                message_id,
+                full_text: report_text.clone(),
+                content_order: Some(0),
+                thinking_order: None,
+                render_parts: None,
+            },
+        );
+
+        eprintln!(
+            "[Agent {}] emitted workflow completion report for session {} parent_run={} report_run={} chars={}",
+            self.id,
+            self.session_id,
+            parent_run_id,
+            report_run_id,
+            report_text.len()
+        );
+    }
+
     async fn execute_task(
         &self,
         app_handle: &AppHandle,
@@ -14536,6 +14700,10 @@ impl AgentInstance {
                     .flatten()
                 {
                     output = format!("{output}\n\n{followup}");
+                }
+                if !result.is_error {
+                    self.try_emit_workflow_completion_report(app_handle, store, run_id, mode)
+                        .await;
                 }
                 ExecutedToolResult::from_tool_result(ToolResult {
                     output,

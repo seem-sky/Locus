@@ -99,7 +99,15 @@ To build both Windows release installers locally:
 bun run release:installers
 ```
 
-The default installer keeps the standard name, for example `locus_0.2.5_x64-setup.exe`. The no-embed installer uses `locus_0.2.5_x64-without_embed_python_git-setup.exe`.
+The default installer keeps the standard name, for example `locus_0.3.2_x64-setup.exe`. For the no-embed variant:
+
+```powershell
+bun run release:installers without_embed_python_git
+```
+
+Output: `locus_0.3.2_x64-without_embed_python_git-setup.exe`.
+
+**Windows note:** NSIS needs large temp disk space. If packaging fails on a full C: drive, point `TEMP`/`TMP` at `.tmp/nsis-temp` before building (see [AGENTS.md](AGENTS.md) — section *Windows 发布安装包（NSIS）*).
 
 ## License
 

@@ -54,7 +54,7 @@ function runPython(python, pythonHome, args) {
   }
 }
 
-function verifyBundle(python, pythonHome) {
+function verifyBundle(python, pythonHome, { quiet = false } = {}) {
   const env = { ...process.env, PYTHONPATH: libDir, PYTHONNOUSERSITE: "1" };
   if (pythonHome) {
     env.PYTHONHOME = pythonHome;
@@ -69,7 +69,45 @@ function verifyBundle(python, pythonHome) {
       `headroom import check failed: ${importCheck.stderr || importCheck.stdout || "unknown"}`,
     );
   }
-  console.log(`[locus] headroom proxy bundle verified: ${importCheck.stdout.trim()}`);
+  if (!quiet) {
+    console.log(`[locus] headroom proxy bundle verified: ${importCheck.stdout.trim()}`);
+  }
+}
+
+function isBundleReady(buildPython) {
+  const versionPath = path.join(bundleDir, "version.txt");
+  const headroomInit = path.join(libDir, "headroom", "__init__.py");
+  if (!existsSync(versionPath) || !existsSync(headroomInit)) {
+    return false;
+  }
+
+  const version = readFileSync(versionPath, "utf8").trim();
+  if (version !== HEADROOM_PROXY_VERSION) {
+    return false;
+  }
+
+  try {
+    verifyBundle(buildPython.python, buildPython.pythonHome, { quiet: true });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function writeSkippedManifest(reason) {
+  writeFileSync(
+    path.join(bundleDir, "manifest.json"),
+    `${JSON.stringify(
+      {
+        skipped: true,
+        reason,
+        headroomVersion: HEADROOM_PROXY_VERSION,
+        generatedAt: new Date().toISOString(),
+      },
+      null,
+      2,
+    )}\n`,
+  );
 }
 
 function main() {
@@ -79,20 +117,13 @@ function main() {
     console.error(
       "[locus] headroom proxy bundle skipped: no Python found. On Windows run `bun run python:bundle` first, or install Python 3.10+.",
     );
-    writeFileSync(
-      path.join(bundleDir, "manifest.json"),
-      `${JSON.stringify(
-        {
-          skipped: true,
-          reason: "no-build-python",
-          headroomVersion: HEADROOM_PROXY_VERSION,
-          generatedAt: new Date().toISOString(),
-        },
-        null,
-        2,
-      )}\n`,
-    );
+    writeSkippedManifest("no-build-python");
     process.exit(0);
+  }
+
+  if (isBundleReady(buildPython)) {
+    console.log(`[locus] Headroom proxy bundle already ready (${HEADROOM_PROXY_VERSION})`);
+    return;
   }
 
   rmSync(libDir, { recursive: true, force: true });
@@ -124,7 +155,7 @@ function main() {
     )}\n`,
   );
 
-  console.log(`[locus] Headroom proxy bundle ready at ${bundleDir}`);
+  console.log(`[locus] Headroom proxy bundle ready at ${path.relative(repoRoot, bundleDir)}`);
 }
 
 main();

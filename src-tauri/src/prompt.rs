@@ -6,6 +6,11 @@ pub mod plan {
     pub const PLAN_REMINDER: &str = include_str!("../../prompt/plan-reminder.md");
 }
 
+pub mod workflow {
+    pub const COMPLETION_REPORT: &str =
+        include_str!("../../prompt/workflow-completion-report.md");
+}
+
 /// Tool definition JSON（description + parameters schema）
 pub mod tools {
     pub const TASK: &str = include_str!("../../tools/task.md");

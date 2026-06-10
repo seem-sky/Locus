@@ -9,6 +9,7 @@
  */
 //! Dev agent code-edit workflow gate: Read → Plan → Implement (subagent) → Optimize (subagent) → Review (subagent).
 
+pub mod completion_report;
 pub mod whitelist;
 
 use serde_json::Value;
@@ -102,6 +103,14 @@ pub enum ReviewVerdict {
     Unknown,
 }
 
+/// Payload for a pending workflow completion report (one per review cycle).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompletionReportTrigger {
+    pub review_cycle: u32,
+    pub verdict: Option<ReviewVerdict>,
+    pub zero_change: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct WorkflowGate {
     phase: CodeEditPhase,
@@ -117,6 +126,10 @@ pub struct WorkflowGate {
     review_cycle: u32,
     /// Consecutive text-only stops nudged in the current workflow phase.
     workflow_text_stop_nudges: u32,
+    /// Set when the workflow cycle completes and a completion report should be emitted.
+    completion_report_pending: Option<CompletionReportTrigger>,
+    /// Prevents duplicate reports for the same review cycle.
+    completion_report_issued_for_cycle: Option<u32>,
 }
 
 impl Default for WorkflowGate {
@@ -136,6 +149,8 @@ impl WorkflowGate {
             strict: dev_workflow_strict_enabled(),
             review_cycle: 0,
             workflow_text_stop_nudges: 0,
+            completion_report_pending: None,
+            completion_report_issued_for_cycle: None,
         }
     }
 
@@ -149,7 +164,33 @@ impl WorkflowGate {
             strict,
             review_cycle: 0,
             workflow_text_stop_nudges: 0,
+            completion_report_pending: None,
+            completion_report_issued_for_cycle: None,
         }
+    }
+
+    fn mark_completion_report_pending(
+        &mut self,
+        verdict: Option<ReviewVerdict>,
+        zero_change: bool,
+    ) {
+        self.completion_report_pending = Some(CompletionReportTrigger {
+            review_cycle: self.review_cycle,
+            verdict,
+            zero_change,
+        });
+    }
+
+    /// Consume a pending completion report trigger once per review cycle.
+    pub fn take_completion_report_pending(&mut self) -> Option<CompletionReportTrigger> {
+        let trigger = self.completion_report_pending.as_ref()?;
+        if self.completion_report_issued_for_cycle == Some(trigger.review_cycle) {
+            self.completion_report_pending = None;
+            return None;
+        }
+        let trigger = self.completion_report_pending.take()?;
+        self.completion_report_issued_for_cycle = Some(trigger.review_cycle);
+        Some(trigger)
     }
 
     /// READ gate: exploration always required; CodeGraph required only for complex edits (enforced at implementer dispatch).
@@ -427,6 +468,7 @@ impl WorkflowGate {
                 if is_zero_change_plan_confirmation(answer, args) {
                     self.plan_zero_change = true;
                     self.phase = CodeEditPhase::Complete;
+                    self.mark_completion_report_pending(None, true);
                     return Some(plan_zero_change_complete_hint());
                 }
                 Some(plan_confirmed_hint(self.review_cycle, self.codegraph_satisfied))
@@ -487,6 +529,7 @@ impl WorkflowGate {
                 match verdict {
                     ReviewVerdict::Pass | ReviewVerdict::PassWithRisks => {
                         self.phase = CodeEditPhase::Complete;
+                        self.mark_completion_report_pending(Some(verdict), false);
                         Some(workflow_complete_message(verdict))
                     }
                     ReviewVerdict::Block | ReviewVerdict::Unknown => {
@@ -1131,7 +1174,7 @@ fn looks_like_zero_change_text(text: &str) -> bool {
 fn plan_zero_change_complete_hint() -> String {
     "[Dev workflow] User confirmed a zero-change plan (keep status quo). \
      This cycle is complete — do NOT dispatch task(implementer), task(optimizer), or task(reviewer). \
-     Summarize the confirmed decision for the user and end the turn.".to_string()
+     A structured completion report is being generated automatically for the user — do NOT summarize or repeat it; end the turn.".to_string()
 }
 
 fn implementer_complete_hint(review_cycle: u32) -> String {
@@ -1165,7 +1208,8 @@ fn workflow_complete_message(verdict: ReviewVerdict) -> String {
     };
     format!(
         "[Dev workflow] Reviewer returned {label}. This Read → Plan → Implement → Optimize → Review cycle is complete.\n\
-         Summarize results for the user. Do not run another reviewer unless there are new code changes.\n\
+         A structured completion report is being generated automatically for the user — do NOT summarize or repeat it; end the turn.\n\
+         Do not run another reviewer unless there are new code changes.\n\
          If more application code must change: read/grep/list AND CodeGraph (codegraph_context + impact on changed symbols), then \
          PLAN → task(implementer) → task(optimizer) → task(reviewer) (a new cycle starts automatically after read/explore)."
     )
@@ -2588,6 +2632,44 @@ mod tests {
         assert_eq!(gate.phase, CodeEditPhase::Review);
         gate.on_subagent_done("reviewer", false, Some("Overall verdict: PASS"));
         assert_eq!(gate.phase, CodeEditPhase::Complete);
+        assert!(gate.take_completion_report_pending().is_some());
+    }
+
+    #[test]
+    fn completion_report_pending_consumed_once_per_cycle() {
+        let mut gate = WorkflowGate::with_strict(true);
+        gate.phase = CodeEditPhase::Review;
+        gate.on_subagent_done("reviewer", false, Some("Overall verdict: PASS"));
+        let first = gate.take_completion_report_pending();
+        assert!(first.is_some());
+        assert_eq!(first.unwrap().review_cycle, 0);
+        assert!(gate.take_completion_report_pending().is_none());
+    }
+
+    #[test]
+    fn zero_change_plan_marks_completion_report_pending() {
+        let mut gate = WorkflowGate::with_strict(true);
+        enter_plan_phase(&mut gate);
+        let args = serde_json::json!({
+            "question": "请确认保持现状",
+            "options": [
+                {
+                    "label": "确认执行",
+                    "description": "确认本轮不修改任何文件,工作区保持当前状态"
+                },
+                { "label": "取消", "description": "取消" },
+                { "label": "修改", "description": "修改计划" }
+            ]
+        });
+        gate.on_tool_success(
+            "ask_user_question",
+            &args,
+            Some("User answered: 确认执行"),
+        );
+        assert_eq!(gate.phase, CodeEditPhase::Complete);
+        let trigger = gate.take_completion_report_pending().expect("pending");
+        assert!(trigger.zero_change);
+        assert!(trigger.verdict.is_none());
     }
 
     #[test]
@@ -2629,7 +2711,7 @@ mod tests {
         let msg = gate.on_subagent_done("reviewer", false, Some("PASS_WITH_RISKS: minor naming issues"));
         assert_eq!(gate.phase, CodeEditPhase::Complete);
         assert!(msg.is_some());
-        assert!(msg.unwrap().contains("complete"));
+        assert!(msg.unwrap().contains("completion report"));
     }
 
     #[test]
@@ -3027,6 +3109,7 @@ mod tests {
         assert_eq!(gate.phase, CodeEditPhase::Complete);
         assert!(hint.contains("zero-change"));
         assert!(hint.contains("do NOT dispatch"));
+        assert!(hint.contains("completion report"));
         assert!(!gate.needs_incomplete_workflow_continuation());
         let task_args = serde_json::json!({
             "subagent_type": "implementer",

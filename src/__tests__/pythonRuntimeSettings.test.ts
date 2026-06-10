@@ -151,6 +151,9 @@ describe("Python runtime settings", () => {
     expect(pkg).toContain('"release:installers": "bun run scripts/build-release-installers.mjs"');
     expect(pkg).toContain('"build:tauri": "bun run build:tauri:with_embed_python_git"');
     expect(pkg).toContain('"build:tauri:without_embed_python_git"');
+    expect(pkg).toContain("headroom:bundle:core");
+    expect(pkg).toMatch(/build:tauri:without_embed_python_git": "[^"]*headroom:bundle:core/);
+    expect(pkg).not.toMatch(/build:tauri:without_embed_python_git": "[^"]*headroom:bundle[^:]/);
     expect(tauriConfig).not.toContain("managed-python");
     expect(tauriConfig).not.toContain("managed-git");
     expect(runTauri).toContain("tauri.with_embed_python_git.conf.json");

@@ -1613,6 +1613,32 @@ impl SessionStore {
             .map_err(|e| format!("Failed to read session tree: {}", e))
     }
 
+    /// Direct child sessions of a parent (subagent sessions), most recently updated first.
+    pub fn list_child_sessions(
+        &self,
+        parent_session_id: &str,
+    ) -> Result<Vec<(String, Option<String>, String)>, String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, agent_id, title FROM sessions
+                 WHERE parent_session_id = ?1
+                 ORDER BY updated_at DESC",
+            )
+            .map_err(|e| format!("Failed to prepare child session query: {}", e))?;
+        let rows = stmt
+            .query_map(params![parent_session_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(|e| format!("Failed to query child sessions: {}", e))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to read child sessions: {}", e))
+    }
+
     pub fn active_descendant_runs(
         &self,
         root_session_id: &str,
