@@ -366,6 +366,7 @@ where
         name: name.to_string(),
         description: prompt.description,
         parameters: prompt.parameters,
+        mutates_workspace: false,
         execute: make_exec(move |args, ctx| Box::pin(handler(args, ctx))),
     }
 }

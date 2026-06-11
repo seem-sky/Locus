@@ -16,8 +16,8 @@ const LOCUS_LOCAL_FILES_BLOCK_RE =
 const LOCUS_LOCAL_FILE_ENTRY_RE =
   /^[ \t]*-\s*(file|folder):\s*`([^`\r\n]+)`(?:\s*;\s*type:\s*([^\r\n]+?))?[ \t]*$/gim;
 
-const UNITY_EDITOR_STATUS_CHANGED_PREFIX_RE =
-  /^[ \t]*\[Unity Editor Status Changed\][^\r\n]*(?:\r?\n[ \t]*){0,2}/;
+const UNITY_EDITOR_STATUS_PREFIX_RE =
+  /^[ \t]*\[Unity Editor Status(?: Changed)?\][^\r\n]*(?:\r?\n[ \t]*){0,2}/;
 
 const DEV_WORKFLOW_CONTINUATION_PREFIX_RE =
   /^[ \t]*\[Dev workflow continuation\][ \t]*(?:\r?\n|$)/i;
@@ -71,7 +71,7 @@ function stripDevWorkflowContinuationPrefix(text: string) {
 }
 
 function stripKnownLocusPrefixes(text: string) {
-  return text.replace(UNITY_EDITOR_STATUS_CHANGED_PREFIX_RE, "");
+  return text.replace(UNITY_EDITOR_STATUS_PREFIX_RE, "");
 }
 
 function stripImplicitLanguagePrefix(text: string) {

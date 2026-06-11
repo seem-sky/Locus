@@ -53,6 +53,21 @@ use prompt_context::{
     detect_input_system, detect_render_pipeline, parse_physics_config, parse_tag_manager,
 };
 
+const REACTIVE_COMPACT_ATTEMPT_KIND: &str = "reactive_compact";
+
+/// Classify a compaction for the UI: manual (user-invoked), auto (preflight
+/// estimate crossed the threshold), or reactive (the request was already sent
+/// and the server rejected it as over the context window).
+fn compact_trigger(force_compact: bool, attempt_kind: &str) -> crate::commands::CompactTrigger {
+    if force_compact {
+        crate::commands::CompactTrigger::Manual
+    } else if attempt_kind == REACTIVE_COMPACT_ATTEMPT_KIND {
+        crate::commands::CompactTrigger::Reactive
+    } else {
+        crate::commands::CompactTrigger::Auto
+    }
+}
+
 fn is_codex_unauthorized_error(error: &str) -> bool {
     let lower = error.to_ascii_lowercase();
     lower.contains("401 unauthorized")
@@ -226,6 +241,7 @@ pub struct AgentInstance {
     app_knowledge_dir: Arc<Option<std::path::PathBuf>>,
     app_agent_dir: Arc<Option<std::path::PathBuf>>,
     knowledge_access_mode: KnowledgeAccessMode,
+    knowledge_focus: Option<KnowledgeFocusDoc>,
     undo_manager: Option<Arc<crate::vcs::UndoManager>>,
     subagent_model_overrides: std::collections::HashMap<String, String>,
     tool_runtime_state: Arc<ToolRuntimeState>,
@@ -237,6 +253,15 @@ pub struct AgentInstance {
     dev_workflow_gates: Option<DevWorkflowGateStore>,
     /// UI or explicit locale tag (`zh` / `en`) for response-language consistency.
     response_locale: Option<String>,
+}
+
+/// Knowledge document the session is scoped to (the document open next to an
+/// embedded knowledge chat). Injected into the env prompt each run so the
+/// model always sees the current document without polluting user messages.
+#[derive(Debug, Clone)]
+pub struct KnowledgeFocusDoc {
+    pub doc_type: crate::knowledge_store::KnowledgeType,
+    pub path: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1511,6 +1536,7 @@ struct PromptKnowledgeItem {
 #[derive(Debug, Default, Clone)]
 struct PromptTreeNode {
     desc: Option<String>,
+    label_suffix: Option<String>,
     dirs: BTreeMap<String, PromptTreeNode>,
     notes: Vec<String>,
     files: Vec<PromptTreeFile>,
@@ -1659,6 +1685,22 @@ fn prompt_hidden_skill_root_parts(item: &PromptKnowledgeItem) -> Option<Vec<Stri
     }
 }
 
+fn prompt_skill_package_root_directory_parts(item: &PromptKnowledgeItem) -> Option<Vec<String>> {
+    if item.doc_type != crate::knowledge_store::KnowledgeType::Skill {
+        return None;
+    }
+
+    let parts = prompt_path_parts(&item.path);
+    let is_root_skill_doc = parts
+        .last()
+        .is_some_and(|name| name.eq_ignore_ascii_case("SKILL.md"));
+    if is_root_skill_doc && parts.len() > 1 {
+        Some(parts[..parts.len() - 1].to_vec())
+    } else {
+        None
+    }
+}
+
 fn prompt_hidden_parent_parts_for(
     parts: &[String],
     hidden_roots: &[Vec<String>],
@@ -1752,16 +1794,22 @@ fn insert_prompt_tree_hidden_at(node: &mut PromptTreeNode, parent_parts: &[Strin
     insert_prompt_tree_hidden_at(child, &parent_parts[1..]);
 }
 
-fn insert_prompt_tree_directory(node: &mut PromptTreeNode, parts: &[String], desc: Option<&str>) {
+fn insert_prompt_tree_directory(
+    node: &mut PromptTreeNode,
+    parts: &[String],
+    desc: Option<&str>,
+    label_suffix: Option<&str>,
+) {
     if parts.is_empty() {
         return;
     }
     let child = node.dirs.entry(parts[0].clone()).or_default();
     if parts.len() == 1 {
         child.desc = desc.map(str::to_string);
+        child.label_suffix = label_suffix.map(str::to_string);
         return;
     }
-    insert_prompt_tree_directory(child, &parts[1..], desc);
+    insert_prompt_tree_directory(child, &parts[1..], desc, label_suffix);
 }
 
 fn insert_prompt_tree_note(node: &mut PromptTreeNode, parts: &[String], note: &str) {
@@ -1815,10 +1863,27 @@ fn build_prompt_tree(
                 continue;
             }
             let desc = prompt_directory_desc(directory);
-            insert_prompt_tree_directory(&mut root, &parts, desc.as_deref());
+            insert_prompt_tree_directory(&mut root, &parts, desc.as_deref(), None);
         }
     }
     for item in items {
+        if !flatten_skill {
+            if let Some(package_parts) = prompt_skill_package_root_directory_parts(item) {
+                if prompt_item_is_structure_injected(item)
+                    && prompt_hidden_parent_parts_for(&package_parts, &hidden_roots).is_none()
+                {
+                    let desc = prompt_file_desc(item);
+                    insert_prompt_tree_directory(
+                        &mut root,
+                        &package_parts,
+                        Some(&desc),
+                        Some("[package]"),
+                    );
+                }
+                continue;
+            }
+        }
+
         let file_name =
             if flatten_skill && item.doc_type == crate::knowledge_store::KnowledgeType::Skill {
                 prompt_flattened_skill_file_name(&item.path)
@@ -1857,10 +1922,15 @@ fn render_tree_lines(
     let mut entries: Vec<(String, Vec<String>)> = Vec::new();
 
     for (dir_name, child) in &node.dirs {
+        let suffix = child
+            .label_suffix
+            .as_deref()
+            .map(|value| format!(" {}", value))
+            .unwrap_or_default();
         let label = if let Some(desc) = child.desc.as_deref() {
-            format!("{}/ :: {}", dir_name, desc)
+            format!("{}/{} :: {}", dir_name, suffix, desc)
         } else {
-            format!("{}/", dir_name)
+            format!("{}/{}", dir_name, suffix)
         };
         entries.push((
             label,
@@ -2001,6 +2071,7 @@ fn build_structure_section(
             Some(
                 "Unity official reference library. Keep the always-on prompt compact here and use `knowledge_query` or concrete `reference/unity-official-docs/...` paths when needed.",
             ),
+            None,
         );
         let unity_note = crate::unity_docs::managed_document_count_hint(working_dir)?
             .map(|count| format!("<{} {} managed externally>", count, pluralize_files(count)))
@@ -2083,10 +2154,10 @@ fn build_search_section(semantic_search_enabled: bool) -> String {
         lines.push("1. Start with `knowledge_query` across all roots first; usually leave `pathPrefix` empty on the first search so `design/`, `memory/`, `skill/`, and `reference/` can all match. Put exact terms, titles, paths, identifiers, or short keyword combinations into `lexicalQuery`.");
     }
     lines.extend([
-        "2. Use `knowledge_read` when you know the target document path or need a specific document. For Skill packages, `skill/<package-id>` reads the package root `SKILL.md`.",
+        "2. Use `knowledge_read` when you know the target document path or need a specific document. For `skill/<package-id>/ [package]` structure entries, read `skill/<package-id>` for the root `SKILL.md`.",
         "3. Use `knowledge_list` to browse entries under a type-prefixed directory path prefix such as `design/` or `skill/unity/`.",
-        "4. In user-facing replies, cite knowledge documents with full type-prefixed paths such as `design/core-loop.md`, `memory/project/background.md`, `reference/unity/ugui-layout.md`, and `skill/builtin/profiler.md`.",
-        "5. Cite Skill package documents with the package id under `skill/`, such as `skill/psd-to-ugui/SKILL.md` or `skill/psd-to-ugui/references/details.md`; cite full knowledge paths in user-facing replies.",
+        "4. In user-facing replies, wrap knowledge document references in single backticks with their full type-prefixed paths, such as `design/core-loop.md`, `memory/project/background.md`, `reference/unity/ugui-layout.md`, and `skill/builtin/profiler.md`; the UI cannot recover omitted path segments.",
+        "5. Cite Skill package documents with the package id under `skill/`, such as `skill/psd-to-ugui/SKILL.md` or `skill/psd-to-ugui/references/details.md`.",
     ]);
     lines.join("\n")
 }
@@ -2108,32 +2179,6 @@ fn build_maintenance_section(access_mode: KnowledgeAccessMode) -> String {
         "- Respect existing maintenance rules on any document or folder you maintain.",
     ]
     .join("\n")
-}
-
-fn build_tools_section(access_mode: KnowledgeAccessMode, semantic_search_enabled: bool) -> String {
-    let query_line = if semantic_search_enabled {
-        "- `knowledge_query`: Search knowledge with separate `lexicalQuery` and `semanticQuery` inputs, plus an optional type-prefixed `pathPrefix`."
-    } else {
-        "- `knowledge_query`: Search knowledge with `lexicalQuery` plus an optional type-prefixed `pathPrefix`."
-    };
-    let mut lines = vec![
-        "### Tools",
-        query_line,
-        "- `knowledge_read`: Read a specific document by type-prefixed path. For Skill packages, `skill/<package-id>` reads the package root `SKILL.md` and `skill/<package-id>/docs/file.md` reads package child docs.",
-        "- `knowledge_list`: Browse entries under a type-prefixed directory path prefix.",
-    ];
-    if access_mode == KnowledgeAccessMode::Full {
-        lines.extend([
-            "- `knowledge_edit`: Update an existing document's content sections or replace text inside a section by type-prefixed `.md` path.",
-            "- `knowledge_create`: Create a new non-Skill document or folder at a type-prefixed path. Document paths end with `.md`; directory paths do not. Document creation only accepts initial content.",
-            "- `knowledge_move`: Move a document or folder using type-prefixed paths. Document paths end with `.md`; directory paths do not.",
-            "- `knowledge_delete`: Delete an obsolete document or folder by type-prefixed path. Document paths end with `.md`; directory paths do not.",
-            "- `skill_create`: Create a Skill as `kind: \"md\"` with metadata or `kind: \"package\"` with package metadata. Use `kind: \"package\"` for Skills that require CLI tools, binaries, scripts, Unity C# files, bundled docs, or any package-local dependency environment. Package creation returns `packageRoot` under the Locus app Skill package directory. For packages, omit `packageId` to derive a short kebab-case package id from `name`; provide `packageId` for distributed packages or a specific namespace.",
-            "- `skill_reload`: Load or reload a Skill manifest after edits and return validation errors.",
-            "- `skill_list`: List discoverable project Skills, built-in app Skills, and app Skill packages.",
-        ]);
-    }
-    lines.join("\n")
 }
 
 fn build_l2_full_document_section(
@@ -2192,6 +2237,65 @@ fn build_l2_full_document_section(
         "### L2 Full Documents\nThese Design and Memory documents stay in the always-on knowledge context as full injections.\n\n{}",
         blocks.join("\n\n")
     ))
+}
+
+const KNOWLEDGE_FOCUS_BODY_CHAR_LIMIT: usize = 6000;
+
+fn build_knowledge_focus_section(doc: &crate::knowledge_store::KnowledgeDocument) -> String {
+    let scope = match doc.storage_source {
+        crate::knowledge_store::KnowledgeStorageSource::App => "user (app-level)",
+        _ => "project",
+    };
+    let mut lines = vec![
+        "## Active Knowledge Document".to_string(),
+        "The user has this knowledge document open in the Knowledge panel, and this conversation is scoped to it. When the user says \"this document\" or \"当前文档\", they mean this one. Prioritize working on it.".to_string(),
+        format!("- Title: {}", doc.title),
+        format!("- Path: {}/{}", doc.doc_type, doc.path),
+        format!("- Type: {}", doc.doc_type),
+        format!("- Scope: {}", scope),
+        format!("- Read-only: {}", if doc.read_only { "yes (do not edit; discuss content and produce suggestions only)" } else { "no" }),
+    ];
+
+    if doc.summary_enabled {
+        if let Some(summary) = doc
+            .summary
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            lines.push("### Summary".to_string());
+            lines.push(summary.to_string());
+        }
+    }
+    if doc.explicit_maintenance_rules {
+        if let Some(rules) = doc
+            .maintenance_rules
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            lines.push("### Maintenance Rules".to_string());
+            lines.push(rules.to_string());
+        }
+    }
+
+    let body = doc.body.trim();
+    if body.is_empty() {
+        lines.push("### Body".to_string());
+        lines.push("<empty>".to_string());
+    } else if body.chars().count() <= KNOWLEDGE_FOCUS_BODY_CHAR_LIMIT {
+        lines.push("### Body".to_string());
+        lines.push(remap_document_body_headings(body, 4));
+    } else {
+        let excerpt: String = body.chars().take(KNOWLEDGE_FOCUS_BODY_CHAR_LIMIT).collect();
+        lines.push(format!(
+            "### Body (truncated to the first {} characters; use `knowledge_read` with the path above for the full document)",
+            KNOWLEDGE_FOCUS_BODY_CHAR_LIMIT
+        ));
+        lines.push(remap_document_body_headings(&excerpt, 4));
+    }
+
+    lines.join("\n")
 }
 
 fn parse_markdown_heading_level(line: &str) -> Option<(usize, &str, &str)> {
@@ -2497,10 +2601,6 @@ pub struct AgentSystemPromptStats {
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
 impl AgentInstance {
-    fn is_dev_runtime_knowledge_rule(file_name: &str) -> bool {
-        matches!(file_name, "知识库使用.md" | "知识维护.md")
-    }
-
     fn has_selected_working_dir_value(working_dir: &str) -> bool {
         !working_dir.trim().is_empty()
     }
@@ -2882,10 +2982,6 @@ impl AgentInstance {
         let semantic_search_enabled = self.knowledge_semantic_search_enabled();
         sections.push(build_search_section(semantic_search_enabled));
         sections.push(build_maintenance_section(self.knowledge_access_mode));
-        sections.push(build_tools_section(
-            self.knowledge_access_mode,
-            semantic_search_enabled,
-        ));
 
         if _include_memory {
             if let Ok(full_document_section) = build_l2_full_document_section(
@@ -2958,6 +3054,7 @@ impl AgentInstance {
             app_knowledge_dir,
             app_agent_dir,
             knowledge_access_mode,
+            knowledge_focus: None,
             undo_manager,
             subagent_model_overrides,
             tool_runtime_state: Arc::new(ToolRuntimeState::default()),
@@ -3167,6 +3264,10 @@ impl AgentInstance {
             return;
         }
         result.output = format!("{context}\n\n{}", result.output);
+    }
+
+    pub fn set_knowledge_focus(&mut self, focus: Option<KnowledgeFocusDoc>) {
+        self.knowledge_focus = focus;
     }
 
     async fn build_tool_execution_context(
@@ -3416,6 +3517,26 @@ impl AgentInstance {
         Self::dynamic_tool_loading_mode_from_app_handle(app_handle)
     }
 
+    /// Context-window budget for the active backend/model. Codex models
+    /// prefer the per-model effective window from the cached /models
+    /// manifest; the static `model_context_limit` table only guesses
+    /// per-family budgets and mis-sizes new variants.
+    fn context_limit(&self) -> u32 {
+        match &self.backend {
+            LlmBackend::Custom { context_length, .. } => *context_length,
+            LlmBackend::OpenAiCodex { .. } => crate::commands::persistent_config_dir()
+                .ok()
+                .and_then(|cache_dir| {
+                    crate::llm::codex_models::cached_effective_context_window(
+                        &cache_dir,
+                        &self.effective_model,
+                    )
+                })
+                .unwrap_or_else(|| model_context_limit(&self.effective_model)),
+            _ => model_context_limit(&self.effective_model),
+        }
+    }
+
     async fn build_request_tool_names(&self) -> Vec<String> {
         self.build_request_tool_names_for_mode(crate::config::DynamicToolLoadingMode::MetaTool)
             .await
@@ -3545,13 +3666,41 @@ impl AgentInstance {
         names
     }
 
-    fn format_lazy_tool_manifest(tool_names: &[String]) -> String {
+    fn summarize_tool_description(description: &str) -> String {
+        const MAX_SUMMARY_CHARS: usize = 160;
+        let first_line = description
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .unwrap_or_default()
+            .trim_start_matches("- ");
+        if first_line.chars().count() <= MAX_SUMMARY_CHARS {
+            return first_line.to_string();
+        }
+        if let Some(period) = first_line.find(". ") {
+            let candidate = &first_line[..=period];
+            if candidate.chars().count() <= MAX_SUMMARY_CHARS {
+                return candidate.to_string();
+            }
+        }
+        let mut truncated: String = first_line.chars().take(MAX_SUMMARY_CHARS).collect();
+        truncated.push('…');
+        truncated
+    }
+
+    fn format_lazy_tool_manifest(entries: &[(String, String)]) -> String {
         let mut lines = vec![
             "## Lazy Loaded Tools".to_string(),
             String::new(),
             "These tool schemas are available by name through `tool_load`:".to_string(),
         ];
-        lines.extend(tool_names.iter().map(|name| format!("- `{}`", name)));
+        lines.extend(entries.iter().map(|(name, summary)| {
+            if summary.is_empty() {
+                format!("- `{}`", name)
+            } else {
+                format!("- `{}` — {}", name, summary)
+            }
+        }));
         lines.join("\n")
     }
 
@@ -3560,7 +3709,18 @@ impl AgentInstance {
         if tool_names.is_empty() {
             return None;
         }
-        Some(Self::format_lazy_tool_manifest(&tool_names))
+        let entries: Vec<(String, String)> = tool_names
+            .into_iter()
+            .map(|name| {
+                let summary = self
+                    .tool_registry
+                    .tool_description(&name)
+                    .map(|(description, _)| Self::summarize_tool_description(&description))
+                    .unwrap_or_default();
+                (name, summary)
+            })
+            .collect();
+        Some(Self::format_lazy_tool_manifest(&entries))
     }
 
     fn normalize_tool_call_names(&self, tool_calls: &mut [ToolCallInfo]) {
@@ -3889,15 +4049,20 @@ impl AgentInstance {
 
         // ── Unity-specific data ──────────────────────────────────
         let unity_started_at = Instant::now();
-        if unity_version.is_some() {
-            let (connected, status, active_scene) =
-                crate::unity_bridge::query_unity_status(&self.working_dir).await;
-            eprintln!(
-                "[Agent {}] Unity status: connected={}, status={}, scene={:?}, cwd={}",
-                self.id, connected, status, active_scene, self.working_dir
-            );
-            unity_status = crate::unity_bridge::format_editor_status_for_prompt(status).to_string();
-            unity_active_scene = active_scene.unwrap_or_else(|| "unknown".to_string());
+        if unity_version.is_some() && self.def.env_template.contains("{{#unity}}") {
+            // Editor status placeholders are optional: agents without them get
+            // status through the per-run conversation announcements instead.
+            if self.def.env_template.contains("<unity_status>") {
+                let (connected, status, active_scene) =
+                    crate::unity_bridge::query_unity_status(&self.working_dir).await;
+                eprintln!(
+                    "[Agent {}] Unity status: connected={}, status={}, scene={:?}, cwd={}",
+                    self.id, connected, status, active_scene, self.working_dir
+                );
+                unity_status =
+                    crate::unity_bridge::format_editor_status_for_prompt(status).to_string();
+                unity_active_scene = active_scene.unwrap_or_else(|| "unknown".to_string());
+            }
 
             let project_path = std::path::Path::new(&self.working_dir);
             let (tags, layers) = parse_tag_manager(project_path);
@@ -3959,29 +4124,35 @@ impl AgentInstance {
         let git_started_at = Instant::now();
         let mut git_available = false;
         let mut git_context_included = false;
-        if has_working_dir {
+        if has_working_dir && env.contains("{{#git}}") {
             use crate::vcs::git::GitProvider;
             use crate::vcs::VcsProvider;
             let is_git = GitProvider.is_available(&self.working_dir).await;
             git_available = is_git;
             if is_git {
-                let branch = GitProvider::current_branch(&self.working_dir)
-                    .await
-                    .unwrap_or_default();
-                let commits = GitProvider::recent_commits(&self.working_dir, 10)
-                    .await
-                    .unwrap_or_default();
+                git_context_included = true;
+                env = env.replace("{{#git}}", "");
+                env = env.replace("{{/git}}", "");
 
-                if !branch.is_empty() || !commits.is_empty() {
-                    git_context_included = true;
-                    env = env.replace("{{#git}}", "");
-                    env = env.replace("{{/git}}", "");
+                if env.contains("<git_branch>") {
+                    let branch = GitProvider::current_branch(&self.working_dir)
+                        .await
+                        .unwrap_or_default();
                     let branch_display = if branch.is_empty() {
                         "(detached HEAD)".to_string()
                     } else {
                         branch
                     };
                     env = env.replace("<git_branch>", &branch_display);
+                }
+
+                // Volatile git data is only queried when the template injects
+                // it; templates without these placeholders direct the model to
+                // run git commands instead, keeping the env prompt stable.
+                if env.contains("<git_recent_commits>") {
+                    let commits = GitProvider::recent_commits(&self.working_dir, 10)
+                        .await
+                        .unwrap_or_default();
                     env = env.replace(
                         "<git_recent_commits>",
                         if commits.is_empty() {
@@ -3990,7 +4161,9 @@ impl AgentInstance {
                             &commits
                         },
                     );
+                }
 
+                if env.contains("{{#git_uncommitted}}") {
                     let stat = GitProvider::uncommitted_summary(&self.working_dir)
                         .await
                         .unwrap_or_default();
@@ -4001,8 +4174,6 @@ impl AgentInstance {
                         env = env.replace("{{/git_uncommitted}}", "");
                         env = env.replace("<git_uncommitted_stat>", &stat);
                     }
-                } else {
-                    remove_block(&mut env, "git");
                 }
             } else {
                 remove_block(&mut env, "git");
@@ -4045,6 +4216,30 @@ impl AgentInstance {
         }
         remove_block(&mut env, "knowledge_index");
         remove_block(&mut env, "knowledge_memory");
+
+        // Session-scoped document focus (embedded knowledge chat). Loaded
+        // fresh every run so the env always reflects the document's latest state.
+        if let Some(focus) = &self.knowledge_focus {
+            if has_working_dir && self.knowledge_access_mode.allows_context() {
+                match crate::knowledge_store::load_document_by_path_with_app_root(
+                    &self.working_dir,
+                    self.app_knowledge_dir.as_ref().as_ref(),
+                    focus.doc_type,
+                    &focus.path,
+                ) {
+                    Ok(doc) => {
+                        env.push_str("\n\n");
+                        env.push_str(&build_knowledge_focus_section(&doc));
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "[Agent {}] knowledge focus document unavailable: session={} path={}/{} error={}",
+                            self.id, self.session_id, focus.doc_type, focus.path, error
+                        );
+                    }
+                }
+            }
+        }
         eprintln!(
             "[Agent {}] system prompt knowledge context ready: session={} elapsed_ms={} requested={} chars={}",
             self.id,
@@ -4084,80 +4279,31 @@ impl AgentInstance {
 
         let rules_started_at = Instant::now();
         let rules_prompt = {
-            let rule_configs = crate::commands::merged_rule_config_for_agent(
+            let rule_entries = crate::commands::collect_agent_rule_files(
                 self.app_agent_dir.as_ref(),
                 &self.working_dir,
                 &self.def.id,
-            );
-            let mut rules_content = String::new();
+                false,
+            )
+            .unwrap_or_default();
+            let mut rule_sections = Vec::new();
 
-            let mut rules_dirs: Vec<std::path::PathBuf> = Vec::new();
-            if has_working_dir {
-                let project_rules = std::path::Path::new(&self.working_dir)
-                    .join("Locus")
-                    .join("agent")
-                    .join(&self.def.id)
-                    .join("rule");
-                if project_rules.is_dir() {
-                    rules_dirs.push(project_rules);
-                }
-            }
-            if let Some(app_dir) = self.app_agent_dir.as_ref() {
-                let app_rules = app_dir.join(&self.def.id).join("rule");
-                if app_rules.is_dir() {
-                    rules_dirs.push(app_rules);
-                }
-            }
-
-            if !rules_dirs.is_empty() {
-                let mut rule_entries: Vec<(
-                    String,
-                    std::path::PathBuf,
-                    crate::commands::RuleConfig,
-                )> = Vec::new();
-                for rules_path in &rules_dirs {
-                    if let Ok(entries) = std::fs::read_dir(rules_path) {
-                        for entry in entries.flatten() {
-                            let path = entry.path();
-                            if path.is_file()
-                                && path.extension().and_then(|e| e.to_str()) == Some("md")
-                            {
-                                let file_name = entry.file_name().to_string_lossy().to_string();
-                                if rule_entries.iter().any(|(n, _, _)| n == &file_name) {
-                                    continue;
-                                }
-                                if Self::is_dev_runtime_knowledge_rule(&file_name) {
-                                    continue;
-                                }
-                                let cfg = rule_configs.get(&file_name).cloned().unwrap_or_default();
-                                if cfg.enabled {
-                                    rule_entries.push((file_name, path, cfg));
-                                }
-                            }
-                        }
-                    }
-                }
-
-                rule_entries.sort_by(|a, b| a.2.order.cmp(&b.2.order).then(a.0.cmp(&b.0)));
-
-                for (i, (_, path, _)) in rule_entries.iter().enumerate() {
-                    if let Ok(content) = std::fs::read_to_string(path) {
-                        let content = content.trim();
-                        if !content.is_empty() {
-                            if !rules_content.is_empty() {
-                                rules_content.push('\n');
-                            }
-                            rules_content.push_str(&format!("{}. {}\n", i + 1, content));
-                        }
+            for entry in rule_entries.iter().filter(|entry| entry.enabled) {
+                if let Ok(content) = std::fs::read_to_string(&entry.path) {
+                    let content = content.trim();
+                    if !content.is_empty() {
+                        // Rule files use their own top heading levels; remap
+                        // them below the `## Rules` section heading.
+                        rule_sections.push(remap_document_body_headings(content, 3));
                     }
                 }
             }
 
             let mut sections = Vec::new();
-            if !rules_content.is_empty() {
+            if !rule_sections.is_empty() {
                 sections.push(format!(
-                    "## Rules (IMPORTANT — follow these rules strictly)\n{}",
-                    rules_content
+                    "## Rules (IMPORTANT — follow these rules strictly)\n\n{}",
+                    rule_sections.join("\n\n")
                 ));
             }
             if has_working_dir && self.knowledge_access_mode.allows_context() {
@@ -5143,6 +5289,19 @@ impl AgentInstance {
         Ok(crate::knowledge_store::list_item_allows_model_recall(item))
     }
 
+    fn knowledge_list_item_is_skill_package_document(
+        item: &crate::knowledge_store::KnowledgeListItem,
+    ) -> bool {
+        item.doc_type == crate::knowledge_store::KnowledgeType::Skill
+            && item
+                .external_source
+                .as_ref()
+                .map(|source| {
+                    source.provider == crate::knowledge_store::KnowledgeSourceProvider::Package
+                })
+                .unwrap_or(false)
+    }
+
     fn sanitize_knowledge_search_hits(
         items: Vec<crate::knowledge_store::KnowledgeSearchHit>,
     ) -> Vec<AgentKnowledgeSearchHit> {
@@ -6052,6 +6211,207 @@ impl AgentInstance {
         context_tokens
     }
 
+    /// Default compaction path for the OpenAI Codex subscription backend,
+    /// aligned with codex-rs: a unary `POST /responses/compact` call whose
+    /// response carries an encrypted compaction item. The item is stored on the
+    /// handoff message and replayed to the Codex API by the payload builders;
+    /// the handoff text itself is only a local fallback for other backends.
+    async fn execute_codex_remote_compact(
+        &self,
+        app_handle: &AppHandle,
+        store: &SessionStore,
+        system_parts: &[&str],
+        context_tokens: u32,
+        context_limit: u32,
+        run_id: &str,
+        attempt_kind: &str,
+        trigger: crate::commands::CompactTrigger,
+        iteration: usize,
+    ) -> Result<bool, String> {
+        let LlmBackend::OpenAiCodex { auth, base_url, .. } = &self.backend else {
+            return Ok(false);
+        };
+
+        let messages = store.get_messages_for_prompt(&self.session_id)?;
+        if messages.len() < 2 {
+            return Ok(false);
+        }
+        let messages_before = messages.len() as u32;
+
+        let mut prepared = compact::prepare_messages_for_llm(&messages);
+        let request_tools = self.build_request_tool_names().await;
+        let api_tools = self.build_api_tools(&request_tools).await;
+        let rewritten = compact::trim_tool_outputs_to_fit_context_window(
+            &mut prepared,
+            system_parts,
+            &api_tools,
+            context_limit,
+        );
+        if rewritten > 0 {
+            eprintln!(
+                "[Agent {}] rewrote {} tool output(s) before remote compaction",
+                self.id, rewritten
+            );
+        }
+
+        let boundary_idx = compact::find_compact_boundary_by_budget(
+            &messages,
+            compact::compact_recent_tail_token_budget(context_limit),
+        );
+        let response_request_metadata = store.get_response_request_metadata(&self.session_id)?;
+        let system_prompt = system_parts.join("\n\n");
+        let model_name = &self.effective_model;
+        let actual_model = model_name.strip_prefix("openai/").unwrap_or(model_name);
+
+        emit_stream(
+            app_handle,
+            run_id,
+            StreamEvent::CompactStart {
+                session_id: self.session_id.clone(),
+                context_tokens,
+                context_limit,
+                trigger: Some(trigger),
+            },
+        );
+
+        let (access_token, account_id) = resolve_codex_request_auth(auth, false)
+            .await
+            .map_err(|e| format!("OpenAI Codex token failed (please re-login): {}", e))?;
+        let compact_result = match codex::compact_conversation_history(
+            &access_token,
+            account_id.as_deref(),
+            base_url.as_deref(),
+            actual_model,
+            &system_prompt,
+            &prepared,
+            &api_tools,
+            self.effort.as_deref(),
+            Some(&self.session_id),
+            Some(&response_request_metadata),
+            self.debug,
+        )
+        .await
+        {
+            Ok(outcome) => Ok(outcome),
+            Err(error) if is_codex_unauthorized_error(&error) => {
+                eprintln!(
+                    "[OpenAI Codex] compact received unauthorized response, refreshing auth and retrying once"
+                );
+                let (access_token, account_id) = resolve_codex_request_auth(auth, true)
+                    .await
+                    .map_err(|e| format!("OpenAI Codex token refresh failed: {}", e))?;
+                codex::compact_conversation_history(
+                    &access_token,
+                    account_id.as_deref(),
+                    base_url.as_deref(),
+                    actual_model,
+                    &system_prompt,
+                    &prepared,
+                    &api_tools,
+                    self.effort.as_deref(),
+                    Some(&self.session_id),
+                    Some(&response_request_metadata),
+                    self.debug,
+                )
+                .await
+            }
+            Err(error) => Err(error),
+        };
+
+        let outcome = match compact_result {
+            Ok(outcome) => {
+                self.record_raw_attempt(
+                    attempt_kind,
+                    iteration,
+                    1,
+                    system_parts,
+                    &prepared,
+                    &api_tools,
+                    context_tokens,
+                    true,
+                    &outcome.raw_response,
+                    Some(false),
+                )
+                .await;
+                outcome
+            }
+            Err(error) => {
+                self.record_raw_attempt(
+                    attempt_kind,
+                    iteration,
+                    1,
+                    system_parts,
+                    &prepared,
+                    &api_tools,
+                    context_tokens,
+                    false,
+                    &error,
+                    Some(false),
+                )
+                .await;
+                return Err(error);
+            }
+        };
+
+        eprintln!(
+            "[Agent {}] codex remote compact returned {} output item(s), encrypted summary {} chars",
+            self.id,
+            outcome.output_item_count,
+            outcome.encrypted_content.len()
+        );
+
+        // The authoritative summary is encrypted for the Codex API only; keep a
+        // deterministic local digest so other backends and the UI retain usable
+        // handoff context if the session later switches models.
+        let summary = compact::build_emergency_compact_summary(
+            &messages,
+            boundary_idx,
+            "the Codex remote compaction summary is an encrypted item that only the Codex API can read",
+        );
+        let keep_from_msg = &messages[boundary_idx];
+        let restored_files_section =
+            compact::build_post_compact_restored_files_section(&messages, &self.working_dir);
+        let summary_msg = compact::build_post_compact_message(
+            &summary,
+            &restored_files_section,
+            keep_from_msg.created_at,
+            boundary_idx + 1 < messages.len(),
+        );
+
+        let (count_before, count_after) =
+            store.compact_messages(&self.session_id, &summary_msg, &keep_from_msg.id)?;
+        store.set_message_response_request_metadata(
+            &self.session_id,
+            &summary_msg.id,
+            &serde_json::json!({
+                "codex_compaction": { "encrypted_content": outcome.encrypted_content }
+            }),
+        )?;
+        crate::llm::codex::reset_cached_session_window(&self.session_id).await;
+        let compacted_context_tokens = self
+            .persist_compacted_context_usage(store, system_parts, context_limit)
+            .await;
+        let compacted_messages = store.get_messages(&self.session_id)?;
+        eprintln!(
+            "[Agent {}] codex remote compact done: {} → {} messages",
+            self.id, count_before, count_after
+        );
+        emit_stream(
+            app_handle,
+            run_id,
+            StreamEvent::CompactDone {
+                session_id: self.session_id.clone(),
+                messages_before,
+                messages_after: count_after,
+                context_tokens: compacted_context_tokens,
+                context_limit,
+                messages: compacted_messages,
+            },
+        );
+
+        Ok(true)
+    }
+
     async fn execute_auto_compact(
         &self,
         app_handle: &AppHandle,
@@ -6064,6 +6424,36 @@ impl AgentInstance {
         attempt_kind: &str,
         iteration: usize,
     ) -> Result<bool, String> {
+        let trigger = compact_trigger(force_compact, attempt_kind);
+        // Codex subscription sessions default to the remote compaction endpoint
+        // (codex-rs default strategy); the prompt-based flow below stays as the
+        // fallback when the endpoint is unavailable or returns no compaction.
+        if matches!(self.backend, LlmBackend::OpenAiCodex { .. }) {
+            match self
+                .execute_codex_remote_compact(
+                    app_handle,
+                    store,
+                    system_parts,
+                    context_tokens,
+                    context_limit,
+                    run_id,
+                    attempt_kind,
+                    trigger,
+                    iteration,
+                )
+                .await
+            {
+                Ok(true) => return Ok(true),
+                Ok(false) => return Ok(false),
+                Err(error) => {
+                    eprintln!(
+                        "[Agent {}] codex remote compact failed, falling back to prompt-based compact: {}",
+                        self.id, error
+                    );
+                }
+            }
+        }
+
         let messages = store.get_messages_for_prompt(&self.session_id)?;
         if messages.len() < 2 {
             return Ok(false);
@@ -6164,6 +6554,7 @@ impl AgentInstance {
                         session_id: self.session_id.clone(),
                         context_tokens,
                         context_limit,
+                        trigger: Some(trigger),
                     },
                 );
                 let summary = compact::build_emergency_compact_summary(&messages, boundary_idx, &e);
@@ -6250,6 +6641,7 @@ impl AgentInstance {
                 session_id: self.session_id.clone(),
                 context_tokens,
                 context_limit,
+                trigger: Some(trigger),
             },
         );
 
@@ -7158,16 +7550,48 @@ impl AgentInstance {
         }
     }
 
-    fn emit_cancelled(&self, app_handle: &AppHandle, store: &SessionStore, run_id: &str) {
+    fn emit_cancelled(
+        &self,
+        app_handle: &AppHandle,
+        store: &SessionStore,
+        run_id: &str,
+        revocable_user_message: Option<&crate::session::models::ChatMessage>,
+    ) {
         let interrupted = Self::persist_interrupted_assistant_snapshot(
             store,
             &self.session_id,
             &self.partial_assistant.snapshot(),
         );
         self.partial_assistant.reset();
+        // A cancel that lands before the run produced any assistant output
+        // takes the user message back: remove it from the session so the
+        // frontend can return the text to the composer.
+        let removed_user_message = if interrupted.is_none() {
+            revocable_user_message.and_then(|message| {
+                match store.delete_message(&self.session_id, &message.id) {
+                    Ok(true) => Some(message.clone()),
+                    Ok(false) => None,
+                    Err(error) => {
+                        eprintln!(
+                            "[Agent {}] failed to revoke user message {} for cancelled session {}: {}",
+                            self.id, message.id, self.session_id, error
+                        );
+                        None
+                    }
+                }
+            })
+        } else {
+            None
+        };
         eprintln!(
-            "[Agent {}] emitting Cancelled for session {} run {}",
-            self.id, self.session_id, run_id
+            "[Agent {}] emitting Cancelled for session {} run {} revoked_user_message={}",
+            self.id,
+            self.session_id,
+            run_id,
+            removed_user_message
+                .as_ref()
+                .map(|message| message.id.as_str())
+                .unwrap_or("none")
         );
         emit_stream(
             app_handle,
@@ -7185,6 +7609,7 @@ impl AgentInstance {
                     .and_then(|message| message.thinking_content.clone()),
                 thinking_duration: interrupted.and_then(|message| message.thinking_duration),
                 render_parts: None,
+                removed_user_message,
             },
         );
     }
@@ -7303,11 +7728,7 @@ impl AgentInstance {
         if initial_mode == "compact" {
             let prompt_parts = self.build_system_prompt_parts().await;
             let system_parts = self.build_core_system_parts(store, &prompt_parts, None);
-            let ctx_limit = if let LlmBackend::Custom { context_length, .. } = &self.backend {
-                *context_length
-            } else {
-                model_context_limit(&self.effective_model)
-            };
+            let ctx_limit = self.context_limit();
             let messages = store.get_messages_for_prompt(&self.session_id)?;
             let prepared_messages = compact::prepare_messages_for_llm(&messages);
             let active_skill_tool_names = self.active_skill_tool_names(&selected_skill_tool_names);
@@ -7364,34 +7785,57 @@ impl AgentInstance {
             return Ok(String::new());
         }
 
+        if self.is_cancel_requested() {
+            self.emit_cancelled(app_handle, store, &run_id, None);
+            return Ok(String::new());
+        }
+
         let user_text_started_at = Instant::now();
         let mut actual_user_text: String;
         if crate::unity_bridge::is_unity_project(&self.working_dir) {
-            let (_connected, status, active_scene) =
-                crate::unity_bridge::query_unity_status(&self.working_dir).await;
+            // The status probe can stall on a busy editor; race it against the
+            // cancel signal so a cancel during prep reacts immediately.
+            let mut cancel_rx = self.cancel_waiter();
+            let probed_status = tokio::select! {
+                status = crate::unity_bridge::query_unity_status(&self.working_dir) => Some(status),
+                _ = cancel_rx.changed() => None,
+            };
+            let Some((_connected, status, active_scene)) = probed_status else {
+                self.emit_cancelled(app_handle, store, &run_id, None);
+                return Ok(String::new());
+            };
             let current_state = (status.to_string(), active_scene.clone());
 
             let mut state_map = session_unity_state().lock().await;
             let prev = state_map.get(&self.session_id);
 
-            if let Some((prev_status, prev_scene)) = prev {
-                if prev_status != &current_state.0 || prev_scene != &current_state.1 {
-                    let status_text = crate::unity_bridge::format_editor_status_for_event(status);
-                    let scene_info = active_scene
-                        .as_deref()
-                        .map(|s| format!(", Active Scene: {}", s))
-                        .unwrap_or_default();
-                    actual_user_text = format!(
-                        "[Unity Editor Status Changed] Unity Editor Status: {}{}\n\n{}",
-                        status_text, scene_info, user_text
-                    );
+            // The env prompt no longer carries editor status, so the first run
+            // of a session (or the first run after a relaunch) announces the
+            // current state; later runs only announce changes.
+            let announcement_marker = match prev {
+                None => Some("[Unity Editor Status]"),
+                Some((prev_status, prev_scene))
+                    if prev_status != &current_state.0 || prev_scene != &current_state.1 =>
+                {
                     eprintln!(
                         "[Agent {}] Unity state changed: {:?} -> {:?}",
                         self.id, (prev_status, prev_scene), &current_state
                     );
-                } else {
-                    actual_user_text = user_text.to_string();
+                    Some("[Unity Editor Status Changed]")
                 }
+                Some(_) => None,
+            };
+
+            if let Some(marker) = announcement_marker {
+                let status_text = crate::unity_bridge::format_editor_status_for_event(status);
+                let scene_info = active_scene
+                    .as_deref()
+                    .map(|s| format!(", Active Scene: {}", s))
+                    .unwrap_or_default();
+                actual_user_text = format!(
+                    "{} Unity Editor Status: {}{}\n\n{}",
+                    marker, status_text, scene_info, user_text
+                );
             } else {
                 actual_user_text = user_text.to_string();
             }
@@ -7428,6 +7872,13 @@ impl AgentInstance {
             prompt_parts.rules_prompt.len(),
             prompt_parts.knowledge_prompt.len()
         );
+        // Never persist the user message once a cancel has been requested —
+        // the frontend returns the unsent draft to the composer instead.
+        if self.is_cancel_requested() {
+            self.emit_cancelled(app_handle, store, &run_id, None);
+            return Ok(String::new());
+        }
+
         let persist_user_message_started_at = Instant::now();
         let language_prompt_prefix = self.language_prompt_prefix(store);
         let env_prompt_prefix = Self::wrap_system_reminder(&prompt_parts.env_prompt);
@@ -7492,7 +7943,7 @@ impl AgentInstance {
             })?;
         emit_stream(app_handle, &run_id, StreamEvent::UserMessage {
             session_id: self.session_id.clone(),
-            message: current_user_message,
+            message: current_user_message.clone(),
         });
         if self.has_selected_working_dir() {
             let memory_store: tauri::State<
@@ -7606,6 +8057,10 @@ impl AgentInstance {
         // 3. Agent Loop
         let mut iteration = 0;
         let mut compact_tracker = compact::CompactTracker::new();
+        // (actual_prompt_tokens, estimated_tokens) of the latest completed LLM
+        // call in this run; calibrates the byte-heuristic estimate against the
+        // provider's real tokenization for auto-compact decisions.
+        let mut estimate_calibration_sample: Option<(u32, u32)> = None;
         let final_text;
         let final_thinking_text;
         let final_thinking_duration: u32;
@@ -7616,6 +8071,9 @@ impl AgentInstance {
         let final_thinking_order;
         let mut done_already_emitted = false;
         let mut terminal_done_message_id: Option<String> = None;
+        // Tracks whether this run has persisted any assistant message yet; a
+        // cancel before that revokes the user message back to the composer.
+        let mut assistant_round_persisted = false;
         let mut codex_turn_state = matches!(self.backend, LlmBackend::OpenAiCodex { .. })
             .then(codex::TurnState::default);
         let render_order_tracker = Arc::new(Mutex::new(StreamRenderOrderTracker::default()));
@@ -7631,8 +8089,14 @@ impl AgentInstance {
 
             if self.is_cancel_requested() {
                 self.clear_pending_knowledge_proposal(app_handle).await;
-            self.clear_pending_memory_proposal(app_handle).await;
-                self.emit_cancelled(app_handle, store, &run_id);
+                self.clear_pending_memory_proposal(app_handle).await;
+                self.emit_cancelled(
+                    app_handle,
+                    store,
+                    &run_id,
+                    (iteration == 1 && !assistant_round_persisted)
+                        .then_some(&current_user_message),
+                );
                 return Ok(String::new());
             }
 
@@ -7647,11 +8111,7 @@ impl AgentInstance {
                 &prompt_parts,
                 workflow_reminder.as_deref(),
             );
-            let ctx_limit = if let LlmBackend::Custom { context_length, .. } = &self.backend {
-                *context_length
-            } else {
-                model_context_limit(&self.effective_model)
-            };
+            let ctx_limit = self.context_limit();
             let mut prepared_messages = compact::prepare_messages_for_llm(&messages);
             let active_skill_tool_names = self.active_skill_tool_names(&selected_skill_tool_names);
             let request_tools = self
@@ -7664,11 +8124,23 @@ impl AgentInstance {
             let api_tools = self.build_api_tools(&request_tools).await;
             let mut estimated_input_tokens =
                 compact::estimate_request_tokens(&system_parts, &prepared_messages, &api_tools);
+            // Real usage recorded for the session (API-reported during normal
+            // rounds, locally estimated right after compact); floors the
+            // estimate for the first request of a run.
+            let persisted_context_tokens = store
+                .get_token_usage(&self.session_id)
+                .map(|usage| usage.context_tokens)
+                .unwrap_or(0);
+            let effective_input_tokens = compact::calibrated_input_tokens(
+                estimated_input_tokens,
+                estimate_calibration_sample,
+                persisted_context_tokens,
+            );
             let is_codex_backend = matches!(self.backend, LlmBackend::OpenAiCodex { .. });
             let should_preflight_compact = if is_codex_backend {
-                compact::should_codex_auto_compact(estimated_input_tokens, ctx_limit)
+                compact::should_codex_auto_compact(effective_input_tokens, ctx_limit)
             } else {
-                compact::should_auto_compact(estimated_input_tokens, ctx_limit)
+                compact::should_auto_compact(effective_input_tokens, ctx_limit)
             };
             let mut preflight_compact_error: Option<String> = None;
             let headroom_every_round = crate::headroom::always_compress_context_enabled();
@@ -7718,9 +8190,12 @@ impl AgentInstance {
 
                 if should_still_preflight_compact {
                 eprintln!(
-                    "[Agent {}] preflight auto-compact candidate: estimated_tokens={}, limit={}, messages={} -> {}",
+                    "[Agent {}] preflight auto-compact candidate: estimated_tokens={}, effective_tokens={}, persisted_context_tokens={}, calibration_sample={:?}, limit={}, messages={} -> {}",
                     self.id,
                     estimated_input_tokens,
+                    effective_input_tokens,
+                    persisted_context_tokens,
+                    estimate_calibration_sample,
                     ctx_limit,
                     messages.len(),
                     prepared_messages.len()
@@ -7730,7 +8205,7 @@ impl AgentInstance {
                         app_handle,
                         store,
                         &system_parts,
-                        estimated_input_tokens,
+                        effective_input_tokens,
                         ctx_limit,
                         false,
                         &run_id,
@@ -7755,23 +8230,24 @@ impl AgentInstance {
             }
 
             if is_codex_backend
-                && compact::should_codex_block_normal_send(estimated_input_tokens, ctx_limit)
+                && compact::should_codex_block_normal_send(effective_input_tokens, ctx_limit)
             {
                 let reason = preflight_compact_error
                     .unwrap_or_else(|| "Codex request is too close to the context limit".to_string());
                 return Err(format!(
-                    "Refusing to send oversized Codex request after compact failed or was unavailable: estimated_input_tokens={}, limit={}, reason={}",
-                    estimated_input_tokens, ctx_limit, reason
+                    "Refusing to send oversized Codex request after compact failed or was unavailable: estimated_input_tokens={}, effective_input_tokens={}, limit={}, reason={}",
+                    estimated_input_tokens, effective_input_tokens, ctx_limit, reason
                 ));
             }
 
             eprintln!(
-                "[Agent {}] iteration {}, messages={}, prepared_messages={}, estimated_input_tokens={}",
+                "[Agent {}] iteration {}, messages={}, prepared_messages={}, estimated_input_tokens={}, effective_input_tokens={}",
                 self.id,
                 iteration,
                 messages.len(),
                 prepared_messages.len(),
-                estimated_input_tokens
+                estimated_input_tokens,
+                effective_input_tokens
             );
 
             const LLM_RETRIES: u32 = 2;
@@ -7974,8 +8450,14 @@ impl AgentInstance {
                             llm_call_started_at.elapsed().as_millis()
                         );
                         self.clear_pending_knowledge_proposal(app_handle).await;
-            self.clear_pending_memory_proposal(app_handle).await;
-                        self.emit_cancelled(app_handle, store, &run_id);
+                        self.clear_pending_memory_proposal(app_handle).await;
+                        self.emit_cancelled(
+                            app_handle,
+                            store,
+                            &run_id,
+                            (iteration == 1 && !assistant_round_persisted)
+                                .then_some(&current_user_message),
+                        );
                         return Ok(String::new());
                     }
                     Some(Ok(resp)) => {
@@ -8129,11 +8611,11 @@ impl AgentInstance {
                             app_handle,
                             store,
                             &system_parts,
-                            estimated_input_tokens,
+                            effective_input_tokens,
                             ctx_limit,
                             false,
                             &run_id,
-                            "reactive_compact",
+                            REACTIVE_COMPACT_ATTEMPT_KIND,
                             iteration,
                         )
                         .await
@@ -8209,15 +8691,19 @@ impl AgentInstance {
                 } else {
                     0
                 };
+                let actual_prompt_tokens = response
+                    .input_tokens
+                    .saturating_add(response.cache_read_tokens)
+                    .saturating_add(response.cache_write_tokens);
+                if actual_prompt_tokens > 0 && estimated_input_tokens > 0 {
+                    estimate_calibration_sample =
+                        Some((actual_prompt_tokens, estimated_input_tokens));
+                }
                 let context_tokens = response.input_tokens
                     + response.cache_read_tokens
                     + response.cache_write_tokens
                     + response.output_tokens;
-                let context_limit = if let LlmBackend::Custom { context_length, .. } = &self.backend {
-                    *context_length
-                } else {
-                    model_context_limit(&self.effective_model)
-                };
+                let context_limit = self.context_limit();
                 match store.record_token_usage(
                     &self.session_id,
                     response.input_tokens as u64,
@@ -8363,6 +8849,7 @@ impl AgentInstance {
                     thinking_opt.map(str::to_string),
                     thinking_dur,
                 );
+                assistant_round_persisted = true;
 
                 let mut prepared: Vec<(ToolCallInfo, serde_json::Value)> = Vec::new();
                 for tc in &ordered_tool_calls {
@@ -8564,8 +9051,14 @@ impl AgentInstance {
                 }
                 if self.is_cancel_requested() {
                     self.clear_pending_knowledge_proposal(app_handle).await;
-            self.clear_pending_memory_proposal(app_handle).await;
-                    self.emit_cancelled(app_handle, store, &run_id);
+                    self.clear_pending_memory_proposal(app_handle).await;
+                    self.emit_cancelled(
+                        app_handle,
+                        store,
+                        &run_id,
+                        (iteration == 1 && !assistant_round_persisted)
+                            .then_some(&current_user_message),
+                    );
                     return Ok(String::new());
                 }
 
@@ -8787,8 +9280,14 @@ impl AgentInstance {
 
                 if self.is_cancel_requested() {
                     self.clear_pending_knowledge_proposal(app_handle).await;
-            self.clear_pending_memory_proposal(app_handle).await;
-                    self.emit_cancelled(app_handle, store, &run_id);
+                    self.clear_pending_memory_proposal(app_handle).await;
+                    self.emit_cancelled(
+                        app_handle,
+                        store,
+                        &run_id,
+                        (iteration == 1 && !assistant_round_persisted)
+                            .then_some(&current_user_message),
+                    );
                     return Ok(String::new());
                 }
 
@@ -8880,6 +9379,7 @@ impl AgentInstance {
                     thinking_opt.map(str::to_string),
                     thinking_dur,
                 );
+                assistant_round_persisted = true;
                 emit_stream(app_handle, &run_id, StreamEvent::ToolCallRoundDone {
                     session_id: self.session_id.clone(),
                     message_id: assistant_msg_id,
@@ -9242,6 +9742,7 @@ impl AgentInstance {
                 | "grep"
                 | "list"
                 | "ask_user_question"
+                | "sheet"
                 | "todowrite"
                 | "graph_view"
                 | "unity_ref_search"
@@ -9274,25 +9775,10 @@ impl AgentInstance {
         )
     }
 
-    fn needs_undo_tracking(name: &str) -> bool {
-        matches!(
-            name,
-            "unity_execute"
-                | "unity_run_states"
-                | "write"
-                | "edit"
-                | "bash"
-                | "view_create"
-                | "knowledge_create"
-                | "knowledge_edit"
-                | "knowledge_move"
-                | "knowledge_delete"
-                | "skill_create"
-        )
-    }
-
     fn tool_call_needs_undo_tracking(&self, name: &str, args: &serde_json::Value) -> bool {
-        if Self::needs_undo_tracking(name) {
+        // Undo tracking is driven by each tool's `mutates_workspace`
+        // declaration (ToolDef / skill-package manifest), not a central list.
+        if self.tool_registry.mutates_workspace(name) {
             return true;
         }
         if name != "tool_call" {
@@ -9309,11 +9795,7 @@ impl AgentInstance {
             return false;
         };
 
-        let canonical = self
-            .tool_registry
-            .canonical_name(target_name)
-            .unwrap_or_else(|| target_name.to_ascii_lowercase());
-        Self::needs_undo_tracking(&canonical)
+        self.tool_registry.mutates_workspace(target_name)
     }
 
     fn workspace_path_touches_view_tree(path: &str) -> bool {
@@ -10251,6 +10733,9 @@ impl AgentInstance {
                 result.mark_workflow_gate_handled();
             }
             result
+        } else if tc.name == "sheet" {
+            self.await_tool_result(self.execute_sheet(app_handle, &tc.id, args, run_id), None)
+                .await
         } else if tc.name == "graph_view" {
             self.execute_graph_view(app_handle, &tc.id, args).await
         } else if tc.name == "todowrite" {
@@ -10997,12 +11482,20 @@ impl AgentInstance {
                     });
                 }
                 let include_hidden = parsed.include_hidden.unwrap_or(false);
+                let include_package_documents = resolved_type
+                    == Some(crate::knowledge_store::KnowledgeType::Skill)
+                    && crate::commands::skill_package_path_prefix_targets_package_sync(
+                        &self.working_dir,
+                        resolved_prefix.as_deref(),
+                    );
                 items.retain(|item| {
                     Self::knowledge_list_item_model_recall_allowed(&self.working_dir, item)
                         .unwrap_or(false)
                         && (include_hidden
                             || item.inject_mode
-                                != crate::knowledge_store::KnowledgeInjectMode::None)
+                                != crate::knowledge_store::KnowledgeInjectMode::None
+                            || (include_package_documents
+                                && Self::knowledge_list_item_is_skill_package_document(item)))
                 });
                 Self::prefix_knowledge_list_item_paths(&mut items);
                 let items = Self::sanitize_knowledge_list_items(items);
@@ -12107,6 +12600,7 @@ impl AgentInstance {
                 tool_call_id: tool_call_id.to_string(),
                 question: question.clone(),
                 options: options.clone(),
+                sheet: None,
             },
         );
 
@@ -12131,6 +12625,285 @@ impl AgentInstance {
             }
             Some(Err(_)) => ToolResult {
                 output: "Question was cancelled".to_string(),
+                is_error: true,
+            },
+            None => {
+                let question_store: tauri::State<crate::QuestionStore> = app_handle.state();
+                let mut store = question_store.lock().await;
+                store.remove(&question_id);
+                Self::interrupted_tool_result().into_tool_result()
+            }
+        }
+    }
+
+    fn parse_sheet_request(
+        args: &serde_json::Value,
+    ) -> Result<(String, crate::commands::SheetRequest), String> {
+        const MAX_SHEET_FIELDS: usize = 24;
+
+        let title = args
+            .get("title")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .unwrap_or("");
+        if title.is_empty() {
+            return Err("Missing required parameter: title".to_string());
+        }
+
+        let optional_text = |key: &str| {
+            args.get(key)
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        };
+
+        let raw_fields = args
+            .get("fields")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        if raw_fields.is_empty() {
+            return Err("sheet requires a non-empty fields array".to_string());
+        }
+        if raw_fields.len() > MAX_SHEET_FIELDS {
+            return Err(format!(
+                "sheet supports at most {} fields, got {}",
+                MAX_SHEET_FIELDS,
+                raw_fields.len()
+            ));
+        }
+
+        let mut seen_keys = HashSet::new();
+        let mut fields = Vec::with_capacity(raw_fields.len());
+        for (index, item) in raw_fields.iter().enumerate() {
+            let key = item
+                .get("key")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .unwrap_or("");
+            if key.is_empty() {
+                return Err(format!("fields[{}] is missing a non-empty key", index));
+            }
+            if !seen_keys.insert(key.to_string()) {
+                return Err(format!("fields[{}] duplicates key '{}'", index, key));
+            }
+
+            let label = item
+                .get("label")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .unwrap_or("");
+            if label.is_empty() {
+                return Err(format!("fields[{}] is missing a non-empty label", index));
+            }
+
+            let value = match item.get("value") {
+                Some(serde_json::Value::String(text)) => text.clone(),
+                Some(serde_json::Value::Number(number)) => number.to_string(),
+                Some(serde_json::Value::Bool(flag)) => flag.to_string(),
+                Some(serde_json::Value::Null) | None => String::new(),
+                Some(other) => serde_json::to_string(other).unwrap_or_default(),
+            };
+
+            let options = item
+                .get("options")
+                .and_then(|v| v.as_array())
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(|option| option.as_str())
+                        .map(str::trim)
+                        .filter(|option| !option.is_empty())
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+
+            fields.push(crate::commands::SheetField {
+                key: key.to_string(),
+                label: label.to_string(),
+                value,
+                description: item
+                    .get("description")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string),
+                multiline: item
+                    .get("multiline")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+                options,
+                readonly: item
+                    .get("readonly")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+            });
+        }
+
+        Ok((
+            title.to_string(),
+            crate::commands::SheetRequest {
+                description: optional_text("description"),
+                confirm_label: optional_text("confirmLabel"),
+                fields,
+            },
+        ))
+    }
+
+    fn sheet_result_from_answer(
+        title: &str,
+        sheet: &crate::commands::SheetRequest,
+        answer: &str,
+    ) -> ToolResult {
+        let parsed: serde_json::Value =
+            serde_json::from_str(answer).unwrap_or(serde_json::Value::Null);
+        let feedback = parsed
+            .get("feedback")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+
+        if parsed.get("action").and_then(|v| v.as_str()) != Some("confirm") {
+            // Unknown answer shapes are treated as a change request so the agent
+            // never proceeds on input it cannot interpret as a confirmation.
+            let feedback_text = feedback.unwrap_or_else(|| answer.trim().to_string());
+            return ToolResult {
+                output: format!(
+                    "User requested changes to '{}' instead of confirming.\nFeedback: {}\nRevise the proposal and present an updated sheet before proceeding.",
+                    title,
+                    if feedback_text.is_empty() {
+                        "(none)"
+                    } else {
+                        feedback_text.as_str()
+                    }
+                ),
+                is_error: false,
+            };
+        }
+
+        let submitted = parsed
+            .get("values")
+            .and_then(|v| v.as_object())
+            .cloned()
+            .unwrap_or_default();
+        let mut values = serde_json::Map::new();
+        let mut changed_keys = Vec::new();
+        for field in &sheet.fields {
+            let submitted_value = if field.readonly {
+                None
+            } else {
+                submitted.get(&field.key).and_then(|v| v.as_str())
+            };
+            let final_value = submitted_value.unwrap_or(field.value.as_str());
+            if final_value != field.value {
+                changed_keys.push(serde_json::Value::String(field.key.clone()));
+            }
+            values.insert(
+                field.key.clone(),
+                serde_json::Value::String(final_value.to_string()),
+            );
+        }
+
+        let mut report = serde_json::Map::new();
+        report.insert("confirmed".to_string(), serde_json::Value::Bool(true));
+        report.insert(
+            "title".to_string(),
+            serde_json::Value::String(title.to_string()),
+        );
+        report.insert("values".to_string(), serde_json::Value::Object(values));
+        if !changed_keys.is_empty() {
+            report.insert(
+                "changedKeys".to_string(),
+                serde_json::Value::Array(changed_keys),
+            );
+        }
+        if let Some(feedback) = feedback {
+            report.insert("note".to_string(), serde_json::Value::String(feedback));
+        }
+
+        ToolResult {
+            output: format!(
+                "User confirmed the sheet.\n{}",
+                serde_json::to_string_pretty(&serde_json::Value::Object(report))
+                    .unwrap_or_else(|_| "{}".to_string())
+            ),
+            is_error: false,
+        }
+    }
+
+    async fn execute_sheet(
+        &self,
+        app_handle: &AppHandle,
+        tool_call_id: &str,
+        args: &serde_json::Value,
+        run_id: &str,
+    ) -> ToolResult {
+        let (title, sheet) = match Self::parse_sheet_request(args) {
+            Ok(parsed) => parsed,
+            Err(message) => {
+                return ToolResult {
+                    output: message,
+                    is_error: true,
+                };
+            }
+        };
+
+        let question_id = uuid::Uuid::new_v4().to_string();
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+        let wait_target = self.user_wait_target(run_id);
+
+        {
+            let question_store: tauri::State<crate::QuestionStore> = app_handle.state();
+            let mut store = question_store.lock().await;
+            store.insert(
+                question_id.clone(),
+                crate::PendingQuestionResponse {
+                    session_id: wait_target.session_id.clone(),
+                    run_id: wait_target.run_id.clone(),
+                    tx,
+                },
+            );
+        }
+
+        emit_stream(
+            app_handle,
+            &wait_target.run_id,
+            crate::commands::StreamEvent::AskUser {
+                session_id: wait_target.session_id.clone(),
+                question_id: question_id.clone(),
+                tool_call_id: tool_call_id.to_string(),
+                question: title.clone(),
+                options: Vec::new(),
+                sheet: Some(sheet.clone()),
+            },
+        );
+
+        eprintln!(
+            "[Agent {}] sheet tool: waiting for user confirmation (question_id={})",
+            self.id, question_id
+        );
+
+        let mut cancel_rx = self.cancel_waiter();
+        let answer_result = tokio::select! {
+            result = rx => Some(result),
+            _ = cancel_rx.changed() => None,
+        };
+
+        match answer_result {
+            Some(Ok(answer)) => {
+                eprintln!(
+                    "[Agent {}] sheet tool: got user response ({} chars)",
+                    self.id,
+                    answer.len()
+                );
+                Self::sheet_result_from_answer(&title, &sheet, &answer)
+            }
+            Some(Err(_)) => ToolResult {
+                output: "Sheet confirmation was cancelled".to_string(),
                 is_error: true,
             },
             None => {
@@ -14730,16 +15503,18 @@ mod tests {
     use super::{
         assess_knowledge_tool_confirmation, assess_knowledge_tool_confirmation_decision,
         build_l2_full_document_section, build_l3_rule_section, build_prompt_tree,
-        build_structure_section, finalize_tool_call_record, render_tree_lines, utf8_prefix_chars,
-        AgentInstance, AgentKnowledgeDocumentContent, AgentKnowledgeDocumentContentPatch,
-        AgentKnowledgeListItem, AgentKnowledgeMutationResponse, AgentKnowledgeReadResponse,
-        AgentKnowledgeSearchHit, ExecutedToolResult, InjectedPromptItem, KnowledgeAccessMode,
-        ParentToolCall, PromptKnowledgeItem, RawContextStore, ToolConfirmDecision, ToolRunOutcome,
+        build_structure_section, compact_trigger, finalize_tool_call_record, render_tree_lines,
+        utf8_prefix_chars, AgentInstance, AgentKnowledgeDocumentContent,
+        AgentKnowledgeDocumentContentPatch, AgentKnowledgeListItem, AgentKnowledgeMutationResponse,
+        AgentKnowledgeReadResponse, AgentKnowledgeSearchHit, ExecutedToolResult,
+        InjectedPromptItem, KnowledgeAccessMode, KnowledgeFocusDoc, ParentToolCall,
+        PromptKnowledgeItem, RawContextStore, ToolConfirmDecision, ToolRunOutcome,
+        REACTIVE_COMPACT_ATTEMPT_KIND,
     };
     use crate::agent::definition::{AgentDef, AgentDefRegistry};
     use crate::commands::{
-        KnowledgeToolConfirmDirectoryMode, KnowledgeToolConfirmOperation, StreamEvent,
-        ToolCallOutcome,
+        CompactTrigger, KnowledgeToolConfirmDirectoryMode, KnowledgeToolConfirmOperation,
+        StreamEvent, ToolCallOutcome,
     };
     use crate::knowledge_store::{
         create_directory, default_directory_config_for_type, save_document,
@@ -14764,6 +15539,59 @@ mod tests {
     }
 
     #[test]
+    fn compact_trigger_classifies_manual_auto_and_reactive() {
+        assert_eq!(compact_trigger(true, "compact"), CompactTrigger::Manual);
+        assert_eq!(compact_trigger(false, "compact"), CompactTrigger::Auto);
+        assert_eq!(
+            compact_trigger(false, REACTIVE_COMPACT_ATTEMPT_KIND),
+            CompactTrigger::Reactive
+        );
+        // Manual wins even if a forced compact were recorded under another kind.
+        assert_eq!(
+            compact_trigger(true, REACTIVE_COMPACT_ATTEMPT_KIND),
+            CompactTrigger::Manual
+        );
+    }
+
+    #[test]
+    fn compact_start_event_serializes_trigger_for_frontend() {
+        let event = StreamEvent::CompactStart {
+            session_id: "session-1".to_string(),
+            context_tokens: 142_800,
+            context_limit: 258_400,
+            trigger: Some(CompactTrigger::Reactive),
+        };
+        let value = serde_json::to_value(&event).expect("serialize compact start");
+
+        assert_eq!(value["type"], "compactStart");
+        assert_eq!(value["contextTokens"], 142_800);
+        assert_eq!(value["contextLimit"], 258_400);
+        assert_eq!(value["trigger"], "reactive");
+
+        // Events persisted before the field existed still deserialize.
+        let legacy: StreamEvent = serde_json::from_value(json!({
+            "type": "compactStart",
+            "sessionId": "session-1",
+            "contextTokens": 1,
+            "contextLimit": 2
+        }))
+        .expect("deserialize legacy compact start");
+        match legacy {
+            StreamEvent::CompactStart { trigger, .. } => assert_eq!(trigger, None),
+            other => panic!("unexpected event variant: {other:?}"),
+        }
+
+        let untriggered = StreamEvent::CompactStart {
+            session_id: "session-1".to_string(),
+            context_tokens: 1,
+            context_limit: 2,
+            trigger: None,
+        };
+        let value = serde_json::to_value(&untriggered).expect("serialize compact start");
+        assert!(value.get("trigger").is_none());
+    }
+
+    #[test]
     fn preserves_interrupted_outcome_from_reserved_tool_result_text() {
         let result = ExecutedToolResult::from_tool_result(ToolResult {
             output: crate::session::history::INTERRUPTED_TOOL_RESULT.to_string(),
@@ -14771,6 +15599,122 @@ mod tests {
         });
 
         assert_eq!(result.outcome, ToolRunOutcome::Interrupted);
+    }
+
+    #[test]
+    fn parse_sheet_request_validates_title_fields_and_keys() {
+        assert!(AgentInstance::parse_sheet_request(&json!({ "fields": [] })).is_err());
+        assert!(AgentInstance::parse_sheet_request(&json!({ "title": "Publish" })).is_err());
+        assert!(AgentInstance::parse_sheet_request(&json!({
+            "title": "Publish",
+            "fields": [
+                { "key": "id", "label": "Plugin id", "value": "asset-tools" },
+                { "key": "id", "label": "Duplicate", "value": "x" },
+            ],
+        }))
+        .is_err());
+        assert!(AgentInstance::parse_sheet_request(&json!({
+            "title": "Publish",
+            "fields": [{ "key": "id", "label": "", "value": "asset-tools" }],
+        }))
+        .is_err());
+
+        let (title, sheet) = AgentInstance::parse_sheet_request(&json!({
+            "title": "Publish plugin asset-tools 0.1.0",
+            "description": "Creates the zip and installs it locally.",
+            "confirmLabel": "Publish",
+            "fields": [
+                {
+                    "key": "id",
+                    "label": "Plugin id",
+                    "value": "asset-tools",
+                    "readonly": true,
+                },
+                {
+                    "key": "version",
+                    "label": "Version",
+                    "value": 0.1,
+                    "options": ["0.1.0", "0.2.0", ""],
+                },
+                {
+                    "key": "summary",
+                    "label": "Summary",
+                    "value": "Tools",
+                    "multiline": true,
+                    "description": "  Shown in the registry.  ",
+                },
+            ],
+        }))
+        .expect("valid sheet request");
+
+        assert_eq!(title, "Publish plugin asset-tools 0.1.0");
+        assert_eq!(sheet.confirm_label.as_deref(), Some("Publish"));
+        assert_eq!(sheet.fields.len(), 3);
+        assert!(sheet.fields[0].readonly);
+        assert_eq!(sheet.fields[1].value, "0.1");
+        assert_eq!(sheet.fields[1].options, vec!["0.1.0", "0.2.0"]);
+        assert!(sheet.fields[2].multiline);
+        assert_eq!(
+            sheet.fields[2].description.as_deref(),
+            Some("Shown in the registry.")
+        );
+    }
+
+    #[test]
+    fn sheet_answer_confirm_reports_final_values_and_changed_keys() {
+        let (title, sheet) = AgentInstance::parse_sheet_request(&json!({
+            "title": "Publish",
+            "fields": [
+                { "key": "id", "label": "Plugin id", "value": "asset-tools", "readonly": true },
+                { "key": "version", "label": "Version", "value": "0.1.0" },
+                { "key": "name", "label": "Name", "value": "Asset Tools" },
+            ],
+        }))
+        .expect("valid sheet request");
+
+        let result = AgentInstance::sheet_result_from_answer(
+            &title,
+            &sheet,
+            r#"{"action":"confirm","values":{"id":"hacked","version":"0.2.0","unknown":"x"},"feedback":" ship it "}"#,
+        );
+
+        assert!(!result.is_error);
+        assert!(result.output.starts_with("User confirmed the sheet."));
+        let report: serde_json::Value =
+            serde_json::from_str(result.output.splitn(2, '\n').nth(1).expect("json body"))
+                .expect("valid report json");
+        assert_eq!(report["confirmed"], json!(true));
+        // readonly fields keep the proposed value even if the answer tries to change them
+        assert_eq!(report["values"]["id"], json!("asset-tools"));
+        assert_eq!(report["values"]["version"], json!("0.2.0"));
+        assert_eq!(report["values"]["name"], json!("Asset Tools"));
+        assert_eq!(report["values"].as_object().map(|map| map.len()), Some(3));
+        assert_eq!(report["changedKeys"], json!(["version"]));
+        assert_eq!(report["note"], json!("ship it"));
+    }
+
+    #[test]
+    fn sheet_answer_feedback_or_unknown_shape_requests_changes() {
+        let (title, sheet) = AgentInstance::parse_sheet_request(&json!({
+            "title": "Publish",
+            "fields": [{ "key": "id", "label": "Plugin id", "value": "asset-tools" }],
+        }))
+        .expect("valid sheet request");
+
+        let feedback = AgentInstance::sheet_result_from_answer(
+            &title,
+            &sheet,
+            r#"{"action":"feedback","feedback":"use a namespaced id"}"#,
+        );
+        assert!(!feedback.is_error);
+        assert!(feedback.output.contains("requested changes"));
+        assert!(feedback.output.contains("use a namespaced id"));
+        assert!(feedback.output.contains("present an updated sheet"));
+
+        let legacy = AgentInstance::sheet_result_from_answer(&title, &sheet, "plain text answer");
+        assert!(!legacy.is_error);
+        assert!(legacy.output.contains("requested changes"));
+        assert!(legacy.output.contains("plain text answer"));
     }
 
     #[test]
@@ -14945,17 +15889,45 @@ mod tests {
 
     #[test]
     fn needs_undo_tracking_includes_workspace_mutations() {
-        assert!(AgentInstance::needs_undo_tracking("bash"));
-        assert!(AgentInstance::needs_undo_tracking("write"));
-        assert!(AgentInstance::needs_undo_tracking("edit"));
-        assert!(AgentInstance::needs_undo_tracking("unity_execute"));
-        assert!(AgentInstance::needs_undo_tracking("view_create"));
-        assert!(AgentInstance::needs_undo_tracking("knowledge_create"));
-        assert!(AgentInstance::needs_undo_tracking("knowledge_edit"));
-        assert!(AgentInstance::needs_undo_tracking("knowledge_move"));
-        assert!(AgentInstance::needs_undo_tracking("knowledge_delete"));
-        assert!(!AgentInstance::needs_undo_tracking("read"));
-        assert!(!AgentInstance::needs_undo_tracking("grep"));
+        let registry = ToolRegistry::with_builtins();
+        for tool in [
+            "bash",
+            "write",
+            "edit",
+            "unity_execute",
+            "unity_run_states",
+            "view_create",
+            "knowledge_create",
+            "knowledge_edit",
+            "knowledge_move",
+            "knowledge_delete",
+            "skill_create",
+            "plugin_install",
+            "plugin_uninstall",
+            "plugin_set_enabled",
+            "plugin_export",
+        ] {
+            assert!(
+                registry.mutates_workspace(tool),
+                "{} should declare mutates_workspace",
+                tool
+            );
+        }
+        for tool in [
+            "read",
+            "grep",
+            "list",
+            "knowledge_read",
+            "plugin_list",
+            "unity_recompile",
+            "view_list",
+        ] {
+            assert!(
+                !registry.mutates_workspace(tool),
+                "{} should not declare mutates_workspace",
+                tool
+            );
+        }
     }
 
     #[test]
@@ -15606,6 +16578,7 @@ PrefabInstance:
             name: name.to_string(),
             description: format!("{} description", name),
             parameters: serde_json::json!({"type": "object"}),
+            mutates_workspace: false,
             execute: Arc::new(|_, _| {
                 Box::pin(async {
                     ToolResult {
@@ -16130,6 +17103,12 @@ PrefabInstance:
         assert!(parts.env_prompt.contains("- `graph_view`"));
         assert!(parts.env_prompt.contains("- `web_fetch`"));
         assert!(!parts.env_prompt.contains("- `read`"));
+        assert!(
+            parts
+                .env_prompt
+                .contains("- `web_fetch` — Fetch a URL for agent-readable content."),
+            "lazy manifest entries should carry a one-line summary"
+        );
 
         let items = instance.list_injected_prompt_items().await;
         let manifest = items
@@ -16654,7 +17633,7 @@ Create a reusable Skill.
     }
 
     #[tokio::test]
-    async fn selected_command_skill_can_bring_builtin_skill_mode_tool() {
+    async fn selected_plugin_skill_can_bring_builtin_skill_mode_tools() {
         let root = tempdir().expect("temp dir");
         let workspace = root.path().join("workspace");
         let app_knowledge_dir = root.path().join("app-knowledge");
@@ -16662,12 +17641,12 @@ Create a reusable Skill.
         std::fs::create_dir_all(&workspace).expect("create workspace");
         std::fs::create_dir_all(&skill_dir).expect("create skill dir");
         std::fs::write(
-            skill_dir.join("create-plugin.md"),
+            skill_dir.join("plugin.md"),
             r#"---
-id: kd_skill_create_plugin
+id: kd_skill_plugin
 type: skill
-path: builtin/create-plugin.md
-title: Create Plugin
+path: builtin/plugin.md
+title: Plugin
 injectMode: none
 summaryEnabled: true
 commandEnabled: true
@@ -16675,24 +17654,28 @@ readOnly: true
 aiMaintained: false
 skillEnabled: true
 skillSurface: command
-commandTrigger: /create-plugin
+commandTrigger: /plugin
 argumentHint:
 tools:
+  - plugin_list
+  - plugin_search
+  - plugin_install
+  - plugin_uninstall
   - plugin_export
 createdAt: 1
 updatedAt: 1
 ---
 
-# Create Plugin
+# Plugin
 
 ## Summary
-Create a Plugin.
+Manage plugins.
 
 ## Content
-Audit and export a plugin.
+Search, install, audit, and export a plugin.
 "#,
         )
-        .expect("write create plugin");
+        .expect("write plugin skill");
 
         let (_, cancel_rx) = tokio::sync::watch::channel(false);
         let agent = AgentInstance::new(
@@ -16728,41 +17711,55 @@ Audit and export a plugin.
             None,
         );
 
-        assert_eq!(
-            agent.tool_registry.default_load_mode("plugin_export"),
-            crate::tool::ToolLoadMode::Skill
-        );
-        assert!(!agent
-            .build_request_tool_names()
-            .await
-            .contains(&"plugin_export".to_string()));
-        assert!(!agent
-            .lazy_tool_manifest_names()
-            .await
-            .contains(&"plugin_export".to_string()));
+        for tool_name in [
+            "plugin_list",
+            "plugin_search",
+            "plugin_install",
+            "plugin_uninstall",
+            "plugin_export",
+        ] {
+            assert_eq!(
+                agent.tool_registry.default_load_mode(tool_name),
+                crate::tool::ToolLoadMode::Skill
+            );
+            assert!(!agent
+                .build_request_tool_names()
+                .await
+                .contains(&tool_name.to_string()));
+            assert!(!agent
+                .lazy_tool_manifest_names()
+                .await
+                .contains(&tool_name.to_string()));
+        }
 
         let inactive_load = agent
             .execute_tool_load_with_mode_and_skills(
-                &serde_json::json!({ "tools": ["plugin_export"] }),
+                &serde_json::json!({ "tools": ["plugin_list", "plugin_search", "plugin_install", "plugin_uninstall", "plugin_export"] }),
                 crate::config::DynamicToolLoadingMode::MetaTool,
                 &HashSet::new(),
             )
             .await;
         let inactive_json: serde_json::Value =
             serde_json::from_str(&inactive_load.output).expect("inactive tool_load json");
-        assert_eq!(inactive_json["tools"][0]["status"], "not_allowed");
+        for index in 0..5 {
+            assert_eq!(inactive_json["tools"][index]["status"], "not_allowed");
+        }
 
         let intent = UserIntentPayload {
             kind: "user_intent_v1".to_string(),
             mode: "build".to_string(),
             skills: vec![UserIntentSkill {
-                dir_name: "create-plugin".to_string(),
+                dir_name: "plugin".to_string(),
                 source: "app".to_string(),
-                name: "Create Plugin".to_string(),
+                name: "Plugin".to_string(),
             }],
             client_message_id: None,
         };
         let active_skill_tool_names = agent.selected_skill_tool_names(Some(&intent));
+        assert!(active_skill_tool_names.contains("plugin_list"));
+        assert!(active_skill_tool_names.contains("plugin_search"));
+        assert!(active_skill_tool_names.contains("plugin_install"));
+        assert!(active_skill_tool_names.contains("plugin_uninstall"));
         assert!(active_skill_tool_names.contains("plugin_export"));
 
         let request_tool_names = agent
@@ -16772,19 +17769,25 @@ Audit and export a plugin.
                 Some("build"),
             )
             .await;
+        assert!(request_tool_names.contains(&"plugin_list".to_string()));
+        assert!(request_tool_names.contains(&"plugin_search".to_string()));
+        assert!(request_tool_names.contains(&"plugin_install".to_string()));
+        assert!(request_tool_names.contains(&"plugin_uninstall".to_string()));
         assert!(request_tool_names.contains(&"plugin_export".to_string()));
 
         let active_load = agent
             .execute_tool_load_with_mode_and_skills(
-                &serde_json::json!({ "tools": ["plugin_export"] }),
+                &serde_json::json!({ "tools": ["plugin_list", "plugin_search", "plugin_install", "plugin_uninstall", "plugin_export"] }),
                 crate::config::DynamicToolLoadingMode::MetaTool,
                 &active_skill_tool_names,
             )
             .await;
         let active_json: serde_json::Value =
             serde_json::from_str(&active_load.output).expect("active tool_load json");
-        assert_eq!(active_json["tools"][0]["status"], "described");
-        assert_eq!(active_json["tools"][0]["loadMode"], "skill");
+        for index in 0..5 {
+            assert_eq!(active_json["tools"][index]["status"], "described");
+            assert_eq!(active_json["tools"][index]["loadMode"], "skill");
+        }
     }
 
     fn sample_agent_knowledge_document(path: &str, title: &str) -> KnowledgeDocument {
@@ -17758,6 +18761,29 @@ Audit and export a plugin.
     }
 
     #[test]
+    fn structure_section_promotes_skill_package_root_summary_to_package_dir() {
+        let items = vec![PromptKnowledgeItem {
+            doc_type: KnowledgeType::Skill,
+            path: "view/SKILL.md".to_string(),
+            title: "View".to_string(),
+            inject_mode: KnowledgeInjectMode::Excerpt,
+            summary: Some("Use for explicit Locus View UI package requests.".to_string()),
+            body_excerpt: None,
+        }];
+
+        let tree = build_prompt_tree(&items, &[], false);
+        let rendered = render_tree_lines(&tree, true, 3).join("\n");
+
+        assert!(
+            rendered
+                .contains("view/ [package] :: Use for explicit Locus View UI package requests."),
+            "{}",
+            rendered
+        );
+        assert!(!rendered.contains("SKILL.md ::"), "{}", rendered);
+    }
+
+    #[test]
     fn structure_section_shows_builtin_memory_directory_rules_for_path_injection() {
         let temp = tempdir().expect("temp dir");
         let working_dir = temp.path().to_string_lossy().to_string();
@@ -18079,16 +19105,17 @@ Audit and export a plugin.
             .knowledge_prompt
             .find("### Search")
             .expect("search section");
-        let tools_index = prompt_parts
-            .knowledge_prompt
-            .find("### Tools")
-            .expect("tools section");
         let memory_index = prompt_parts
             .knowledge_prompt
             .find("### L2 Full Documents")
             .expect("l2 full document section");
-        assert!(search_index < tools_index);
-        assert!(tools_index < memory_index);
+        assert!(search_index < memory_index);
+        // Knowledge tool usage lives in the tool schemas and the lazy tool
+        // manifest; the knowledge block must not duplicate it.
+        assert!(!prompt_parts.knowledge_prompt.contains("### Tools"));
+        assert!(!prompt_parts.knowledge_prompt.contains("`skill_create`:"));
+        assert!(!prompt_parts.knowledge_prompt.contains("`skill_reload`:"));
+        assert!(!prompt_parts.knowledge_prompt.contains("`skill_list`:"));
         assert!(!prompt_parts.knowledge_prompt.contains("## L3 Rules"));
         assert!(!prompt_parts.knowledge_prompt.contains("Full Document:"));
         assert!(prompt_parts.rules_prompt.contains("## L3 Rules"));
@@ -18099,6 +19126,72 @@ Audit and export a plugin.
         assert!(!prompt_parts.env_prompt.contains("## Knowledge"));
         assert!(!prompt_parts.env_prompt.contains("project-mistake-note.md"));
         assert!(!prompt_parts.env_prompt.contains("user-preference.md"));
+    }
+
+    #[test]
+    fn system_prompt_parts_inject_knowledge_focus_document_into_env() {
+        let temp = tempdir().expect("temp dir");
+        let working_dir = temp.path().to_string_lossy().to_string();
+        let mut document = sample_agent_knowledge_document("combat/core-loop.md", "Core Loop");
+        document.summary = Some("Loop summary".to_string());
+        document.maintenance_rules = Some("Keep damage tables current.".to_string());
+        document.body = "# Core Loop\nDamage remains 20.".to_string();
+        save_document(&working_dir, document).expect("save document");
+
+        // No {{#knowledge}} block in the template: the focus document must be
+        // injected regardless of the agent's knowledge placeholders.
+        let mut agent = test_agent_instance_with_prompts(
+            working_dir,
+            "You are a test agent.",
+            "# Environment\nWorking directory: <working_dir>\n",
+        );
+        agent.set_knowledge_focus(Some(KnowledgeFocusDoc {
+            doc_type: KnowledgeType::Design,
+            path: "combat/core-loop.md".to_string(),
+        }));
+
+        let prompt_parts = tokio::runtime::Runtime::new()
+            .expect("create runtime")
+            .block_on(agent.build_system_prompt_parts());
+
+        assert!(prompt_parts
+            .env_prompt
+            .contains("## Active Knowledge Document"));
+        assert!(prompt_parts
+            .env_prompt
+            .contains("- Path: design/combat/core-loop.md"));
+        assert!(prompt_parts.env_prompt.contains("- Read-only: no"));
+        assert!(prompt_parts.env_prompt.contains("Loop summary"));
+        assert!(prompt_parts
+            .env_prompt
+            .contains("Keep damage tables current."));
+        assert!(prompt_parts.env_prompt.contains("Damage remains 20."));
+        // Body headings are remapped below the env section headings.
+        assert!(prompt_parts.env_prompt.contains("#### Core Loop"));
+        assert!(!prompt_parts.env_prompt.contains("\n# Core Loop"));
+    }
+
+    #[test]
+    fn knowledge_focus_is_skipped_when_document_is_missing() {
+        let temp = tempdir().expect("temp dir");
+        let working_dir = temp.path().to_string_lossy().to_string();
+        let mut agent = test_agent_instance_with_prompts(
+            working_dir,
+            "You are a test agent.",
+            "# Environment\nWorking directory: <working_dir>\n",
+        );
+        agent.set_knowledge_focus(Some(KnowledgeFocusDoc {
+            doc_type: KnowledgeType::Design,
+            path: "missing/doc.md".to_string(),
+        }));
+
+        let prompt_parts = tokio::runtime::Runtime::new()
+            .expect("create runtime")
+            .block_on(agent.build_system_prompt_parts());
+
+        assert!(!prompt_parts
+            .env_prompt
+            .contains("## Active Knowledge Document"));
     }
 
     #[test]
@@ -18254,6 +19347,58 @@ Audit and export a plugin.
 
         assert!(!result.is_error);
         assert_eq!(result.output, "design/project-overview.md");
+    }
+
+    #[test]
+    fn execute_knowledge_list_shows_package_docs_for_single_package_prefix() {
+        let temp = tempdir().expect("temp dir");
+        let working_dir = temp.path().to_string_lossy().to_string();
+        let plugin_root = temp
+            .path()
+            .join(crate::plugin::PROJECT_PLUGINS_RELATIVE)
+            .join("com.example.view-plugin");
+        let skill_root = plugin_root.join("skills").join("view");
+        std::fs::create_dir_all(&skill_root).expect("create skill package");
+        std::fs::write(
+            plugin_root.join(crate::plugin::PLUGIN_MANIFEST_FILE_NAME),
+            r#"{
+  "schemaVersion": 1,
+  "id": "com.example.view-plugin",
+  "name": "View Plugin",
+  "version": "1.0.0",
+  "components": {
+    "skills": [{ "id": "view", "path": "skills/view" }]
+  }
+}
+"#,
+        )
+        .expect("write plugin manifest");
+        std::fs::write(
+            skill_root.join("skill.json"),
+            r#"{
+  "schema": "locus.skill.v1",
+  "id": "view",
+  "version": "1.0.0",
+  "name": "View",
+  "injectMode": "excerpt",
+  "description": "Use explicit Locus View UI package requests."
+}
+"#,
+        )
+        .expect("write skill manifest");
+        std::fs::write(skill_root.join("SKILL.md"), "# View\n").expect("write skill root");
+        std::fs::write(skill_root.join("debug.md"), "# Debug\n").expect("write debug doc");
+        std::fs::write(skill_root.join("runtime-api.md"), "# Runtime API\n")
+            .expect("write runtime doc");
+
+        let agent = test_agent_instance(working_dir);
+        let result = agent.execute_knowledge_list(&json!({"pathPrefix":"skill/view/"}));
+
+        assert!(!result.is_error);
+        assert_eq!(
+            result.output,
+            "skill/view/SKILL.md\nskill/view/debug.md\nskill/view/runtime-api.md"
+        );
     }
 
     #[test]

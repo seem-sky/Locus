@@ -142,6 +142,7 @@ const props = withDefaults(defineProps<{
   placeholder?: string;
   disabled?: boolean;
   isStreaming?: boolean;
+  cancelling?: boolean;
   sendLabel?: string;
   cancelLabel?: string;
   allowImages?: boolean;
@@ -157,6 +158,7 @@ const props = withDefaults(defineProps<{
   placeholder: "",
   disabled: false,
   isStreaming: false,
+  cancelling: false,
   sendLabel: "",
   cancelLabel: "",
   allowImages: true,
@@ -268,6 +270,17 @@ const canSend = computed(() =>
   || consoleTextAttachments.value.length > 0
   || localFileAttachments.value.length > 0,
 );
+
+function isDraftEmpty() {
+  return !props.modelValue
+    && !pastedContent.value
+    && imageAttachments.value.length === 0
+    && assetRefAttachments.value.length === 0
+    && consoleTextAttachments.value.length === 0
+    && localFileAttachments.value.length === 0
+    && !hasComposerIntent(composerIntent.value);
+}
+
 const hasHeaderStart = computed(() =>
   !!slots["header-start"]
   || (!!props.showTopPlanBadge && !!composerPlanBadge.value)
@@ -2256,6 +2269,7 @@ defineExpose({
   appendPrefill,
   applyDraftPrefill,
   addAssetRefs,
+  isDraftEmpty,
 });
 </script>
 
@@ -2462,6 +2476,7 @@ defineExpose({
       :placeholder="placeholder"
       :disabled="disabled"
       :is-streaming="isStreaming"
+      :cancelling="cancelling"
       :can-send="canSend"
       :send-label="sendLabel"
       :cancel-label="cancelLabel"

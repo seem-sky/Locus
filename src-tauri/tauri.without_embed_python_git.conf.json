@@ -14,6 +14,7 @@
       "./gen/lua53": "lua53/",
       "./gen/rtk": "rtk/",
       "./gen/headroom-bundle": "headroom-bundle/",
+      "./gen/gh-runtime": "gh-runtime/",
       "../agent": "agent/",
       "../knowledge": "knowledge/",
       "../skills": "skills/",

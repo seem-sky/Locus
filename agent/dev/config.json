@@ -37,6 +37,7 @@
     "task",
     "todowrite",
     "ask_user_question",
+    "sheet",
     "graph_view",
     "web_fetch",
     "unity_execute",

@@ -1,8 +1,9 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use notify::{Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
@@ -11,6 +12,9 @@ use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, Webview
 use tokio::io::AsyncWriteExt;
 
 pub const VIEW_SCHEMA: &str = "locus.view.v1";
+// apiVersion records the Locus version a package was created with. It is
+// informational metadata, not a compatibility gate: packages created by older
+// app versions keep loading after an upgrade.
 pub const VIEW_API_VERSION: &str = concat!("v", env!("CARGO_PKG_VERSION"));
 pub const LEGACY_VIEW_API_VERSION: &str = "v0.3.0";
 pub const VIEW_TREE_METADATA_SCHEMA: &str = "locus.view.tree.v1";
@@ -115,16 +119,8 @@ where
     deserializer.deserialize_any(ViewApiVersionVisitor)
 }
 
-fn supported_view_api_version_labels() -> String {
-    if VIEW_API_VERSION == LEGACY_VIEW_API_VERSION {
-        VIEW_API_VERSION.to_string()
-    } else {
-        format!("{}, {}", VIEW_API_VERSION, LEGACY_VIEW_API_VERSION)
-    }
-}
-
-fn is_supported_view_api_version(value: &str) -> bool {
-    value == VIEW_API_VERSION || value == LEGACY_VIEW_API_VERSION
+fn is_valid_view_api_version(value: &str) -> bool {
+    !value.trim().is_empty()
 }
 
 #[derive(Debug, Default)]
@@ -393,6 +389,8 @@ struct ViewTreeMetadata {
     folders: Vec<String>,
     #[serde(default)]
     order: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    view_display_paths: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -439,6 +437,7 @@ pub struct ViewExportPackageRequest {
 pub struct ViewPluginExportCopy {
     pub id: String,
     pub file_count: usize,
+    pub source_root: PathBuf,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -971,9 +970,21 @@ fn updated_at(path: &Path) -> i64 {
         .unwrap_or(0)
 }
 
+// Window labels derive from view ids (`view-<id>`, detached copies get a
+// `view-<id>-<uuid>` label), so ids that would land in the `view-content-*`
+// or `view-pool-*` label namespaces are reserved.
+fn view_id_uses_reserved_prefix(id: &str) -> bool {
+    ["content", "pool"]
+        .iter()
+        .any(|prefix| id == *prefix || id.starts_with(&format!("{}-", prefix)))
+}
+
 pub fn is_valid_view_id(id: &str) -> bool {
     let id = id.trim();
     if id.is_empty() || id.starts_with('-') || id.ends_with('-') || id.contains("--") {
+        return false;
+    }
+    if view_id_uses_reserved_prefix(id) {
         return false;
     }
     id.chars()
@@ -982,6 +993,9 @@ pub fn is_valid_view_id(id: &str) -> bool {
 
 pub fn normalize_view_id(id: &str) -> Result<String, String> {
     let normalized = id.trim();
+    if view_id_uses_reserved_prefix(normalized) {
+        return Err("Invalid view id: 'content' and 'pool' prefixes are reserved.".to_string());
+    }
     if !is_valid_view_id(normalized) {
         return Err("Invalid view id: use lowercase kebab-case.".to_string());
     }
@@ -1107,12 +1121,8 @@ pub fn validate_view_manifest(manifest: &ViewManifest) -> Result<(), String> {
     if manifest.schema != VIEW_SCHEMA {
         return Err(format!("Unsupported View schema: {}", manifest.schema));
     }
-    if !is_supported_view_api_version(&manifest.api_version) {
-        return Err(format!(
-            "Unsupported View apiVersion: {}. Expected one of: {}.",
-            manifest.api_version,
-            supported_view_api_version_labels()
-        ));
+    if !is_valid_view_api_version(&manifest.api_version) {
+        return Err("View apiVersion cannot be empty.".to_string());
     }
     normalize_view_id(&manifest.id)?;
     if manifest.name.trim().is_empty() {
@@ -1595,6 +1605,19 @@ fn view_is_plugin_managed(view: &ViewPackageSummary) -> bool {
     view.plugin_id.is_some() || view.source.starts_with("plugin")
 }
 
+fn apply_view_display_path_overrides(
+    views: &mut [ViewPackageSummary],
+    view_display_paths: &BTreeMap<String, String>,
+) {
+    for view in views {
+        if view_is_plugin_managed(view) {
+            if let Some(display_path) = view_display_paths.get(&view.id) {
+                view.display_path = display_path.clone();
+            }
+        }
+    }
+}
+
 fn ensure_no_plugin_managed_views<'a>(
     views: impl IntoIterator<Item = &'a ViewPackageSummary>,
     action: &str,
@@ -1740,6 +1763,10 @@ pub fn list_views_sync(working_dir: &str) -> Result<Vec<ViewPackageSummary>, Str
         }
     }
 
+    if let Ok(metadata) = load_view_tree_metadata(&views_root) {
+        apply_view_display_path_overrides(&mut views, &metadata.view_display_paths);
+    }
+
     views.sort_by(|left, right| {
         left.package_rel_path
             .cmp(&right.package_rel_path)
@@ -1756,6 +1783,7 @@ fn load_view_tree_metadata(views_root: &Path) -> Result<ViewTreeMetadata, String
             schema: VIEW_TREE_METADATA_SCHEMA.to_string(),
             folders: Vec::new(),
             order: Vec::new(),
+            view_display_paths: BTreeMap::new(),
         });
     }
 
@@ -1785,10 +1813,17 @@ fn load_view_tree_metadata(views_root: &Path) -> Result<ViewTreeMetadata, String
             order.push(rel_path);
         }
     }
+    let mut view_display_paths = BTreeMap::new();
+    for (view_id, display_path) in metadata.view_display_paths {
+        let view_id = normalize_view_id(&view_id)?;
+        let display_path = normalize_view_tree_rel_path(&display_path, false)?;
+        view_display_paths.insert(view_id, display_path);
+    }
     Ok(ViewTreeMetadata {
         schema: VIEW_TREE_METADATA_SCHEMA.to_string(),
         folders: folders.into_iter().collect(),
         order,
+        view_display_paths,
     })
 }
 
@@ -1796,6 +1831,7 @@ fn save_view_tree_metadata(
     views_root: &Path,
     folders: BTreeSet<String>,
     order: Vec<String>,
+    view_display_paths: BTreeMap<String, String>,
 ) -> Result<(), String> {
     let path = view_tree_metadata_path(views_root);
     if let Some(parent) = path.parent() {
@@ -1810,15 +1846,22 @@ fn save_view_tree_metadata(
             normalized_order.push(rel_path);
         }
     }
+    let mut normalized_view_display_paths = BTreeMap::new();
+    for (view_id, display_path) in view_display_paths {
+        normalized_view_display_paths.insert(
+            normalize_view_id(&view_id)?,
+            normalize_view_tree_rel_path(&display_path, false)?,
+        );
+    }
     let metadata = ViewTreeMetadata {
         schema: VIEW_TREE_METADATA_SCHEMA.to_string(),
         folders: folders.into_iter().collect(),
         order: normalized_order,
+        view_display_paths: normalized_view_display_paths,
     };
     let raw = serde_json::to_string_pretty(&metadata)
         .map_err(|e| format!("Failed to serialize View tree metadata: {}", e))?;
-    std::fs::write(&path, raw + "\n")
-        .map_err(|e| format!("Failed to write {}: {}", path.display(), e))
+    write_text_file_atomic(&path, &(raw + "\n"))
 }
 
 fn view_display_folder_paths(views: &[ViewPackageSummary]) -> BTreeSet<String> {
@@ -1982,6 +2025,8 @@ fn normalize_insert_anchor(value: Option<&str>) -> Result<Option<String>, String
 
 fn view_tree_order_after_move(
     order: &[String],
+    entries_before_move: &[ViewTreeOrderEntry],
+    valid_paths_before_move: &BTreeSet<String>,
     entries_after_move: &[ViewTreeOrderEntry],
     valid_paths_after_move: &BTreeSet<String>,
     source_rel_path: &str,
@@ -2013,6 +2058,7 @@ fn view_tree_order_after_move(
         ));
     }
 
+    let mut anchor_removed_by_move = false;
     for anchor in [insert_before.as_deref(), insert_after.as_deref()]
         .into_iter()
         .flatten()
@@ -2024,13 +2070,27 @@ fn view_tree_order_after_move(
             ));
         }
         if !valid_paths_after_move.contains(anchor) {
-            return Err(format!("View insert anchor not found: {}", anchor));
+            if !valid_paths_before_move.contains(anchor) {
+                return Err(format!("View insert anchor not found: {}", anchor));
+            }
+            anchor_removed_by_move = true;
         }
     }
 
     let remapped_order = remap_view_tree_order_for_move(order, source_rel_path, moved_rel_path);
-    let mut target_group =
-        view_tree_ordered_child_paths(entries_after_move, target_dir_rel_path, &remapped_order);
+    let mut target_group = if anchor_removed_by_move {
+        let mut paths =
+            view_tree_ordered_child_paths(entries_before_move, target_dir_rel_path, order);
+        paths.retain(|rel_path| {
+            valid_paths_after_move.contains(rel_path)
+                || insert_before.as_deref() == Some(rel_path.as_str())
+                || insert_after.as_deref() == Some(rel_path.as_str())
+        });
+        paths
+    } else {
+        view_tree_ordered_child_paths(entries_after_move, target_dir_rel_path, &remapped_order)
+    };
+    target_group.retain(|rel_path| rel_path != source_rel_path);
     target_group.retain(|rel_path| rel_path != moved_rel_path);
     match (insert_before, insert_after) {
         (Some(anchor), None) => {
@@ -2050,6 +2110,7 @@ fn view_tree_order_after_move(
         (None, None) => target_group.push(moved_rel_path.to_string()),
         (Some(_), Some(_)) => unreachable!(),
     }
+    target_group.retain(|rel_path| valid_paths_after_move.contains(rel_path));
 
     let target_group_set = target_group.iter().cloned().collect::<BTreeSet<_>>();
     let mut next_order = remapped_order
@@ -2108,6 +2169,33 @@ fn set_view_manifest_display_path(package_root: &str, display_path: &str) -> Res
     write_manifest_to_root(&root, &manifest)
 }
 
+fn stage_view_display_path_for_move(
+    view: &ViewPackageSummary,
+    display_path: &str,
+    metadata: &mut ViewTreeMetadata,
+) -> Result<String, String> {
+    let display_path = normalize_view_display_path(display_path)?;
+    if view_is_plugin_managed(view) {
+        metadata
+            .view_display_paths
+            .insert(view.id.clone(), display_path.clone());
+        return Ok(display_path);
+    }
+
+    metadata.view_display_paths.remove(&view.id);
+    Ok(display_path)
+}
+
+fn write_view_display_path_for_move(
+    view: &ViewPackageSummary,
+    display_path: &str,
+) -> Result<(), String> {
+    if view_is_plugin_managed(view) {
+        return Ok(());
+    }
+    set_view_manifest_display_path(&view.package_root, display_path)
+}
+
 fn set_view_manifest_name(package_root: &str, name: &str) -> Result<(), String> {
     let root = PathBuf::from(package_root);
     let mut manifest = load_manifest_from_root(&root)?;
@@ -2134,7 +2222,118 @@ fn remove_view_package_root(views_root: &Path, root: &Path, label: &str) -> Resu
             label
         ));
     }
+    stop_view_file_watchers_under(root);
     std::fs::remove_dir_all(root).map_err(|e| format!("Failed to delete {}: {}", root.display(), e))
+}
+
+struct ViewPackageTransferPlan {
+    normalized_id: String,
+    views_root: PathBuf,
+    canonical_source_root: PathBuf,
+    display_path: Option<String>,
+}
+
+fn plan_view_package_transfer_to_plugin_sync(
+    working_dir: &str,
+    view_id: &str,
+    source_root: &Path,
+) -> Result<ViewPackageTransferPlan, String> {
+    let normalized_id = normalize_view_id(view_id)?;
+    let views_root = views_root_for_workspace(working_dir)?;
+    let canonical_views_root = dunce::canonicalize(&views_root).map_err(|e| {
+        format!(
+            "Failed to resolve View root '{}': {}",
+            views_root.display(),
+            e
+        )
+    })?;
+    let canonical_source_root = dunce::canonicalize(source_root).map_err(|e| {
+        format!(
+            "Failed to resolve View source root '{}': {}",
+            source_root.display(),
+            e
+        )
+    })?;
+    if canonical_source_root == canonical_views_root
+        || !canonical_source_root.starts_with(&canonical_views_root)
+    {
+        return Err(format!(
+            "View '{}' is not in the workspace View directory and cannot be transferred automatically.",
+            normalized_id
+        ));
+    }
+    if plugin_view_source_for_root(working_dir, &canonical_source_root).is_some() {
+        return Err(format!(
+            "View '{}' is already managed by a plugin.",
+            normalized_id
+        ));
+    }
+
+    let manifest = load_manifest_from_root(&canonical_source_root)?;
+    if manifest.id != normalized_id {
+        return Err(format!(
+            "View id mismatch before transfer: requested {}, manifest has {}",
+            normalized_id, manifest.id
+        ));
+    }
+
+    let display_path = list_views_sync(working_dir)
+        .ok()
+        .and_then(|views| {
+            views.into_iter().find(|view| {
+                view.id == normalized_id
+                    && !view_is_plugin_managed(view)
+                    && dunce::canonicalize(&view.package_root)
+                        .unwrap_or_else(|_| PathBuf::from(&view.package_root))
+                        == canonical_source_root
+            })
+        })
+        .map(|view| view.display_path);
+
+    Ok(ViewPackageTransferPlan {
+        normalized_id,
+        views_root,
+        canonical_source_root,
+        display_path,
+    })
+}
+
+pub(crate) fn preflight_view_package_transfer_to_plugin_sync(
+    working_dir: &str,
+    view_id: &str,
+    source_root: &Path,
+) -> Result<String, String> {
+    plan_view_package_transfer_to_plugin_sync(working_dir, view_id, source_root)
+        .map(|plan| plan.normalized_id)
+}
+
+pub(crate) fn transfer_view_package_to_plugin_sync(
+    working_dir: &str,
+    view_id: &str,
+    source_root: &Path,
+) -> Result<String, String> {
+    let _guard = lock_view_mutations();
+    let plan = plan_view_package_transfer_to_plugin_sync(working_dir, view_id, source_root)?;
+
+    remove_view_package_root(
+        &plan.views_root,
+        &plan.canonical_source_root,
+        &plan.normalized_id,
+    )?;
+
+    let mut metadata = load_view_tree_metadata(&plan.views_root)?;
+    metadata.view_display_paths.remove(&plan.normalized_id);
+    if let Some(display_path) = plan.display_path {
+        metadata.order.retain(|path| path != &display_path);
+    }
+    save_view_tree_metadata(
+        &plan.views_root,
+        metadata.folders.into_iter().collect(),
+        metadata.order,
+        metadata.view_display_paths,
+    )?;
+
+    Ok(plan.normalized_id)
 }
 
 pub fn list_view_tree_sync(working_dir: &str) -> Result<ViewTreeSnapshot, String> {
@@ -2177,6 +2376,7 @@ pub fn create_view_folder_sync(
     working_dir: &str,
     request: ViewCreateFolderRequest,
 ) -> Result<ViewFolderSummary, String> {
+    let _guard = lock_view_mutations();
     let views_root = views_root_for_workspace(working_dir)?;
     let parent_rel_path = request.parent_rel_path.as_deref().unwrap_or("").trim();
     let parent_rel_path = normalize_view_tree_rel_path(parent_rel_path, true)?;
@@ -2198,7 +2398,12 @@ pub fn create_view_folder_sync(
 
     metadata.folders.push(rel_path.clone());
     let folders = metadata.folders.into_iter().collect::<BTreeSet<_>>();
-    save_view_tree_metadata(&views_root, folders, metadata.order)?;
+    save_view_tree_metadata(
+        &views_root,
+        folders,
+        metadata.order,
+        metadata.view_display_paths,
+    )?;
     Ok(view_folder_summary(rel_path, &views_root))
 }
 
@@ -2206,6 +2411,7 @@ pub fn delete_view_entry_sync(
     working_dir: &str,
     request: ViewDeleteEntryRequest,
 ) -> Result<ViewTreeSnapshot, String> {
+    let _guard = lock_view_mutations();
     let views_root = views_root_for_workspace(working_dir)?;
     let rel_path = normalize_view_tree_rel_path(&request.rel_path, false)?;
     let views = list_views_sync(working_dir)?;
@@ -2220,6 +2426,7 @@ pub fn delete_view_entry_sync(
         ensure_no_plugin_managed_views(std::iter::once(view), "remove")?;
         roots_to_delete.push(PathBuf::from(&view.package_root));
         metadata.order.retain(|path| path != &view.display_path);
+        metadata.view_display_paths.remove(&view.id);
     } else if folder_paths.contains(&rel_path) {
         let folder_views = views
             .iter()
@@ -2227,6 +2434,7 @@ pub fn delete_view_entry_sync(
             .collect::<Vec<_>>();
         ensure_no_plugin_managed_views(folder_views.iter().copied(), "remove")?;
         for view in folder_views {
+            metadata.view_display_paths.remove(&view.id);
             roots_to_delete.push(PathBuf::from(&view.package_root));
         }
         metadata
@@ -2243,6 +2451,7 @@ pub fn delete_view_entry_sync(
         &views_root,
         metadata.folders.into_iter().collect(),
         metadata.order,
+        metadata.view_display_paths,
     )?;
 
     roots_to_delete.sort();
@@ -2257,6 +2466,7 @@ pub fn rename_view_entry_sync(
     working_dir: &str,
     request: ViewRenameEntryRequest,
 ) -> Result<ViewTreeSnapshot, String> {
+    let _guard = lock_view_mutations();
     let views_root = views_root_for_workspace(working_dir)?;
     let source_rel_path = normalize_view_tree_rel_path(&request.rel_path, false)?;
     let views = list_views_sync(working_dir)?;
@@ -2334,7 +2544,12 @@ pub fn rename_view_entry_sync(
         remap_view_tree_order_for_move(&metadata.order, &source_rel_path, &target_rel_path),
         &valid_paths,
     );
-    save_view_tree_metadata(&views_root, next_folders, next_order)?;
+    save_view_tree_metadata(
+        &views_root,
+        next_folders,
+        next_order,
+        metadata.view_display_paths,
+    )?;
     list_view_tree_sync(working_dir)
 }
 
@@ -2342,6 +2557,7 @@ pub fn move_view_entry_sync(
     working_dir: &str,
     request: ViewMoveEntryRequest,
 ) -> Result<ViewTreeSnapshot, String> {
+    let _guard = lock_view_mutations();
     let views_root = views_root_for_workspace(working_dir)?;
     let source_rel_path = normalize_view_tree_rel_path(&request.source_rel_path, false)?;
     let target_dir_rel_path = request.target_dir_rel_path.as_deref().unwrap_or("");
@@ -2370,6 +2586,8 @@ pub fn move_view_entry_sync(
         .into_iter()
         .chain(metadata.folders.iter().cloned())
         .collect::<BTreeSet<_>>();
+    let entries_before_move = view_tree_order_entries(&views, &folder_paths);
+    let valid_paths_before_move = view_tree_valid_order_paths(&views, &folder_paths);
     if !target_dir_rel_path.is_empty() && !folder_paths.contains(&target_dir_rel_path) {
         return Err(format!(
             "Target View folder not found: {}",
@@ -2384,10 +2602,15 @@ pub fn move_view_entry_sync(
     }
 
     if let Some(view) = unique_view_at_display_path(&views, &source_rel_path)? {
-        ensure_no_plugin_managed_views(std::iter::once(view), "move")?;
+        let mut next_metadata = metadata.clone();
+        let mut display_path_write: Option<String> = None;
         if source_rel_path != target_rel_path {
             ensure_display_path_available(&views, &folder_paths, &target_rel_path, Some(&view.id))?;
-            set_view_manifest_display_path(&view.package_root, &target_rel_path)?;
+            display_path_write = Some(stage_view_display_path_for_move(
+                view,
+                &target_rel_path,
+                &mut next_metadata,
+            )?);
         }
         let mut next_views = views.clone();
         for next_view in &mut next_views {
@@ -2397,12 +2620,14 @@ pub fn move_view_entry_sync(
         }
         let next_folder_paths = view_display_folder_paths(&next_views)
             .into_iter()
-            .chain(metadata.folders.iter().cloned())
+            .chain(next_metadata.folders.iter().cloned())
             .collect::<BTreeSet<_>>();
         let entries_after_move = view_tree_order_entries(&next_views, &next_folder_paths);
         let valid_paths = view_tree_valid_order_paths(&next_views, &next_folder_paths);
         let next_order = view_tree_order_after_move(
-            &metadata.order,
+            &next_metadata.order,
+            &entries_before_move,
+            &valid_paths_before_move,
             &entries_after_move,
             &valid_paths,
             &source_rel_path,
@@ -2411,10 +2636,14 @@ pub fn move_view_entry_sync(
             request.insert_before_rel_path.as_deref(),
             request.insert_after_rel_path.as_deref(),
         )?;
+        if let Some(display_path) = display_path_write.as_deref() {
+            write_view_display_path_for_move(view, display_path)?;
+        }
         save_view_tree_metadata(
             &views_root,
-            metadata.folders.into_iter().collect(),
+            next_metadata.folders.into_iter().collect(),
             next_order,
+            next_metadata.view_display_paths,
         )?;
         return list_view_tree_sync(working_dir);
     }
@@ -2433,19 +2662,25 @@ pub fn move_view_entry_sync(
 
     let moving_views = views
         .iter()
-        .filter(|view| display_path_is_under(&view.display_path, &source_rel_path))
+        .enumerate()
+        .filter(|(_, view)| display_path_is_under(&view.display_path, &source_rel_path))
         .collect::<Vec<_>>();
-    ensure_no_plugin_managed_views(moving_views.iter().copied(), "move")?;
     if source_rel_path != target_rel_path {
-        for view in &moving_views {
+        for (_, view) in &moving_views {
             let next_path =
                 replace_display_path_prefix(&view.display_path, &source_rel_path, &target_rel_path);
             ensure_display_path_available(&views, &folder_paths, &next_path, Some(&view.id))?;
         }
-        for view in moving_views {
+    }
+
+    let mut next_metadata = metadata.clone();
+    let mut display_path_writes = Vec::new();
+    if source_rel_path != target_rel_path {
+        for (view_index, view) in &moving_views {
             let next_path =
                 replace_display_path_prefix(&view.display_path, &source_rel_path, &target_rel_path);
-            set_view_manifest_display_path(&view.package_root, &next_path)?;
+            let next_path = stage_view_display_path_for_move(view, &next_path, &mut next_metadata)?;
+            display_path_writes.push((*view_index, next_path));
         }
     }
 
@@ -2458,15 +2693,15 @@ pub fn move_view_entry_sync(
     }
 
     let mut next_folders = BTreeSet::new();
-    for folder in metadata.folders {
+    for folder in &next_metadata.folders {
         if display_path_is_under(&folder, &source_rel_path) {
             next_folders.insert(replace_display_path_prefix(
-                &folder,
+                folder,
                 &source_rel_path,
                 &target_rel_path,
             ));
         } else {
-            next_folders.insert(folder);
+            next_folders.insert(folder.clone());
         }
     }
     next_folders.insert(target_rel_path.clone());
@@ -2477,7 +2712,9 @@ pub fn move_view_entry_sync(
     let entries_after_move = view_tree_order_entries(&next_views, &next_folder_paths);
     let valid_paths = view_tree_valid_order_paths(&next_views, &next_folder_paths);
     let next_order = view_tree_order_after_move(
-        &metadata.order,
+        &next_metadata.order,
+        &entries_before_move,
+        &valid_paths_before_move,
         &entries_after_move,
         &valid_paths,
         &source_rel_path,
@@ -2486,7 +2723,15 @@ pub fn move_view_entry_sync(
         request.insert_before_rel_path.as_deref(),
         request.insert_after_rel_path.as_deref(),
     )?;
-    save_view_tree_metadata(&views_root, next_folders, next_order)?;
+    for (view_index, display_path) in display_path_writes {
+        write_view_display_path_for_move(&views[view_index], &display_path)?;
+    }
+    save_view_tree_metadata(
+        &views_root,
+        next_folders,
+        next_order,
+        next_metadata.view_display_paths,
+    )?;
     list_view_tree_sync(working_dir)
 }
 
@@ -2698,6 +2943,7 @@ pub(crate) fn copy_view_package_for_plugin_sync(
     Ok(ViewPluginExportCopy {
         id: manifest.id,
         file_count,
+        source_root: root,
     })
 }
 
@@ -2901,6 +3147,7 @@ pub fn import_view_package_sync(
     working_dir: &str,
     request: ViewImportPackageRequest,
 ) -> Result<ViewPackageImportResult, String> {
+    let _guard = lock_view_mutations();
     let archive_path = PathBuf::from(request.file_path.trim());
     if archive_path.as_os_str().is_empty() {
         return Err("Import path cannot be empty.".to_string());
@@ -2986,6 +3233,7 @@ pub fn create_view_sync_with_scope(
     request: ViewCreateRequest,
     temporary: bool,
 ) -> Result<ViewPackageDetail, String> {
+    let _guard = lock_view_mutations();
     let requested_id = normalize_view_id(&request.id)?;
     let id = if temporary {
         unique_temporary_view_id(&requested_id)
@@ -5217,9 +5465,34 @@ pub fn emit_view_tree_changed(app_handle: &AppHandle) {
     let _ = app_handle.emit(VIEW_TREE_CHANGED_EVENT, serde_json::json!({}));
 }
 
-fn view_file_watcher_keys() -> &'static Mutex<BTreeSet<String>> {
-    static WATCHERS: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
-    WATCHERS.get_or_init(|| Mutex::new(BTreeSet::new()))
+struct ViewFileWatcherHandle {
+    roots: Vec<PathBuf>,
+    cancel: Arc<AtomicBool>,
+}
+
+fn view_file_watchers() -> &'static Mutex<HashMap<String, ViewFileWatcherHandle>> {
+    static WATCHERS: OnceLock<Mutex<HashMap<String, ViewFileWatcherHandle>>> = OnceLock::new();
+    WATCHERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+// Cancels watchers whose watched root lives under `target` so that deleting
+// or transferring a package releases its watcher thread instead of leaking it
+// for the rest of the process lifetime.
+pub(crate) fn stop_view_file_watchers_under(target: &Path) {
+    let target = canonical_view_watch_path(target);
+    let Ok(mut watchers) = view_file_watchers().lock() else {
+        return;
+    };
+    watchers.retain(|_, handle| {
+        let cancelled = handle
+            .roots
+            .iter()
+            .any(|root| root == &target || root.starts_with(&target));
+        if cancelled {
+            handle.cancel.store(true, Ordering::Relaxed);
+        }
+        !cancelled
+    });
 }
 
 fn should_reload_for_view_event(event: &notify::Event) -> bool {
@@ -5285,13 +5558,21 @@ fn start_view_file_watcher(
         .map(|root| root.display().to_string().replace('\\', "/"))
         .collect::<Vec<_>>()
         .join("|");
+    let cancel = Arc::new(AtomicBool::new(false));
     {
-        let mut keys = view_file_watcher_keys()
+        let mut watchers = view_file_watchers()
             .lock()
             .map_err(|_| "View file watcher registry is poisoned.".to_string())?;
-        if !keys.insert(key.clone()) {
+        if watchers.contains_key(&key) {
             return Ok(());
         }
+        watchers.insert(
+            key.clone(),
+            ViewFileWatcherHandle {
+                roots: roots.clone(),
+                cancel: cancel.clone(),
+            },
+        );
     }
 
     let app_handle = app_handle.clone();
@@ -5307,19 +5588,20 @@ fn start_view_file_watcher(
     ) {
         Ok(watcher) => watcher,
         Err(error) => {
-            remove_view_file_watcher_key(&key);
+            remove_view_file_watcher_entry(&key, &cancel);
             return Err(format!("Failed to create watcher: {}", error));
         }
     };
 
     for root in &roots {
         if let Err(error) = watcher.watch(root, RecursiveMode::Recursive) {
-            remove_view_file_watcher_key(&key);
+            remove_view_file_watcher_entry(&key, &cancel);
             return Err(format!("Failed to watch {}: {}", root.display(), error));
         }
     }
 
     let key_for_thread = key.clone();
+    let cancel_for_thread = cancel.clone();
     match std::thread::Builder::new()
         .name(thread_name)
         .spawn(move || {
@@ -5327,6 +5609,10 @@ fn start_view_file_watcher(
             let mut pending = false;
             let mut last_event_at = Instant::now();
             loop {
+                if cancel_for_thread.load(Ordering::Relaxed) {
+                    remove_view_file_watcher_entry(&key_for_thread, &cancel_for_thread);
+                    break;
+                }
                 match rx.recv_timeout(Duration::from_millis(160)) {
                     Ok(Ok(event)) => {
                         if should_reload_for_view_event(&event) {
@@ -5350,7 +5636,7 @@ fn start_view_file_watcher(
                         }
                     }
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                        remove_view_file_watcher_key(&key_for_thread);
+                        remove_view_file_watcher_entry(&key_for_thread, &cancel_for_thread);
                         break;
                     }
                 }
@@ -5358,15 +5644,24 @@ fn start_view_file_watcher(
         }) {
         Ok(_) => Ok(()),
         Err(error) => {
-            remove_view_file_watcher_key(&key);
+            remove_view_file_watcher_entry(&key, &cancel);
             Err(format!("Failed to spawn watcher thread: {}", error))
         }
     }
 }
 
-fn remove_view_file_watcher_key(key: &str) {
-    if let Ok(mut keys) = view_file_watcher_keys().lock() {
-        keys.remove(key);
+// Only removes the entry if it still belongs to this watcher instance: a
+// cancelled key may have been re-registered by a fresh watcher in the
+// meantime, and that newer registration must survive.
+fn remove_view_file_watcher_entry(key: &str, cancel: &Arc<AtomicBool>) {
+    if let Ok(mut watchers) = view_file_watchers().lock() {
+        let owned = watchers
+            .get(key)
+            .map(|handle| Arc::ptr_eq(&handle.cancel, cancel))
+            .unwrap_or(false);
+        if owned {
+            watchers.remove(key);
+        }
     }
 }
 
@@ -5521,6 +5816,21 @@ fn view_storage_lock() -> &'static Mutex<()> {
     VIEW_STORAGE_LOCK.get_or_init(|| Mutex::new(()))
 }
 
+// Serializes View registry mutations: the tree-metadata read-modify-write
+// cycles and the duplicate-id scan that precedes package creation/import.
+// Without it concurrent tree operations drop each other's updates. Must never
+// be taken by a function that is itself called while the lock is held.
+fn view_mutation_lock() -> &'static Mutex<()> {
+    static VIEW_MUTATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    VIEW_MUTATION_LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn lock_view_mutations() -> std::sync::MutexGuard<'static, ()> {
+    view_mutation_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 fn normalize_view_storage_key(key: &str) -> Result<String, String> {
     let normalized = key.trim();
     if normalized.is_empty() {
@@ -5549,6 +5859,23 @@ fn storage_path_for_view(working_dir: &str, view_id: &str) -> Result<PathBuf, St
         ));
     }
     package_path(&root, VIEW_STORAGE_REL_PATH)
+}
+
+// Write-then-rename so a crash mid-write never leaves a truncated JSON file
+// behind; a half-written storage or tree file would fail every later read.
+fn write_text_file_atomic(path: &Path, contents: &str) -> Result<(), String> {
+    let mut tmp_name = path
+        .file_name()
+        .map(|name| name.to_os_string())
+        .ok_or_else(|| format!("Invalid file path: {}", path.display()))?;
+    tmp_name.push(".tmp");
+    let tmp_path = path.with_file_name(tmp_name);
+    std::fs::write(&tmp_path, contents)
+        .map_err(|error| format!("Failed to write {}: {}", tmp_path.display(), error))?;
+    std::fs::rename(&tmp_path, path).map_err(|error| {
+        let _ = std::fs::remove_file(&tmp_path);
+        format!("Failed to replace {}: {}", path.display(), error)
+    })
 }
 
 fn read_view_storage_file(
@@ -5590,8 +5917,7 @@ fn write_view_storage_file(
     }
     let json = serde_json::to_string_pretty(storage)
         .map_err(|error| format!("Failed to serialize View storage: {}", error))?;
-    std::fs::write(path, json + "\n")
-        .map_err(|error| format!("Failed to write {}: {}", path.display(), error))
+    write_text_file_atomic(path, &(json + "\n"))
 }
 
 pub fn view_storage_get_sync(
@@ -6155,6 +6481,19 @@ mod tests {
     }
 
     #[test]
+    fn view_id_validation_rejects_reserved_window_label_prefixes() {
+        assert!(!is_valid_view_id("content"));
+        assert!(!is_valid_view_id("content-foo"));
+        assert!(!is_valid_view_id("pool"));
+        assert!(!is_valid_view_id("pool-1"));
+        assert!(is_valid_view_id("contents-panel"));
+        assert!(is_valid_view_id("pooled-table"));
+        assert!(super::normalize_view_id("content-foo")
+            .unwrap_err()
+            .contains("reserved"));
+    }
+
+    #[test]
     fn package_relative_path_rejects_escapes_and_absolute_paths() {
         assert_eq!(
             normalize_package_rel_path("src\\App.vue").unwrap(),
@@ -6168,7 +6507,7 @@ mod tests {
     }
 
     #[test]
-    fn list_views_sync_reads_project_plugin_views_and_blocks_entry_delete() {
+    fn list_views_sync_reads_project_plugin_views_moves_display_path_and_blocks_entry_delete() {
         let temp = tempdir().unwrap();
         let working_dir = temp.path().to_string_lossy().to_string();
         let plugin_root = temp
@@ -6227,10 +6566,43 @@ mod tests {
             view_root
         );
 
+        create_view_folder_sync(
+            &working_dir,
+            super::ViewCreateFolderRequest {
+                parent_rel_path: None,
+                name: "Tools".to_string(),
+            },
+        )
+        .expect("create user folder");
+        let moved = move_view_entry_sync(
+            &working_dir,
+            super::ViewMoveEntryRequest {
+                source_rel_path: view.display_path.clone(),
+                target_dir_rel_path: Some("Tools".to_string()),
+                insert_before_rel_path: None,
+                insert_after_rel_path: None,
+            },
+        )
+        .expect("plugin view display path can move");
+        assert!(moved
+            .views
+            .iter()
+            .any(|view| view.id == "plugin-asset-inspector"
+                && view.display_path == "Tools/asset-inspector"));
+        let plugin_manifest_raw = std::fs::read_to_string(view_root.join("view.json")).unwrap();
+        assert!(!plugin_manifest_raw.contains("\"displayPath\""));
+
+        let listed_after_move = list_views_sync(&working_dir).expect("list moved plugin view");
+        let moved_view = listed_after_move
+            .iter()
+            .find(|view| view.id == "plugin-asset-inspector")
+            .expect("moved plugin view should be listed");
+        assert_eq!(moved_view.display_path, "Tools/asset-inspector");
+
         let delete_error = delete_view_entry_sync(
             &working_dir,
             super::ViewDeleteEntryRequest {
-                rel_path: view.display_path.clone(),
+                rel_path: moved_view.display_path.clone(),
             },
         )
         .expect_err("plugin views should be removed through plugin uninstall");
@@ -6239,7 +6611,7 @@ mod tests {
         let rename_error = rename_view_entry_sync(
             &working_dir,
             super::ViewRenameEntryRequest {
-                rel_path: view.display_path.clone(),
+                rel_path: moved_view.display_path.clone(),
                 name: "Renamed".to_string(),
             },
         )
@@ -6366,6 +6738,14 @@ mod tests {
             requirements: None,
         };
         validate_view_manifest(&manifest).unwrap();
+
+        // apiVersion records the creating app version and is not a
+        // compatibility gate: any non-empty version must stay loadable.
+        manifest.api_version = "v0.1.0".to_string();
+        validate_view_manifest(&manifest).unwrap();
+        manifest.api_version = "  ".to_string();
+        assert!(validate_view_manifest(&manifest).is_err());
+        manifest.api_version = VIEW_API_VERSION.to_string();
 
         manifest.entry = "../main.ts".to_string();
         assert!(validate_view_manifest(&manifest).is_err());
@@ -7008,7 +7388,19 @@ mod tests {
         assert!(!default_test_view_package_root(&working_dir)
             .join("material-inspector")
             .exists());
-        assert!(deleted.views.is_empty());
+        // Plugin-managed views from globally installed plugins may be listed
+        // on developer machines; only workspace views must be gone.
+        let workspace_views = deleted
+            .views
+            .iter()
+            .filter(|view| !super::view_is_plugin_managed(view))
+            .map(|view| (view.id.clone(), view.package_root.clone()))
+            .collect::<Vec<_>>();
+        assert!(
+            workspace_views.is_empty(),
+            "expected no workspace views after folder delete, found: {:?}",
+            workspace_views
+        );
         assert!(!deleted.folders.iter().any(|item| item.rel_path == "Tools"));
     }
 
@@ -7097,6 +7489,98 @@ mod tests {
             .views
             .iter()
             .any(|view| view.display_path == "Tools/bravo-view"));
+    }
+
+    #[test]
+    fn view_tree_move_single_child_before_removed_parent_folder_succeeds() {
+        let temp = tempdir().unwrap();
+        let working_dir = temp.path().to_string_lossy().to_string();
+
+        create_view_sync(
+            &working_dir,
+            super::ViewCreateRequest {
+                id: "locus-workspace".to_string(),
+                package_name: None,
+                name: Some("Locus Workspace".to_string()),
+                template: Some("blank".to_string()),
+                icon: None,
+                display_path: Some("Tools/Locus Workspace".to_string()),
+            },
+        )
+        .expect("create view inside implicit folder");
+        create_view_sync(
+            &working_dir,
+            super::ViewCreateRequest {
+                id: "hello-view".to_string(),
+                package_name: None,
+                name: Some("Hello View".to_string()),
+                template: Some("blank".to_string()),
+                icon: None,
+                display_path: Some("Hello View".to_string()),
+            },
+        )
+        .expect("create root sibling");
+
+        let moved = move_view_entry_sync(
+            &working_dir,
+            super::ViewMoveEntryRequest {
+                source_rel_path: "Tools/Locus Workspace".to_string(),
+                target_dir_rel_path: Some(String::new()),
+                insert_before_rel_path: Some("Tools".to_string()),
+                insert_after_rel_path: None,
+            },
+        )
+        .expect("move view before its removed implicit parent folder");
+
+        assert!(moved
+            .views
+            .iter()
+            .any(|view| view.id == "locus-workspace" && view.display_path == "Locus Workspace"));
+        assert!(!moved
+            .folders
+            .iter()
+            .any(|folder| folder.rel_path == "Tools"));
+        assert!(!moved
+            .order
+            .iter()
+            .any(|path| path == "Tools/Locus Workspace"));
+        assert!(!moved.order.iter().any(|path| path == "Tools"));
+    }
+
+    #[test]
+    fn view_tree_move_invalid_anchor_does_not_change_display_path() {
+        let temp = tempdir().unwrap();
+        let working_dir = temp.path().to_string_lossy().to_string();
+
+        create_view_sync(
+            &working_dir,
+            super::ViewCreateRequest {
+                id: "locus-workspace".to_string(),
+                package_name: None,
+                name: Some("Locus Workspace".to_string()),
+                template: Some("blank".to_string()),
+                icon: None,
+                display_path: Some("Tools/Locus Workspace".to_string()),
+            },
+        )
+        .expect("create view inside folder");
+
+        let err = move_view_entry_sync(
+            &working_dir,
+            super::ViewMoveEntryRequest {
+                source_rel_path: "Tools/Locus Workspace".to_string(),
+                target_dir_rel_path: Some(String::new()),
+                insert_before_rel_path: Some("Missing".to_string()),
+                insert_after_rel_path: None,
+            },
+        )
+        .expect_err("invalid anchor should fail");
+        assert!(err.contains("View insert anchor not found: Missing"));
+
+        let listed = list_view_tree_sync(&working_dir).expect("list view tree after failed move");
+        assert!(listed.views.iter().any(
+            |view| view.id == "locus-workspace" && view.display_path == "Tools/Locus Workspace"
+        ));
     }
 
     #[test]

@@ -12,13 +12,18 @@ describe("View sidebar settings", () => {
   it("keeps the bundled /view skill display name short", () => {
     const manifest = JSON.parse(read("skills/view/skill.json")) as {
       name: string;
+      injectMode?: string;
+      description?: string;
       command?: { trigger?: string };
     };
     const skill = read("skills/view/SKILL.md");
 
     expect(manifest.name).toBe("View");
+    expect(manifest.injectMode).toBe("excerpt");
+    expect(manifest.description).toContain("build or edit a Locus View");
     expect(manifest.command?.trigger).toBe("/view");
     expect(skill).toContain("# View");
+    expect(skill).toContain("## L1");
     expect(skill).not.toContain("# View Package");
   });
 
@@ -78,7 +83,7 @@ describe("View sidebar settings", () => {
     expect(zh).toContain('"view.tree.rename": "重命名"');
     expect(en).toContain('"view.tree.createFolder": "New Folder"');
     expect(en).toContain('"view.tree.rename": "Rename"');
-    expect(zh).toContain('"view.action.reveal": "在文件游览器中显示"');
+    expect(zh).toContain('"view.action.reveal": "在文件浏览器中显示"');
     expect(en).toContain('"view.action.reveal": "Show in File Explorer"');
   });
 
@@ -123,6 +128,24 @@ describe("View sidebar settings", () => {
     expect(viewPage).toContain("beginRenameFromContext");
     expect(viewPage).toContain("class=\"view-tree-create-actions\"");
     expect(viewPage).toContain("view.tree.deleteConfirmMessage");
+    expect(viewPage).toContain("return !!node.relPath.trim();");
+  });
+
+  it("closes View context menus around delete confirmation", () => {
+    const sessionPanel = read("src/components/chat/SessionPanel.vue");
+    const viewPage = read("src/components/ViewPackageView.vue");
+
+    expect(sessionPanel).toContain("interface ViewDeleteConfirmState");
+    expect(sessionPanel).toMatch(/viewDeleteConfirm\.value = \{\r?\n\s+x: menu\.x,\r?\n\s+y: menu\.y,\r?\n\s+node: menu\.node,\r?\n\s+\};\r?\n\s+closeViewContextMenu\(\);/);
+    expect(sessionPanel).toMatch(/\} finally \{\r?\n\s+closeViewDeleteConfirm\(\);\r?\n\s+\}/);
+    expect(sessionPanel).toContain('v-if="viewDeleteConfirm"');
+    expect(sessionPanel).toContain("viewDeleteConfirm.node.label");
+
+    expect(viewPage).toContain("interface ViewDeleteConfirmState");
+    expect(viewPage).toMatch(/deleteConfirm\.value = \{\r?\n\s+x: menu\.x,\r?\n\s+y: menu\.y,\r?\n\s+node: menu\.node,\r?\n\s+\};\r?\n\s+closeContextMenu\(\);/);
+    expect(viewPage).toMatch(/\} finally \{\r?\n\s+closeDeleteConfirm\(\);\r?\n\s+\}/);
+    expect(viewPage).toContain('v-if="deleteConfirm"');
+    expect(viewPage).toContain("deleteConfirm.node.label");
   });
 
   it("lets view_create create temporary packages outside the visible View tree", () => {

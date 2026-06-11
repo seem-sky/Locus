@@ -69,6 +69,48 @@ export interface ToolCallInfo {
   executionMeta?: ToolExecutionMeta;
 }
 
+export type ToolCallOutcome = "done" | "error" | "interrupted";
+
+export interface RenderOrderKey {
+  runId: string;
+  seq: number;
+}
+
+export type AssistantRenderPart =
+  | {
+      kind: "thinking";
+      id: string;
+      order: RenderOrderKey;
+      content: string;
+      active?: boolean;
+      duration?: number;
+      signature?: string;
+    }
+  | {
+      kind: "text";
+      id: string;
+      order: RenderOrderKey;
+      content: string;
+    }
+  | {
+      kind: "toolCall";
+      id: string;
+      order: RenderOrderKey;
+      toolCall: ToolCallInfo;
+    }
+  | {
+      kind: "knowledgeProposal";
+      id: string;
+      order: RenderOrderKey;
+      message: ChatMessage;
+    }
+  | {
+      kind: "memoryProposal";
+      id: string;
+      order: RenderOrderKey;
+      message: ChatMessage;
+    };
+
 export interface ImageAttachment {
   data: string;
   mimeType: string;
@@ -131,48 +173,6 @@ export interface SkillIntentItem {
   name: string;
 }
 
-export type ToolCallOutcome = "done" | "error" | "interrupted";
-
-export interface RenderOrderKey {
-  runId: string;
-  seq: number;
-}
-
-export type AssistantRenderPart =
-  | {
-      kind: "thinking";
-      id: string;
-      order: RenderOrderKey;
-      content: string;
-      active?: boolean;
-      duration?: number;
-      signature?: string;
-    }
-  | {
-      kind: "text";
-      id: string;
-      order: RenderOrderKey;
-      content: string;
-    }
-  | {
-      kind: "toolCall";
-      id: string;
-      order: RenderOrderKey;
-      toolCall: ToolCallInfo;
-    }
-  | {
-      kind: "knowledgeProposal";
-      id: string;
-      order: RenderOrderKey;
-      message: ChatMessage;
-    }
-  | {
-      kind: "memoryProposal";
-      id: string;
-      order: RenderOrderKey;
-      message: ChatMessage;
-    };
-
 export interface UserIntentMeta {
   kind: "user_intent_v1";
   mode: "build" | "plan";
@@ -210,6 +210,17 @@ export interface KnowledgeProposalItem {
 }
 
 export interface KnowledgeProposal {
+  proposalId: string;
+  status: KnowledgeProposalStatus;
+  confidence: number;
+  verify: KnowledgeProposalVerify;
+  estTokens: number;
+  items: KnowledgeProposalItem[];
+  createdAt: number;
+  updatedAt: number;
+}
+
+
   proposalId: string;
   status: KnowledgeProposalStatus;
   confidence: number;
@@ -601,13 +612,6 @@ export interface HeadroomProxyRuntimeStatus {
   error?: string;
 }
 
-export interface HeadroomSettingsStatus {
-  settings: HeadroomSettings;
-  libraryAvailable: boolean;
-  contextLibraryAvailable: boolean;
-  proxy: HeadroomProxyRuntimeStatus;
-}
-
 export interface AuthUrlInfo {
   url: string;
 }
@@ -870,6 +874,7 @@ export type StreamEvent = { runId: string } & (
       toolCallId: string;
       question: string;
       options: AskOption[];
+      sheet?: SheetRequest | null;
     }
   | {
       type: "toolConfirm";
@@ -885,6 +890,8 @@ export type StreamEvent = { runId: string } & (
       sessionId: string;
       contextTokens: number;
       contextLimit: number;
+      /** "reactive" means the server rejected the request as over the window. */
+      trigger?: "auto" | "manual" | "reactive";
     }
   | {
       type: "compactDone";
@@ -903,6 +910,8 @@ export type StreamEvent = { runId: string } & (
       thinkingContent?: string | null;
       thinkingDuration?: number | null;
       renderParts?: AssistantRenderPart[] | null;
+      /** The user message revoked by a cancel that produced no assistant output. */
+      removedUserMessage?: ChatMessage | null;
     }
   | {
       type: "done";
@@ -921,6 +930,22 @@ export interface AskOption {
   description: string;
 }
 
+export interface SheetField {
+  key: string;
+  label: string;
+  value: string;
+  description?: string | null;
+  multiline?: boolean;
+  options?: string[];
+  readonly?: boolean;
+}
+
+export interface SheetRequest {
+  description?: string | null;
+  confirmLabel?: string | null;
+  fields: SheetField[];
+}
+
 export type PluginStatus =
   | { status: "missing" }
   | { status: "outdated" }
@@ -931,6 +956,7 @@ export interface PendingQuestion {
   toolCallId: string;
   question: string;
   options: AskOption[];
+  sheet?: SheetRequest | null;
 }
 
 export interface PendingToolConfirm {
@@ -945,9 +971,6 @@ export interface BasicToolConfirmDisplay {
   kind: "basic";
   toolName: string;
   arguments: string;
-  workflowNote?: string;
-  /** READ/PLAN ambiguous tool confirm — offer session whitelist. */
-  workflowWhitelistOffered?: boolean;
 }
 
 export type KnowledgeToolConfirmDirectoryMode = "auto" | "approval";
@@ -1029,8 +1052,9 @@ export interface SkillManifest {
 export interface SkillConfig {
   enabled: boolean;
   surface: SkillSurface;
-  description: string;
-  commandTrigger: string;
+  /** Omitted fields keep their stored workspace override untouched. */
+  description?: string;
+  commandTrigger?: string;
   injectMode?: KnowledgeInjectMode;
 }
 
@@ -1965,12 +1989,16 @@ export interface VcsRevisionRef {
 // ---------------------------------------------------------------------------
 
 export interface RuleItem {
+  key: string;
   fileName: string;
   title: string;
   order: number;
   enabled: boolean;
   updatedAt: number;
   source: string;
+  readOnly: boolean;
+  pluginId?: string | null;
+  pluginScope?: "app" | "project" | string | null;
 }
 
 export interface AgentSystemPromptStats {
@@ -2016,6 +2044,8 @@ export interface VcsUndoEntry {
   assistantMessageId: string;
   runId?: string | null;
   checkpoint: VcsCheckpoint;
+  workingDir?: string;
+  afterStateId?: string | null;
   changedFiles: ChangedFile[];
   hasUnityExecute: boolean;
   consumed: boolean;

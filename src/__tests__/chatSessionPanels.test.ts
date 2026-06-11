@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createPinia, setActivePinia } from "pinia";
 import { useChatStore } from "../stores/chat";
 import { useChatChangesStore } from "../stores/chatChanges";
+import { useUiStore } from "../stores/ui";
 import type { TodoItem, TodoSnapshot } from "../types";
 
 const sessionServiceMocks = vi.hoisted(() => ({
@@ -35,9 +36,17 @@ const undoServiceMocks = vi.hoisted(() => ({
   undoList: vi.fn(),
   undoPerform: vi.fn(),
   undoPerformToMessage: vi.fn(),
+  undoCheckDirty: vi.fn(),
 }));
 
 const displaySettingsState = vi.hoisted(() => ({
+  showWelcomeSubtitle: true,
+  showKnowledgeTab: true,
+  showCollabTab: true,
+  showAssetTab: true,
+  showViewsTab: true,
+  showPluginsTab: true,
+  showAgentTab: true,
   todoAutoOpen: true,
   changesAutoOpen: true,
   changesAutoClose: true,
@@ -159,6 +168,13 @@ describe("chat session panel state", () => {
     vi.resetAllMocks();
 
     displaySettingsState.todoAutoOpen = true;
+    displaySettingsState.showWelcomeSubtitle = true;
+    displaySettingsState.showKnowledgeTab = true;
+    displaySettingsState.showCollabTab = true;
+    displaySettingsState.showAssetTab = true;
+    displaySettingsState.showViewsTab = true;
+    displaySettingsState.showPluginsTab = true;
+    displaySettingsState.showAgentTab = true;
     displaySettingsState.changesAutoOpen = true;
     displaySettingsState.changesAutoClose = true;
     displaySettingsState.fileChangePopoverEnabled = true;
@@ -258,6 +274,7 @@ describe("chat session panel state", () => {
     undoServiceMocks.undoList.mockImplementation(async (sessionId: string) => undoData[sessionId] ?? []);
     undoServiceMocks.undoPerform.mockResolvedValue(undefined);
     undoServiceMocks.undoPerformToMessage.mockResolvedValue(undefined);
+    undoServiceMocks.undoCheckDirty.mockResolvedValue([]);
   });
 
   it("keeps historical todos closed on first session switch and allows manual reopen", async () => {
@@ -503,11 +520,98 @@ describe("chat session panel state", () => {
     await chatStore.selectSession("s1");
 
     expect(changesStore.latestTurnRounds).toHaveLength(2);
-    expect(changesStore.latestTurnFiles.map((file) => file.path)).toEqual([
+    expect(changesStore.latestTurnFiles.map((file) => file.finalPath)).toEqual([
       "src/gamma.ts",
       "src/delta.ts",
     ]);
     expect(changesStore.currentFileCount).toBe(2);
+  });
+
+  it("nets out files created then deleted within the same run in current mode", async () => {
+    const chatStore = useChatStore();
+    const changesStore = useChatChangesStore();
+
+    undoData.s1 = [
+      makeUndoEntry("s1", "src/temp.ts", {
+        assistantMessageId: "msg-create",
+        runId: "run-a",
+        createdAt: 1,
+        status: "A",
+      }),
+      makeUndoEntry("s1", "src/kept.ts", {
+        assistantMessageId: "msg-add-kept",
+        runId: "run-a",
+        createdAt: 2,
+        status: "A",
+      }),
+      makeUndoEntry("s1", "src/temp.ts", {
+        assistantMessageId: "msg-delete",
+        runId: "run-a",
+        createdAt: 3,
+        status: "D",
+      }),
+      makeUndoEntry("s1", "src/kept.ts", {
+        assistantMessageId: "msg-edit-kept",
+        runId: "run-a",
+        createdAt: 4,
+        status: "M",
+      }),
+    ];
+
+    await chatStore.selectSession("s1");
+
+    expect(changesStore.latestTurnRounds).toHaveLength(4);
+    // temp.ts was created and deleted within the run, so it nets out; kept.ts
+    // stays "A" because it is new relative to the run start even though the
+    // last round reported "M".
+    expect(
+      changesStore.latestTurnFiles.map((file) => [file.finalPath, file.status]),
+    ).toEqual([["src/kept.ts", "A"]]);
+    expect(changesStore.currentFileCount).toBe(1);
+
+    changesStore.setMode("all");
+    expect(
+      changesStore.currentFiles.map((file) => [file.finalPath, file.status]),
+    ).toEqual([["src/kept.ts", "A"]]);
+  });
+
+  it("keeps hasAnyChanges when the latest run's changes net out", async () => {
+    const chatStore = useChatStore();
+    const changesStore = useChatChangesStore();
+
+    undoData.s1 = [
+      makeUndoEntry("s1", "src/old.ts", {
+        assistantMessageId: "msg-old",
+        runId: "run-old",
+        createdAt: 1,
+      }),
+      makeUndoEntry("s1", "src/temp.ts", {
+        assistantMessageId: "msg-create",
+        runId: "run-new",
+        createdAt: 2,
+        status: "A",
+      }),
+      makeUndoEntry("s1", "src/temp.ts", {
+        assistantMessageId: "msg-delete",
+        runId: "run-new",
+        createdAt: 3,
+        status: "D",
+      }),
+    ];
+    latestCompletedRunIdData.s1 = "run-new";
+
+    await chatStore.selectSession("s1");
+
+    expect(changesStore.latestTurnRounds).toHaveLength(2);
+    expect(changesStore.latestTurnFiles).toEqual([]);
+    expect(changesStore.currentFileCount).toBe(0);
+    // The "all" view still has content, so the panel toggle must stay reachable.
+    expect(changesStore.hasAnyChanges).toBe(true);
+
+    changesStore.setMode("all");
+    expect(changesStore.currentFiles.map((file) => file.finalPath)).toEqual([
+      "src/old.ts",
+    ]);
   });
 
   it("shows an empty current round when the latest completed run has no undo entry", async () => {
@@ -539,7 +643,7 @@ describe("chat session panel state", () => {
 
     changesStore.setMode("all");
     expect(changesStore.currentFileCount).toBe(1);
-    expect(changesStore.currentFiles.map((file) => "finalPath" in file ? file.finalPath : file.path)).toEqual([
+    expect(changesStore.currentFiles.map((file) => file.finalPath)).toEqual([
       "src/changed.ts",
     ]);
   });
@@ -579,7 +683,7 @@ describe("chat session panel state", () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
 
     expect(changesStore.latestTurnRounds).toHaveLength(1);
-    expect(changesStore.latestTurnFiles.map((file) => file.path)).toEqual([
+    expect(changesStore.latestTurnFiles.map((file) => file.finalPath)).toEqual([
       "src/cancelled.ts",
     ]);
     expect(changesStore.currentFileCount).toBe(1);
@@ -612,7 +716,7 @@ describe("chat session panel state", () => {
     await chatStore.selectSession("s1");
 
     expect(changesStore.latestTurnRounds).toHaveLength(2);
-    expect(changesStore.latestTurnFiles.map((file) => file.path)).toEqual([
+    expect(changesStore.latestTurnFiles.map((file) => file.finalPath)).toEqual([
       "src/alpha.ts",
       "src/beta.ts",
     ]);
@@ -663,7 +767,7 @@ describe("chat session panel state", () => {
 
     expect(changesStore.currentPanelVisible).toBe(true);
     expect(changesStore.latestTurnRounds).toHaveLength(1);
-    expect(changesStore.latestTurnFiles.map((file) => file.path)).toEqual([
+    expect(changesStore.latestTurnFiles.map((file) => file.finalPath)).toEqual([
       "src/live.ts",
     ]);
     expect(changesStore.currentFileCount).toBe(1);
@@ -1604,12 +1708,232 @@ describe("chat session panel state", () => {
 
   it("removes the local pending user message when chat launch fails", async () => {
     const chatStore = useChatStore();
+    const uiStore = useUiStore();
     sessionServiceMocks.chat.mockRejectedValueOnce(new Error("session locked"));
 
     await chatStore.sendMessage("will fail");
 
     expect(chatStore.isStreaming).toBe(false);
     expect(chatStore.messages).toEqual([]);
+    expect(uiStore.pendingChatPrefill?.draft?.text).toBe("will fail");
+    expect(uiStore.pendingChatPrefill?.sessionId).toBeNull();
+    expect(uiStore.pendingChatPrefill?.requireEmptyComposer).toBe(true);
+  });
+
+  it("restores attachments and intent to the composer draft when chat launch fails", async () => {
+    const chatStore = useChatStore();
+    const uiStore = useUiStore();
+    sessionServiceMocks.chat.mockRejectedValueOnce(new Error("missing token"));
+
+    await chatStore.sendMessage(
+      "prompt text",
+      [{ data: "data:image/png;base64,abc", mimeType: "image/png" }],
+      [{ kind: "asset", path: "Assets/Foo.prefab" }],
+      {
+        mode: "plan",
+        displayText: "visible text",
+        userIntent: {
+          kind: "user_intent_v1",
+          mode: "plan",
+          skills: [{ dirName: "view", source: "project", name: "View" }],
+        },
+      },
+    );
+
+    const draft = uiStore.pendingChatPrefill?.draft;
+    expect(draft?.text).toBe("visible text");
+    expect(draft?.images).toHaveLength(1);
+    expect(draft?.assetRefs[0]).toMatchObject({ kind: "asset", path: "Assets/Foo.prefab" });
+    expect(draft?.intent.mode).toBe("plan");
+    expect(draft?.intent.skills).toEqual([{ dirName: "view", source: "project", name: "View" }]);
+    expect(uiStore.pendingChatPrefill?.requireEmptyComposer).toBe(true);
+  });
+
+  it("restores the pending user draft when a run errors before the user message is persisted", async () => {
+    const chatStore = useChatStore();
+    const uiStore = useUiStore();
+    sessionServiceMocks.chat.mockResolvedValueOnce({ sessionId: "s1", runId: "run-before-user" });
+
+    await chatStore.sendMessage("before persistence");
+    expect(chatStore.messages[0]?.content).toBe("before persistence");
+
+    chatStore.handleStreamEvent({
+      runId: "run-before-user",
+      type: "error",
+      sessionId: "s1",
+      error: {
+        code: "chat.stream_failed",
+        message: "failed before user event",
+        retryable: false,
+        severity: "error",
+      },
+    });
+
+    await vi.waitFor(() => {
+      expect(uiStore.pendingChatPrefill?.draft?.text).toBe("before persistence");
+    });
+    expect(uiStore.pendingChatPrefill?.sessionId).toBe("s1");
+    expect(uiStore.pendingChatPrefill?.requireEmptyComposer).toBe(true);
+    expect(chatStore.messages).toEqual([]);
+  });
+
+  it("restores the pending user draft when a run is cancelled before the user message is persisted", async () => {
+    const chatStore = useChatStore();
+    const uiStore = useUiStore();
+    sessionServiceMocks.chat.mockResolvedValueOnce({ sessionId: "s1", runId: "run-cancel-early" });
+    sessionServiceMocks.listSessions.mockResolvedValue([
+      {
+        id: "s1",
+        title: "Cancel session",
+        agentId: null,
+        sessionType: "chat",
+        updatedAt: 1,
+        runtimeStatus: "running",
+      },
+    ]);
+
+    await chatStore.sendMessage("cancelled before persistence");
+    expect(chatStore.messages[0]?.content).toBe("cancelled before persistence");
+
+    chatStore.handleStreamEvent({
+      runId: "run-cancel-early",
+      type: "cancelled",
+      sessionId: "s1",
+    });
+
+    await vi.waitFor(() => {
+      expect(uiStore.pendingChatPrefill?.draft?.text).toBe("cancelled before persistence");
+    });
+    expect(uiStore.pendingChatPrefill?.sessionId).toBe("s1");
+    expect(uiStore.pendingChatPrefill?.requireEmptyComposer).toBe(true);
+    expect(chatStore.messages).toEqual([]);
+    expect(chatStore.isStreaming).toBe(false);
+  });
+
+  it("keeps the persisted user message when a run is cancelled after the user message event", async () => {
+    const chatStore = useChatStore();
+    const uiStore = useUiStore();
+    sessionServiceMocks.chat.mockResolvedValueOnce({ sessionId: "s1", runId: "run-cancel-late" });
+    sessionServiceMocks.listSessions.mockResolvedValue([
+      {
+        id: "s1",
+        title: "Cancel session",
+        agentId: null,
+        sessionType: "chat",
+        updatedAt: 1,
+        runtimeStatus: "running",
+      },
+    ]);
+
+    await chatStore.sendMessage("persisted before cancel");
+    const pendingMessage = chatStore.messages.find((message) => message.role === "user");
+
+    chatStore.handleStreamEvent({
+      runId: "run-cancel-late",
+      type: "userMessage",
+      sessionId: "s1",
+      message: {
+        id: "msg-user-1",
+        role: "user",
+        content: "persisted before cancel",
+        createdAt: 1,
+        thinkingSignature: pendingMessage?.thinkingSignature,
+      },
+    });
+
+    chatStore.handleStreamEvent({
+      runId: "run-cancel-late",
+      type: "cancelled",
+      sessionId: "s1",
+    });
+    await new Promise((resolve) => globalThis.setTimeout(resolve, 0));
+
+    expect(sessionServiceMocks.loadSession).not.toHaveBeenCalled();
+    expect(uiStore.pendingChatPrefill).toBeNull();
+    expect(chatStore.messages.map((message) => message.id)).toContain("msg-user-1");
+  });
+
+  it("returns the revoked user message to the composer when cancel produced no assistant output", async () => {
+    const chatStore = useChatStore();
+    const uiStore = useUiStore();
+    sessionServiceMocks.chat.mockResolvedValueOnce({ sessionId: "s1", runId: "run-revoke" });
+    sessionServiceMocks.listSessions.mockResolvedValue([
+      {
+        id: "s1",
+        title: "Revoke session",
+        agentId: null,
+        sessionType: "chat",
+        updatedAt: 1,
+        runtimeStatus: "running",
+      },
+    ]);
+
+    await chatStore.sendMessage("revoked text");
+    const pendingMessage = chatStore.messages.find((message) => message.role === "user");
+    const persisted = {
+      id: "msg-user-1",
+      role: "user" as const,
+      content: "revoked text",
+      createdAt: 1,
+      thinkingSignature: pendingMessage?.thinkingSignature,
+    };
+
+    chatStore.handleStreamEvent({
+      runId: "run-revoke",
+      type: "userMessage",
+      sessionId: "s1",
+      message: persisted,
+    });
+    expect(chatStore.messages.map((message) => message.id)).toContain("msg-user-1");
+
+    chatStore.handleStreamEvent({
+      runId: "run-revoke",
+      type: "cancelled",
+      sessionId: "s1",
+      removedUserMessage: persisted,
+    });
+    await new Promise((resolve) => globalThis.setTimeout(resolve, 0));
+
+    expect(chatStore.messages).toEqual([]);
+    expect(uiStore.pendingChatPrefill?.draft?.text).toBe("revoked text");
+    expect(uiStore.pendingChatPrefill?.sessionId).toBe("s1");
+    expect(uiStore.pendingChatPrefill?.requireEmptyComposer).toBe(true);
+    expect(sessionServiceMocks.loadSession).not.toHaveBeenCalled();
+    expect(chatStore.isStreaming).toBe(false);
+  });
+
+  it("defers a cancel clicked while the chat launch is in flight and fires it once the run starts", async () => {
+    const chatStore = useChatStore();
+    let resolveChat: ((value: { sessionId: string; runId: string }) => void) | undefined;
+    sessionServiceMocks.chat.mockImplementationOnce(() =>
+      new Promise((resolve) => {
+        resolveChat = resolve;
+      }));
+    sessionServiceMocks.listSessions.mockResolvedValue([
+      {
+        id: "s1",
+        title: "Deferred cancel",
+        agentId: null,
+        sessionType: "chat",
+        updatedAt: 1,
+        runtimeStatus: "running",
+      },
+    ]);
+
+    const sendPromise = chatStore.sendMessage("cancel me early");
+    expect(chatStore.isStreaming).toBe(true);
+    expect(chatStore.activeSessionId).toBeNull();
+
+    await chatStore.cancelChat();
+    expect(sessionServiceMocks.cancelChat).not.toHaveBeenCalled();
+    expect(chatStore.isCancelling).toBe(true);
+
+    resolveChat!({ sessionId: "s1", runId: "run-deferred" });
+    await sendPromise;
+
+    await vi.waitFor(() => {
+      expect(sessionServiceMocks.cancelChat).toHaveBeenCalledWith("s1");
+    });
   });
 
   it("sends a client message id that matches the local pending user message", async () => {
@@ -1725,6 +2049,35 @@ describe("chat session panel state", () => {
       "pending-1",
     );
     expect(chatStore.activeQueuedFollowUp).toBeNull();
+  });
+
+  it("restores a running follow-up to the composer draft when queueing fails", async () => {
+    const chatStore = useChatStore();
+    const uiStore = useUiStore();
+    sessionServiceMocks.queueChatInput.mockRejectedValueOnce({
+      code: "network.failed",
+      message: "offline",
+    });
+
+    chatStore.activeSessionId = "s1";
+    chatStore.currentRunId = "run-1";
+    chatStore.isStreaming = true;
+
+    await chatStore.sendMessage(
+      "queued prompt",
+      [],
+      [{ kind: "asset", path: "Assets/Queued.prefab" }],
+      { displayText: "queued visible" },
+    );
+
+    expect(chatStore.activeQueuedFollowUp).toBeNull();
+    expect(uiStore.pendingChatPrefill?.draft?.text).toBe("queued visible");
+    expect(uiStore.pendingChatPrefill?.sessionId).toBe("s1");
+    expect(uiStore.pendingChatPrefill?.requireEmptyComposer).toBe(true);
+    expect(uiStore.pendingChatPrefill?.draft?.assetRefs[0]).toMatchObject({
+      kind: "asset",
+      path: "Assets/Queued.prefab",
+    });
   });
 
   it("shows an inserted user message after the active tool round is persisted", () => {
@@ -2285,7 +2638,7 @@ describe("chat session panel state", () => {
     const result = await chatStore.performUndo("assistant-1");
 
     expect(result).toBe(true);
-    expect(undoServiceMocks.undoPerform).toHaveBeenCalledWith("s1", "assistant-1", false);
+    expect(undoServiceMocks.undoPerform).toHaveBeenCalledWith("s1", "assistant-1", false, false);
     expect(chatStore.messages).toHaveLength(1);
     expect(chatStore.messages[0]).toMatchObject({
       id: "user-restored",
@@ -2408,6 +2761,7 @@ describe("chat session panel state", () => {
       "s1",
       "assistant-after",
       "user-target",
+      false,
       false,
     );
     expect(sessionServiceMocks.rollbackSessionToMessage).not.toHaveBeenCalled();

@@ -1,10 +1,10 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "locus",
-  "version": "0.3.2",
+  "version": "0.4.0",
   "identifier": "com.locus.app",
   "build": {
-    "beforeDevCommand": "bun run ort:bundle && bun run dev",
+    "beforeDevCommand": "bun run ort:bundle && bun run github-cli:bundle && bun run dev",
     "devUrl": "http://localhost:14901",
     "beforeBuildCommand": "bun run build:tauri:without_embed_python_git",
     "frontendDist": "../dist"
@@ -53,6 +53,7 @@
       "./gen/rtk": "rtk/",
       "./gen/headroom-bundle": "headroom-bundle/",
       "./gen/headroom-proxy-bundle": "headroom-proxy-bundle/",
+      "./gen/gh-runtime": "gh-runtime/",
       "../agent": "agent/",
       "../knowledge": "knowledge/",
       "../skills": "skills/",

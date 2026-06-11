@@ -1,6 +1,8 @@
 
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted, watch } from "vue";
+import { listen } from "@tauri-apps/api/event";
+import type { UnlistenFn } from "@tauri-apps/api/event";
 import { listAgents, listSubagentDefs, getAgentEnvTemplate, getAgentRenderedEnvPrompt, getAgentSystemPrompt, getAgentSystemPromptStats, listAgentInjectedItems, setAgentToolDirectLoad, listRules, readRule, saveRule, deleteRule, setRuleEnabled, setRuleOrder } from "../services/agent";
 import type { AgentInfo, AgentSystemPromptStats, InjectedPromptItem, InjectedToolLoadMode, RuleItem } from "../types";
 import { getWarmup } from "../composables/warmupCache";
@@ -144,9 +146,27 @@ let resizing: "sidebar" | "dir" | null = null;
 let resizeStartX = 0;
 let resizeStartWidth = 0;
 let releaseSelectionLock: (() => void) | null = null;
+let pluginsChangedUnlisten: UnlistenFn | null = null;
+let agentViewUnmounted = false;
 
 function selectedRule(): RuleItem | null {
   return selected.value?.type === "rule" ? selected.value.rule : null;
+}
+
+function ruleKey(rule: RuleItem | null | undefined): string {
+  return rule?.key || rule?.fileName || "";
+}
+
+function selectedRuleKey(): string {
+  return ruleKey(selectedRule());
+}
+
+function canEditRule(rule: RuleItem | null | undefined): boolean {
+  return !!rule && !rule.readOnly;
+}
+
+function canToggleRule(rule: RuleItem | null | undefined): boolean {
+  return !!rule && !rule.pluginId;
 }
 
 function closeRuleContextMenu() {
@@ -377,22 +397,29 @@ function injectedItemIcon(kind: InjectedPromptItem["kind"]): string {
   return "◌";
 }
 
-async function loadAllAgents() {
-  try {
-    const topLevel = await listAgents();
-    const subLevel = await listSubagentDefs();
-    allAgents.value = [...topLevel, ...subLevel];
-    if (!selectedAgentId.value && allAgents.value.length > 0) {
-      const def = allAgents.value.find(a => a.isDefault);
-      selectedAgentId.value = def ? def.id : allAgents.value[0].id;
-    }
-  } catch (e) {
-    console.error("loadAllAgents failed:", e);
+function sourceBadgeLabel(source: string | null | undefined): string {
+  if (source === "app") return t("common.builtIn");
+  if (source === "project") return t("common.project");
+  if (source === "both") return t("common.builtInAndProject");
+  if (source === "pluginApp" || source?.startsWith("pluginApp:")) {
+    return t("agent.source.pluginApp");
   }
+  if (source === "pluginProject" || source?.startsWith("pluginProject:")) {
+    return t("agent.source.pluginProject");
+  }
+  return "";
 }
 
-async function switchAgent(agentId: string) {
-  selectedAgentId.value = agentId;
+function sourceBadgeClass(source: string | null | undefined): string {
+  if (source === "app") return "source-app";
+  if (source === "project") return "source-project";
+  if (source === "both") return "source-both";
+  if (source === "pluginApp" || source?.startsWith("pluginApp:")) return "source-plugin";
+  if (source === "pluginProject" || source?.startsWith("pluginProject:")) return "source-plugin";
+  return "";
+}
+
+function resetAgentDetailState() {
   selected.value = null;
   closeRuleContextMenu();
   ruleContent.value = "";
@@ -409,6 +436,37 @@ async function switchAgent(agentId: string) {
   promptStatsError.value = "";
   promptStatsLoading.value = false;
   promptStatsRequestId += 1;
+}
+
+function preferredAgentId(agents: AgentInfo[]): string {
+  if (agents.length === 0) return "";
+  const def = agents.find((agent) => agent.isDefault);
+  return def ? def.id : agents[0].id;
+}
+
+async function loadAllAgents() {
+  try {
+    const topLevel = await listAgents();
+    const subLevel = await listSubagentDefs();
+    allAgents.value = [...topLevel, ...subLevel];
+    const selectedStillAvailable = allAgents.value.some(
+      (agent) => agent.id === selectedAgentId.value,
+    );
+    if (!selectedStillAvailable) {
+      const nextAgentId = preferredAgentId(allAgents.value);
+      if (selectedAgentId.value !== nextAgentId) {
+        selectedAgentId.value = nextAgentId;
+        resetAgentDetailState();
+      }
+    }
+  } catch (e) {
+    console.error("loadAllAgents failed:", e);
+  }
+}
+
+async function switchAgent(agentId: string) {
+  selectedAgentId.value = agentId;
+  resetAgentDetailState();
   await loadAgentData();
 }
 
@@ -584,7 +642,7 @@ async function selectRuleItem(rule: RuleItem) {
   confirmingDeleteRule.value = null;
   ruleContentLoading.value = true;
   try {
-    ruleContent.value = await readRule(selectedAgentId.value, rule.fileName);
+    ruleContent.value = await readRule(selectedAgentId.value, ruleKey(rule));
   } catch (e) {
     ruleContent.value = t("common.readFailed", normalizeAppError(e).message);
   } finally {
@@ -593,10 +651,11 @@ async function selectRuleItem(rule: RuleItem) {
 }
 
 async function setRuleEnabledState(rule: RuleItem, enabled: boolean) {
+  if (!canToggleRule(rule)) return;
   const previous = rule.enabled;
   rule.enabled = enabled;
   try {
-    await setRuleEnabled(selectedAgentId.value, rule.fileName, enabled);
+    await setRuleEnabled(selectedAgentId.value, ruleKey(rule), enabled);
     void loadPromptStats();
   } catch (e) {
     console.error("set_rule_enabled failed:", e);
@@ -605,6 +664,7 @@ async function setRuleEnabledState(rule: RuleItem, enabled: boolean) {
 }
 
 function startEditRule() {
+  if (!canEditRule(selectedRule())) return;
   closeRuleContextMenu();
   ruleEditing.value = true;
   ruleEditContent.value = ruleContent.value;
@@ -612,14 +672,14 @@ function startEditRule() {
 
 async function saveEditRule() {
   const sr = selectedRule();
-  if (!sr) return;
+  if (!sr || !canEditRule(sr)) return;
   try {
     await saveRule(selectedAgentId.value, sr.fileName, ruleEditContent.value);
     ruleContent.value = ruleEditContent.value;
     ruleEditing.value = false;
     await loadRules();
     await loadPromptStats();
-    const updated = ruleItems.value.find(r => r.fileName === sr.fileName);
+    const updated = ruleItems.value.find(r => ruleKey(r) === ruleKey(sr));
     if (updated) selected.value = { type: "rule", rule: updated };
   } catch (e) {
     console.error("save_rule failed:", e);
@@ -657,9 +717,10 @@ async function commitCreateRule() {
 
 async function removeRule(rule: RuleItem) {
   closeRuleContextMenu();
+  if (!canEditRule(rule)) return;
   try {
     await deleteRule(selectedAgentId.value, rule.fileName);
-    if (selectedRule()?.fileName === rule.fileName) {
+    if (selectedRuleKey() === ruleKey(rule)) {
       selected.value = null;
       ruleContent.value = "";
       ruleEditing.value = false;
@@ -693,7 +754,7 @@ async function onRuleDrop(index: number) {
   const [moved] = arr.splice(from, 1);
   arr.splice(index, 0, moved);
   ruleItems.value = arr;
-  const fileNames = arr.map(r => r.fileName);
+  const fileNames = arr.map(r => ruleKey(r));
   try {
     await setRuleOrder(selectedAgentId.value, fileNames);
     void loadPromptStats();
@@ -732,12 +793,12 @@ function onRuleListContextMenu(event: MouseEvent) {
 
 async function requestDeleteRuleFromContext() {
   const rule = ruleContextMenu.value?.rule;
-  if (!rule) return;
+  if (!rule || !canEditRule(rule)) return;
   closeRuleContextMenu();
-  if (selectedRule()?.fileName !== rule.fileName) {
+  if (selectedRuleKey() !== ruleKey(rule)) {
     await selectRuleItem(rule);
   }
-  confirmingDeleteRule.value = rule.fileName;
+  confirmingDeleteRule.value = ruleKey(rule);
 }
 
 function onResizeStart(e: MouseEvent, target: "sidebar" | "dir") {
@@ -799,29 +860,44 @@ function formatDate(ts: number): string {
 }
 
 onMounted(async () => {
+  agentViewUnmounted = false;
   // Use background warmup cache if available
   const cachedAgents = getWarmup<AgentInfo[]>("agent:agents");
   const cachedSubagents = getWarmup<AgentInfo[]>("agent:subagents");
   if (cachedAgents && cachedSubagents) {
     allAgents.value = [...cachedAgents, ...cachedSubagents];
-    if (!selectedAgentId.value && allAgents.value.length > 0) {
-      const def = allAgents.value.find(a => a.isDefault);
-      selectedAgentId.value = def ? def.id : allAgents.value[0].id;
+    if (!selectedAgentId.value) {
+      selectedAgentId.value = preferredAgentId(allAgents.value);
     }
   } else {
     await loadAllAgents();
   }
+  if (agentViewUnmounted) return;
   if (selectedAgentId.value) {
     loadAgentData();
+  }
+  const releasePluginsChanged = await listen<void>("plugins-changed", async () => {
+    await loadAllAgents();
+    if (selectedAgentId.value) {
+      refreshAll();
+    }
+  });
+  if (agentViewUnmounted) {
+    releasePluginsChanged();
+  } else {
+    pluginsChangedUnlisten = releasePluginsChanged;
   }
 });
 
 onUnmounted(() => {
+  agentViewUnmounted = true;
   closeRuleContextMenu();
   document.removeEventListener("mousemove", onResizeMove);
   document.removeEventListener("mouseup", onResizeEnd);
   releaseSelectionLock?.();
   releaseSelectionLock = null;
+  pluginsChangedUnlisten?.();
+  pluginsChangedUnlisten = null;
 });
 
 watch(
@@ -887,12 +963,12 @@ watch(
             <div class="rule-drag-zone" @dragover.prevent>
               <button
                 v-for="(rule, idx) in ruleItems"
-                :key="rule.fileName"
+                :key="ruleKey(rule)"
                 type="button"
                 class="kb-item rule-item"
                 :class="{
-                  selected: selected?.type === 'rule' && selectedRule()?.fileName === rule.fileName,
-                  'rule-context-target': ruleContextMenu?.rule?.fileName === rule.fileName && selectedRule()?.fileName !== rule.fileName,
+                  selected: selected?.type === 'rule' && selectedRuleKey() === ruleKey(rule),
+                  'rule-context-target': ruleKey(ruleContextMenu?.rule) === ruleKey(rule) && selectedRuleKey() !== ruleKey(rule),
                   'rule-disabled': !rule.enabled,
                   'rule-dragging': ruleDragIndex === idx,
                   'rule-drag-over': ruleDragOverIndex === idx && ruleDragIndex !== idx,
@@ -910,7 +986,9 @@ watch(
                 <label class="rule-toggle-label" @click.stop>
                   <BaseCheckbox
                     :model-value="rule.enabled"
+                    :disabled="!canToggleRule(rule)"
                     :aria-label="rule.enabled ? t('common.enabled') : t('common.disabled')"
+                    :title="!canToggleRule(rule) ? t('agent.rulePluginEnableManagedByPlugin') : undefined"
                     @update:model-value="setRuleEnabledState(rule, $event)"
                   />
                 </label>
@@ -1024,9 +1102,7 @@ watch(
         <div class="preview-header">
           <span class="preview-title">{{ selectedAgent?.name || selectedAgentId }}</span>
           <span class="preview-path">{{ t("agent.systemPrompt") }}</span>
-          <span v-if="selectedAgent?.source === 'app'" class="source-badge source-app">{{ t("common.builtIn") }}</span>
-          <span v-else-if="selectedAgent?.source === 'project'" class="source-badge source-project">{{ t("common.project") }}</span>
-          <span v-else-if="selectedAgent?.source === 'both'" class="source-badge source-both">{{ t("common.builtInAndProject") }}</span>
+          <span v-if="sourceBadgeLabel(selectedAgent?.source)" class="source-badge" :class="sourceBadgeClass(selectedAgent?.source)">{{ sourceBadgeLabel(selectedAgent?.source) }}</span>
         </div>
         <div class="preview-body" :class="{ 'is-loading': systemPromptLoading }">
           <div v-if="systemPromptLoading && !systemPromptContent" class="preview-loading">{{ t("common.loading") }}</div>
@@ -1041,9 +1117,7 @@ watch(
         <div class="preview-header">
           <span class="preview-title">{{ selectedAgent?.name || selectedAgentId }}</span>
           <span class="preview-path">env.md</span>
-          <span v-if="selectedAgent?.source === 'app'" class="source-badge source-app">{{ t("common.builtIn") }}</span>
-          <span v-else-if="selectedAgent?.source === 'project'" class="source-badge source-project">{{ t("common.project") }}</span>
-          <span v-else-if="selectedAgent?.source === 'both'" class="source-badge source-both">{{ t("common.builtInAndProject") }}</span>
+          <span v-if="sourceBadgeLabel(selectedAgent?.source)" class="source-badge" :class="sourceBadgeClass(selectedAgent?.source)">{{ sourceBadgeLabel(selectedAgent?.source) }}</span>
           <BaseSegmented
             class="env-preview-mode"
             :model-value="envPreviewMode"
@@ -1065,27 +1139,29 @@ watch(
         <div class="preview-header">
           <span class="preview-title">{{ selectedRule()?.title }}</span>
           <span class="preview-path">{{ selectedRule()?.fileName }}</span>
-          <span v-if="selectedRule()?.source === 'app'" class="source-badge source-app">{{ t("common.builtIn") }}</span>
-          <span v-else-if="selectedRule()?.source === 'project'" class="source-badge source-project">{{ t("common.project") }}</span>
-          <BaseButton v-if="!ruleEditing" class="preview-open-btn" :aria-label="t('agent.editRule')" @click="startEditRule" :title="t('common.edit')">&#9998;</BaseButton>
+          <span v-if="sourceBadgeLabel(selectedRule()?.source)" class="source-badge" :class="sourceBadgeClass(selectedRule()?.source)">{{ sourceBadgeLabel(selectedRule()?.source) }}</span>
+          <span v-if="selectedRule()?.readOnly" class="source-badge source-readonly">{{ t("agent.readOnly") }}</span>
+          <BaseButton v-if="!ruleEditing && canEditRule(selectedRule())" class="preview-open-btn" :aria-label="t('agent.editRule')" @click="startEditRule" :title="t('common.edit')">&#9998;</BaseButton>
           <button class="preview-close" :aria-label="t('agent.closeRulePreview')" @click="selected = null; ruleContent = ''; ruleEditing = false" :title="t('common.close')">&times;</button>
         </div>
         <div class="rule-action-bar">
           <label class="skill-toggle">
             <BaseCheckbox
               :model-value="!!selectedRule()?.enabled"
+              :disabled="!canToggleRule(selectedRule())"
               :aria-label="selectedRule()?.enabled ? t('common.enabled') : t('common.disabled')"
+              :title="!canToggleRule(selectedRule()) ? t('agent.rulePluginEnableManagedByPlugin') : undefined"
               @update:model-value="setRuleEnabledState(selectedRule()!, $event)"
             />
             <span>{{ selectedRule()?.enabled ? t("common.enabled") : t("common.disabled") }}</span>
           </label>
           <div class="rule-action-spacer"></div>
-          <template v-if="confirmingDeleteRule === selectedRule()?.fileName">
+          <template v-if="canEditRule(selectedRule()) && confirmingDeleteRule === selectedRuleKey()">
             <span class="rule-delete-confirm-text">{{ t("agent.deleteConfirm") }}</span>
             <BaseButton class="rule-delete-confirm-btn" variant="danger" @click="removeRule(selectedRule()!)">{{ t("common.confirm") }}</BaseButton>
             <BaseButton class="rule-delete-cancel-btn" @click="confirmingDeleteRule = null">{{ t("common.cancel") }}</BaseButton>
           </template>
-          <BaseButton v-else class="rule-delete-btn" variant="danger" @click="confirmingDeleteRule = selectedRule()!.fileName">{{ t("common.delete") }}</BaseButton>
+          <BaseButton v-else-if="canEditRule(selectedRule())" class="rule-delete-btn" variant="danger" @click="confirmingDeleteRule = selectedRuleKey()">{{ t("common.delete") }}</BaseButton>
         </div>
         <div v-if="ruleEditing" class="preview-body rule-edit-body">
           <textarea
@@ -1199,9 +1275,7 @@ watch(
         <div class="preview-header">
           <span class="preview-title">{{ selectedAgent?.name || selectedAgentId }}</span>
           <span class="preview-path">{{ t("agent.dashboard.headerPath") }}</span>
-          <span v-if="selectedAgent?.source === 'app'" class="source-badge source-app">{{ t("common.builtIn") }}</span>
-          <span v-else-if="selectedAgent?.source === 'project'" class="source-badge source-project">{{ t("common.project") }}</span>
-          <span v-else-if="selectedAgent?.source === 'both'" class="source-badge source-both">{{ t("common.builtInAndProject") }}</span>
+          <span v-if="sourceBadgeLabel(selectedAgent?.source)" class="source-badge" :class="sourceBadgeClass(selectedAgent?.source)">{{ sourceBadgeLabel(selectedAgent?.source) }}</span>
         </div>
         <div class="preview-body dashboard-body" :class="{ 'is-loading': promptStatsLoading && !!promptStats }">
           <div v-if="promptStatsLoading && !promptStats" class="preview-loading">{{ t("agent.dashboard.loading") }}</div>
@@ -1341,9 +1415,9 @@ watch(
           <button type="button" class="agent-rule-ctx-item" @click="startCreateRule">
             {{ t("agent.newRule") }}
           </button>
-          <div v-if="ruleContextMenu.rule" class="agent-rule-ctx-sep"></div>
+          <div v-if="canEditRule(ruleContextMenu.rule)" class="agent-rule-ctx-sep"></div>
           <button
-            v-if="ruleContextMenu.rule"
+            v-if="canEditRule(ruleContextMenu.rule)"
             type="button"
             class="agent-rule-ctx-item agent-rule-ctx-item-danger"
             @click="requestDeleteRuleFromContext"
@@ -2601,6 +2675,12 @@ watch(
   border-color: color-mix(in srgb, var(--accent-border) 65%, var(--status-warn-border) 35%);
   background: color-mix(in srgb, var(--accent-soft) 60%, var(--status-warn-bg) 40%);
   color: var(--text-color);
+}
+
+.source-plugin {
+  border-color: color-mix(in srgb, var(--border-color) 82%, transparent);
+  background: color-mix(in srgb, var(--panel-bg) 72%, var(--hover-bg) 28%);
+  color: var(--text-secondary);
 }
 
 .source-runtime {

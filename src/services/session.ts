@@ -10,6 +10,7 @@ import type {
   AssetRefAttachment,
   UserIntentMeta,
   KnowledgeAccessMode,
+  KnowledgeDocumentType,
   PendingSessionInput,
 } from "../types";
 
@@ -29,6 +30,8 @@ export interface ChatParams {
   knowledgeMode?: KnowledgeAccessMode | null;
   /** UI locale (`zh` / `en`) — keeps subagent response language aligned with the main session. */
   responseLocale?: string | null;
+  knowledgeDocType?: KnowledgeDocumentType | null;
+  knowledgeDocPath?: string | null;
 }
 
 export interface CreateSessionParams {

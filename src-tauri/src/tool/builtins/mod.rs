@@ -42,6 +42,7 @@ pub fn register_all(registry: &mut ToolRegistry) {
     registry.register_builtin(unity::unity_yaml_search());
     registry.register_builtin(unity::unity_yaml_read());
     registry.register_builtin(misc::ask());
+    registry.register_builtin(misc::sheet());
     registry.register_builtin(knowledge::knowledge_list_tool());
     registry.register_builtin(knowledge::knowledge_query_tool());
     registry.register_builtin(knowledge::knowledge_read_tool());
@@ -52,6 +53,11 @@ pub fn register_all(registry: &mut ToolRegistry) {
     registry.register_builtin(skill::skill_create_tool());
     registry.register_builtin(skill::skill_reload_tool());
     registry.register_builtin(skill::skill_list_tool());
+    registry.register_builtin_with_load_mode(plugin::plugin_list(), ToolLoadMode::Skill);
+    registry.register_builtin_with_load_mode(plugin::plugin_search(), ToolLoadMode::Skill);
+    registry.register_builtin_with_load_mode(plugin::plugin_install(), ToolLoadMode::Skill);
+    registry.register_builtin_with_load_mode(plugin::plugin_set_enabled(), ToolLoadMode::Skill);
+    registry.register_builtin_with_load_mode(plugin::plugin_uninstall(), ToolLoadMode::Skill);
     registry.register_builtin_with_load_mode(plugin::plugin_export(), ToolLoadMode::Skill);
     registry.register_builtin_with_load_mode(view::view_create(), ToolLoadMode::Skill);
     registry.register_builtin_with_load_mode(view::view_list(), ToolLoadMode::Skill);
@@ -107,6 +113,7 @@ fn config_query_tool() -> ToolDef {
         name: "config_query".to_string(),
         description: prompt.description,
         parameters: prompt.parameters,
+        mutates_workspace: false,
         execute,
     }
 }
@@ -126,6 +133,7 @@ fn tool_load_tool() -> ToolDef {
         name: "tool_load".to_string(),
         description: prompt.description,
         parameters: prompt.parameters,
+        mutates_workspace: false,
         execute,
     }
 }
@@ -145,6 +153,7 @@ fn tool_call_tool() -> ToolDef {
         name: "tool_call".to_string(),
         description: prompt.description,
         parameters: prompt.parameters,
+        mutates_workspace: false,
         execute,
     }
 }

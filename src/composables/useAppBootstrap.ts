@@ -156,8 +156,7 @@ export function useAppBootstrap() {
       source === "knowledge_edit" ||
       source === "knowledge_move" ||
       source === "knowledge_delete" ||
-      source === "plugin_install" ||
-      source === "plugin_uninstall" ||
+      source.startsWith("plugin_") ||
       source === "undo_perform"
     );
   }
@@ -518,6 +517,7 @@ export function useAppBootstrap() {
     );
     unlistenPluginsChanged = await runtime.subscribe<void>("plugins-changed", () => {
       void agentStore.loadAgents();
+      void loadSkills();
     });
     markStartupPhase("register_listeners_subscriptions_ready");
 

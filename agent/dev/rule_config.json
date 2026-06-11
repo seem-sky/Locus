@@ -15,5 +15,6 @@
   "codegraph.md": { "enabled": true, "order": 13 },
   "tool_usage_strategy.md": { "enabled": true, "order": 14 },
   "risk_control.md": { "enabled": true, "order": 15 },
-  "output_principles.md": { "enabled": true, "order": 16 }
+  "output_principles.md": { "enabled": true, "order": 16 },
+  "unity_reference_protocol.md": { "enabled": true, "order": 17 }
 }

@@ -10,6 +10,7 @@ pub fn lua_gc_analyze() -> ToolDef {
         name: "lua_gc_analyze".to_string(),
         description: prompt.description,
         parameters: prompt.parameters,
+        mutates_workspace: false,
         execute: make_exec(|args, ctx| {
             Box::pin(async move {
                 let project_path = match ctx.working_dir {

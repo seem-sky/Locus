@@ -25,10 +25,12 @@ import {
 } from "./useStreamReducer";
 import { resolveToolCallDisplayShape } from "./toolCallBatches";
 import type {
+  ChatComposerSendPayload,
   ChatMessage,
   EffortLevel,
   ImageAttachment,
   AssetRefAttachment,
+  KnowledgeDocumentType,
   PendingQuestion,
   PendingToolConfirm,
   StreamEvent,
@@ -63,6 +65,11 @@ interface EmbeddedChatState extends StreamState {
   localFallbackMergeGroupId: string | null;
 }
 
+export interface EmbeddedChatKnowledgeFocus {
+  docType: KnowledgeDocumentType;
+  path: string;
+}
+
 export interface UseEmbeddedChatSessionOptions {
   sessionKey: MaybeRefOrGetter<string>;
   sessionType?: string;
@@ -71,6 +78,8 @@ export interface UseEmbeddedChatSessionOptions {
   selectedAgentId?: MaybeRefOrGetter<string | null | undefined>;
   effort?: MaybeRefOrGetter<EffortLevel | null | undefined>;
   effortSupported?: MaybeRefOrGetter<boolean | undefined>;
+  /** Knowledge document this session is scoped to; injected into the agent env by the backend. */
+  knowledgeFocus?: MaybeRefOrGetter<EmbeddedChatKnowledgeFocus | null | undefined>;
   buildRequest: (input: string) => EmbeddedChatRequest | null;
 }
 
@@ -569,6 +578,9 @@ function applyMutation(state: EmbeddedChatState, mutation: StreamMutation) {
     case "upsertUserMessage":
       state.messages = mergeUserMessage(state.messages, mutation.message);
       break;
+    case "removeMessage":
+      state.messages = state.messages.filter((message) => message.id !== mutation.messageId);
+      break;
     case "replaceMessages":
       state.messages = [...mutation.messages];
       break;
@@ -952,6 +964,8 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
     state.isStreaming = true;
     state.pendingRun = true;
 
+    const knowledgeFocus = toValue(options.knowledgeFocus) ?? null;
+
     try {
       const launch = await sessionService.chat({
         sessionId: state.sessionId,
@@ -966,6 +980,8 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
         mode: request.mode ?? null,
         userIntent,
         responseLocale: resolveChatResponseLocale(locale.value),
+        knowledgeDocType: knowledgeFocus?.docType ?? null,
+        knowledgeDocPath: knowledgeFocus?.path ?? null,
       });
 
       state.sessionId = launch.sessionId;
@@ -980,6 +996,30 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
       resetRoundState(state);
       state.error = normalizeAppError(error).message;
     }
+  }
+
+  // Entry point for composer "send" events. The composer payload is structurally
+  // compatible with EmbeddedChatRequest, so passing it straight to send() would
+  // skip options.buildRequest and drop the pane's injected context (e.g. the
+  // knowledge pane's current-document block). Wrap the payload text here, then
+  // carry the composer's attachments and intent over to the built request.
+  function sendComposerPayload(payload?: ChatComposerSendPayload | null) {
+    if (!payload) {
+      void send();
+      return;
+    }
+    const built = options.buildRequest(payload.text);
+    if (!built && !payload.text.trim() && payload.images.length === 0 && payload.assetRefs.length === 0) {
+      return;
+    }
+    void send({
+      text: built?.text ?? payload.text,
+      displayText: payload.displayText,
+      mode: payload.mode ?? built?.mode ?? null,
+      userIntent: payload.userIntent ?? built?.userIntent ?? null,
+      images: payload.images.length > 0 ? payload.images : built?.images ?? null,
+      assetRefs: payload.assetRefs.length > 0 ? payload.assetRefs : built?.assetRefs ?? null,
+    });
   }
 
   async function insertQueuedFollowUp() {
@@ -1229,6 +1269,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
     errorMessage,
     sessionId,
     send,
+    sendComposerPayload,
     insertQueuedFollowUp,
     deleteQueuedFollowUp,
     cancel,

@@ -36,6 +36,7 @@ pub mod tools {
     pub const UNITY_RECOMPILE: &str = include_str!("../../tools/unity_recompile.json");
     pub const LIST: &str = include_str!("../../tools/list.json");
     pub const ASK: &str = include_str!("../../tools/ask.json");
+    pub const SHEET: &str = include_str!("../../tools/sheet.json");
     pub const KNOWLEDGE_LIST: &str = include_str!("../../tools/knowledge_list.json");
     pub const KNOWLEDGE_QUERY: &str = include_str!("../../tools/knowledge_query.json");
     pub const KNOWLEDGE_READ: &str = include_str!("../../tools/knowledge_read.json");
@@ -46,6 +47,11 @@ pub mod tools {
     pub const SKILL_CREATE: &str = include_str!("../../tools/skill_create.json");
     pub const SKILL_RELOAD: &str = include_str!("../../tools/skill_reload.json");
     pub const SKILL_LIST: &str = include_str!("../../tools/skill_list.json");
+    pub const PLUGIN_LIST: &str = include_str!("../../tools/plugin_list.json");
+    pub const PLUGIN_SEARCH: &str = include_str!("../../tools/plugin_search.json");
+    pub const PLUGIN_INSTALL: &str = include_str!("../../tools/plugin_install.json");
+    pub const PLUGIN_UNINSTALL: &str = include_str!("../../tools/plugin_uninstall.json");
+    pub const PLUGIN_SET_ENABLED: &str = include_str!("../../tools/plugin_set_enabled.json");
     pub const PLUGIN_EXPORT: &str = include_str!("../../tools/plugin_export.json");
     pub const VIEW_CREATE: &str = include_str!("../../tools/view_create.json");
     pub const VIEW_LIST: &str = include_str!("../../tools/view_list.json");
@@ -134,6 +140,7 @@ mod tests {
             ("unity_recompile", tools::UNITY_RECOMPILE),
             ("list", tools::LIST),
             ("ask", tools::ASK),
+            ("sheet", tools::SHEET),
             ("knowledge_list", tools::KNOWLEDGE_LIST),
             ("knowledge_query", tools::KNOWLEDGE_QUERY),
             ("knowledge_read", tools::KNOWLEDGE_READ),
@@ -144,6 +151,11 @@ mod tests {
             ("skill_create", tools::SKILL_CREATE),
             ("skill_reload", tools::SKILL_RELOAD),
             ("skill_list", tools::SKILL_LIST),
+            ("plugin_list", tools::PLUGIN_LIST),
+            ("plugin_search", tools::PLUGIN_SEARCH),
+            ("plugin_install", tools::PLUGIN_INSTALL),
+            ("plugin_uninstall", tools::PLUGIN_UNINSTALL),
+            ("plugin_set_enabled", tools::PLUGIN_SET_ENABLED),
             ("plugin_export", tools::PLUGIN_EXPORT),
             ("view_create", tools::VIEW_CREATE),
             ("view_list", tools::VIEW_LIST),
@@ -179,5 +191,25 @@ mod tests {
             let prompt = parse_tool_prompt(json_str);
             assert_openai_compatible_tool_parameters(name, &prompt.parameters);
         }
+    }
+
+    #[test]
+    fn unity_run_states_profiler_skill_reference_resolves() {
+        let prompt = parse_tool_prompt(tools::UNITY_RUN_STATES);
+        assert!(
+            prompt.description.contains("skill/profiler.md"),
+            "unity_run_states should direct the agent to the profiler skill"
+        );
+
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("knowledge")
+            .join("skill")
+            .join("profiler.md");
+        assert!(
+            path.is_file(),
+            "skill/profiler.md is referenced by the unity_run_states tool prompt but missing at {:?}",
+            path
+        );
     }
 }

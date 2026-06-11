@@ -457,7 +457,9 @@ function skillPackageIdForDocument(
   return document.externalSource.sourceId?.trim() || firstSegment;
 }
 
-function isSkillPackageRootDocument(document: KnowledgeDocumentSummary): boolean {
+export function isSkillPackageRootDocument(
+  document: KnowledgeDocumentSummary,
+): boolean {
   const packageId = skillPackageIdForDocument(document);
   if (!packageId) return false;
   const normalizedPath = document.path.replace(/\\/g, "/").replace(/^\/+/, "");
@@ -680,6 +682,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
   let pendingSaveCount = 0;
   let releaseSelectionLock: (() => void) | null = null;
   let knowledgeChangedUnlisten: UnlistenFn | null = null;
+  let pluginsChangedUnlisten: UnlistenFn | null = null;
   let lexicalRebuildStatusUnlisten: UnlistenFn | null = null;
   let destroyed = false;
   let loadedDirectoryDocumentPaths = emptyLoadedDirectoryDocumentPaths();
@@ -2248,6 +2251,15 @@ export function useKnowledgeState(props: KnowledgeProps) {
     );
   }
 
+  function collapseAllForType(type: KnowledgeDocumentType) {
+    const prefix = `${type}/`;
+    expandedPaths.value = new Set(
+      Array.from(expandedPaths.value).filter(
+        (entry) => !entry.startsWith(prefix),
+      ),
+    );
+  }
+
   function pruneUnityReferenceManagedEntries() {
     documents.value = documents.value.filter(
       (doc) =>
@@ -3177,15 +3189,17 @@ export function useKnowledgeState(props: KnowledgeProps) {
     const packageId = skillPackageIdForDocument(current);
     if (!packageId) return;
 
+    // description and injectMode are sent only when the user changed them;
+    // omitted fields keep their stored override state on the backend instead
+    // of pinning the currently effective manifest/L1 value into the workspace.
     const nextConfig: SkillConfig = {
       enabled: meta.skillEnabled ?? current.skillEnabled ?? true,
       surface: meta.skillSurface ?? current.skillSurface ?? "command",
-      description: current.summary ?? "",
       commandTrigger:
         meta.commandTrigger === undefined
           ? current.commandTrigger ?? ""
           : meta.commandTrigger ?? "",
-      injectMode: meta.injectMode ?? current.injectMode ?? "none",
+      injectMode: meta.injectMode,
     };
 
     beginSave();
@@ -3734,6 +3748,17 @@ export function useKnowledgeState(props: KnowledgeProps) {
         : node.kind === "package"
           ? fullDocumentPath("skill", node.packageId)
           : fullDocumentPath(node.document.type, node.document.path);
+    await copyKnowledgeRelativePath(relativePath);
+  }
+
+  async function copySearchResultRelativePath(result: KnowledgeSearchResult) {
+    const normalizedPath = result.path.replace(/\\/g, "/").replace(/^\/+/, "");
+    await copyKnowledgeRelativePath(
+      fullDocumentPath(result.type, normalizedPath),
+    );
+  }
+
+  async function copyKnowledgeRelativePath(relativePath: string) {
     if (!relativePath.trim()) return;
 
     try {
@@ -3848,6 +3873,15 @@ export function useKnowledgeState(props: KnowledgeProps) {
     await moveDocumentPath(node.document.path, nextPath, node.document.type);
   }
 
+  async function moveExplorerNodes(nodes: ExplorerNode[], targetDir: string) {
+    // Sequential on purpose: each move funnels through enqueueMutation and
+    // refreshes shared state; firing them concurrently would race selection
+    // syncing for multi-node drags.
+    for (const node of nodes) {
+      await moveExplorerNode(node, targetDir);
+    }
+  }
+
   async function selectDocumentByPath(path: string) {
     const normalized = path.replace(/\\/g, "/");
     const matched = documents.value.find(
@@ -3883,13 +3917,22 @@ export function useKnowledgeState(props: KnowledgeProps) {
         handleLexicalRebuildStatus(event.payload);
       },
     );
+    const releasePluginsChanged = await listen<void>(
+      "plugins-changed",
+      () => {
+        if (!hasWorkspace.value) return;
+        scheduleExternalRefresh();
+      },
+    );
 
     if (destroyed) {
       release();
+      releasePluginsChanged();
       releaseLexicalRebuildStatus();
       return;
     }
     knowledgeChangedUnlisten = release;
+    pluginsChangedUnlisten = releasePluginsChanged;
     lexicalRebuildStatusUnlisten = releaseLexicalRebuildStatus;
   });
 
@@ -3901,6 +3944,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
     stopFeishuReferenceStatusPoll();
     stopUnityReferenceStatusPoll();
     knowledgeChangedUnlisten?.();
+    pluginsChangedUnlisten?.();
     lexicalRebuildStatusUnlisten?.();
     endExplorerDrag();
   });
@@ -4020,6 +4064,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
     togglePath,
     expandPath,
     expandAncestors,
+    collapseAllForType,
     hasMoreRootDocuments,
     hasMoreDirectoryDocuments,
     hasLoadedDirectoryDocuments,
@@ -4073,7 +4118,9 @@ export function useKnowledgeState(props: KnowledgeProps) {
     renameExplorerFolder,
     renameExplorerDocument,
     copyExplorerRelativePath,
+    copySearchResultRelativePath,
     openExplorerInFileSystem,
     moveExplorerNode,
+    moveExplorerNodes,
   };
 }

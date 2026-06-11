@@ -49,6 +49,7 @@ pub(super) fn read() -> ToolDef {
         name: "read".to_string(),
         description: prompt.description,
         parameters: prompt.parameters,
+        mutates_workspace: false,
         execute: make_exec(|args, ctx| {
             Box::pin(async move {
                 if args.get("filePath").and_then(|v| v.as_str()).is_none() {
@@ -263,6 +264,7 @@ pub(super) fn write() -> ToolDef {
         name: "write".to_string(),
         description: prompt.description,
         parameters: prompt.parameters,
+        mutates_workspace: true,
         execute: make_exec(|args, ctx| {
             Box::pin(async move {
                 if args.get("filePath").and_then(|v| v.as_str()).is_none() {
@@ -345,6 +347,7 @@ pub(super) fn edit() -> ToolDef {
         name: "edit".to_string(),
         description: prompt.description,
         parameters: prompt.parameters,
+        mutates_workspace: true,
         execute: make_exec(|args, ctx| {
             Box::pin(async move {
                 if args.get("filePath").and_then(|v| v.as_str()).is_none() {
@@ -740,6 +743,7 @@ pub(super) fn list() -> ToolDef {
         name: "list".to_string(),
         description: prompt.description,
         parameters: prompt.parameters,
+        mutates_workspace: false,
         execute: make_exec(|args, ctx| {
             Box::pin(async move {
                 let root_path = args

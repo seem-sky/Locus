@@ -8,6 +8,7 @@ import ToolResultImages from "./ToolResultImages.vue";
 import FileDiffViewer from "./diff/FileDiffViewer.vue";
 import LucideIcon from "./icons/LucideIcon.vue";
 import hljs, { langFromPath } from "../hljs";
+import { useThrottledStreamingText } from "../composables/streamingRenderThrottle";
 import { diffStrings } from "../services/diff";
 import { t } from "../i18n";
 import { resolveToolBlockOverride } from "./tool-block-overrides/toolBlockOverrides";
@@ -21,6 +22,7 @@ import { traceToolBlockLayoutChange } from "../services/layoutDiagnostics";
 import { resolveViewToolOpenId } from "./viewToolCallActions";
 import { resolveHeadroomDisplayForToolCall } from "../composables/headroomExecutionMeta";
 import { resolveToolCallDisplayShape } from "../composables/toolCallBatches";
+import { resolveSkillLoadedMarkerForToolCall } from "./toolCallSkillLoadedMarker";
 
 import type { ToolCallDisplay, FileDiffPayload } from "../types";
 
@@ -52,8 +54,19 @@ const outputPre = ref<HTMLPreElement | null>(null);
 const notificationStore = useNotificationStore();
 const projectStore = useProjectStore();
 
+// Streamed tool output (subagent text, shell chunks) repaints at the shared
+// streaming cadence instead of once per delta event; id/status transitions
+// flush so the final output never lags behind the status change.
+const { text: displayedToolOutput, flush: flushDisplayedToolOutput } =
+  useThrottledStreamingText(() => props.toolCall.output ?? "");
+
 watch(
-  () => [props.toolCall.output, props.toolCall.nestedToolCalls?.length],
+  () => [props.toolCall.id, props.toolCall.status] as const,
+  () => flushDisplayedToolOutput(),
+);
+
+watch(
+  () => [displayedToolOutput.value, props.toolCall.nestedToolCalls?.length],
   () => {
     if (outputPre.value && props.toolCall.status === "running") {
       nextTick(() => {
@@ -214,7 +227,7 @@ const viewToolOpenId = computed(() =>
   resolveViewToolOpenId({
     name: props.toolCall.name,
     arguments: props.toolCall.arguments,
-    output: props.toolCall.output,
+    output: displayedToolOutput.value || undefined,
     status: props.toolCall.status,
   }),
 );
@@ -243,7 +256,7 @@ const editDiffData = computed((): EditDiffResult | null => {
   try {
     const args = JSON.parse(props.toolCall.arguments);
     const filePath = args.filePath || args.file_path || args.path || "";
-    const startLines = parseEditStartLines(props.toolCall.output);
+    const startLines = parseEditStartLines(displayedToolOutput.value);
     const items: EditDiffItem[] = [];
     if (Array.isArray(args.edits)) {
       for (let i = 0; i < args.edits.length; i++) {
@@ -378,6 +391,12 @@ function prettifyKey(key: string): string {
 const argsSummary = computed(() =>
   buildToolCallArgsSummary(props.toolCall.name, props.toolCall.arguments),
 );
+const skillLoadedMarker = computed(() =>
+  resolveSkillLoadedMarkerForToolCall(props.toolCall, displayedToolOutput.value || undefined),
+);
+const skillLoadedLabel = computed(() =>
+  skillLoadedMarker.value ? t("tool.knowledgeRead.skillLoaded", skillLoadedMarker.value.name) : "",
+);
 
 async function reopenGraphView() {
   if (openingGraphView.value) return;
@@ -424,7 +443,7 @@ function getFilePath(): string {
 }
 
 const outputDisplay = computed(() => {
-  const output = props.toolCall.output;
+  const output = displayedToolOutput.value;
   return output ? persistedOutputDisplay(output) : { kind: "normal" as const, text: "" };
 });
 
@@ -435,7 +454,7 @@ const toolResultImages = computed(() => props.toolCall.images ?? []);
 const hasToolResultImages = computed(() => toolResultImages.value.length > 0);
 
 const highlightedOutput = computed(() => {
-  const output = props.toolCall.output;
+  const output = displayedToolOutput.value;
   if (!output) return null;
   if (outputDisplay.value.kind !== "normal") return null;
   const name = props.toolCall.name;
@@ -507,6 +526,7 @@ const highlightedOutput = computed(() => {
           <span v-if="headroomCompressLabel" class="tool-call-rtk-status-text">{{ headroomCompressLabel }}</span>
         </span>
         <span v-if="argsSummary" class="tool-call-summary">{{ argsSummary }}</span>
+        <span v-if="skillLoadedLabel" class="tool-call-inline-note">· {{ skillLoadedLabel }}</span>
       </button>
       <button
         v-if="showGraphViewOpenButton"
@@ -604,9 +624,9 @@ const highlightedOutput = computed(() => {
       <div v-if="toolCall.output !== undefined || toolCall.status === 'running'" class="tool-call-section">
         <div class="tool-call-section-label">
           {{ t("tool.section.output") }}
-          <span v-if="toolCall.status === 'running' && toolCall.output" class="output-streaming-indicator"></span>
+          <span v-if="toolCall.status === 'running' && displayedToolOutput" class="output-streaming-indicator"></span>
         </div>
-        <template v-if="toolCall.output || hasToolResultImages || (isSubagentTool && toolCall.nestedToolCalls && toolCall.nestedToolCalls.length > 0)">
+        <template v-if="displayedToolOutput || hasToolResultImages || (isSubagentTool && toolCall.nestedToolCalls && toolCall.nestedToolCalls.length > 0)">
           <div v-if="isSubagentTool && toolCall.status !== 'error'" class="subagent-output ui-select-text" :class="{ 'streaming-output': toolCall.status === 'running' }" ref="outputPre">
             <div v-if="toolCall.nestedToolCalls && toolCall.nestedToolCalls.length > 0" class="nested-tool-calls">
               <ToolCallCollection
@@ -625,22 +645,22 @@ const highlightedOutput = computed(() => {
                 </template>
               </ToolCallCollection>
             </div>
-            <div v-if="toolCall.output && isDeletedOutput" class="tool-output-deleted">
+            <div v-if="displayedToolOutput && isDeletedOutput" class="tool-output-deleted">
               <div class="tool-output-deleted-title">{{ t("tool.persistedOutputDeleted") }}</div>
               <code v-if="deletedOutputPath" class="tool-output-deleted-path">
                 {{ t("tool.persistedOutputDeletedPath", deletedOutputPath) }}
               </code>
             </div>
-            <MarkdownRenderer v-else-if="toolCall.output" :content="displayOutput" />
+            <MarkdownRenderer v-else-if="displayedToolOutput" :content="displayOutput" />
           </div>
-          <div v-else-if="toolCall.output && isDeletedOutput" class="tool-output-deleted">
+          <div v-else-if="displayedToolOutput && isDeletedOutput" class="tool-output-deleted">
             <div class="tool-output-deleted-title">{{ t("tool.persistedOutputDeleted") }}</div>
             <code v-if="deletedOutputPath" class="tool-output-deleted-path">
               {{ t("tool.persistedOutputDeletedPath", deletedOutputPath) }}
             </code>
           </div>
-          <pre v-else-if="toolCall.output && highlightedOutput" class="tool-call-pre ui-select-text hljs" :class="{ 'error-output': toolCall.status === 'error', 'streaming-output': toolCall.status === 'running' }" ref="outputPre" v-html="highlightedOutput"></pre>
-          <pre v-else-if="toolCall.output" class="tool-call-pre ui-select-text" :class="{ 'error-output': toolCall.status === 'error', 'streaming-output': toolCall.status === 'running' }" ref="outputPre">{{ displayOutput }}</pre>
+          <pre v-else-if="displayedToolOutput && highlightedOutput" class="tool-call-pre ui-select-text hljs" :class="{ 'error-output': toolCall.status === 'error', 'streaming-output': toolCall.status === 'running' }" ref="outputPre" v-html="highlightedOutput"></pre>
+          <pre v-else-if="displayedToolOutput" class="tool-call-pre ui-select-text" :class="{ 'error-output': toolCall.status === 'error', 'streaming-output': toolCall.status === 'running' }" ref="outputPre">{{ displayOutput }}</pre>
           <ToolResultImages v-if="hasToolResultImages" :images="toolResultImages" />
         </template>
         <template v-else>
@@ -895,6 +915,17 @@ const highlightedOutput = computed(() => {
   overflow: hidden;
   text-overflow: ellipsis;
   min-width: 0;
+}
+
+.tool-call-inline-note {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 38%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-secondary);
+  font-size: 11px;
 }
 
 .tool-call-action-button {

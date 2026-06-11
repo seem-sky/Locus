@@ -155,6 +155,7 @@ fn memory_recall() -> ToolDef {
             },
             "required": ["query"]
         }),
+        mutates_workspace: false,
         execute: make_exec(|args, ctx| {
             Box::pin(async move {
             let working_dir = match working_dir_or_error(&ctx, "memory_recall") {
@@ -217,6 +218,7 @@ fn memory_smart_search() -> ToolDef {
             },
             "required": ["query"]
         }),
+        mutates_workspace: false,
         execute: make_exec(|args, ctx| {
             Box::pin(async move {
             let working_dir = match working_dir_or_error(&ctx, "memory_smart_search") {
@@ -285,6 +287,7 @@ fn memory_save() -> ToolDef {
             },
             "required": ["content"]
         }),
+        mutates_workspace: true,
         execute: make_exec(|args, ctx| {
             Box::pin(async move {
             let working_dir = match working_dir_or_error(&ctx, "memory_save") {
@@ -376,6 +379,7 @@ fn memory_action_create() -> ToolDef {
             },
             "required": ["title"]
         }),
+        mutates_workspace: true,
         execute: make_exec(|args, ctx| {
             Box::pin(async move {
             let working_dir = match working_dir_or_error(&ctx, "memory_action_create") {
@@ -481,6 +485,7 @@ fn memory_action_update() -> ToolDef {
             },
             "required": ["actionId"]
         }),
+        mutates_workspace: true,
         execute: make_exec(|args, ctx| {
             Box::pin(async move {
             let _working_dir = match working_dir_or_error(&ctx, "memory_action_update") {
@@ -560,6 +565,7 @@ fn memory_action_list() -> ToolDef {
                 }
             }
         }),
+        mutates_workspace: false,
         execute: make_exec(|args, ctx| {
             Box::pin(async move {
             let working_dir = match working_dir_or_error(&ctx, "memory_action_list") {
@@ -609,6 +615,7 @@ fn memory_frontier() -> ToolDef {
                 }
             }
         }),
+        mutates_workspace: false,
         execute: make_exec(|args, ctx| {
             Box::pin(async move {
             let working_dir = match working_dir_or_error(&ctx, "memory_frontier") {
@@ -642,6 +649,7 @@ fn memory_sessions() -> ToolDef {
         name: "memory_sessions".to_string(),
         description: "List recent agentmemory sessions with status and observation counts.".to_string(),
         parameters: serde_json::json!({ "type": "object", "properties": {} }),
+        mutates_workspace: false,
         execute: make_exec(|_args, ctx| {
             Box::pin(async move {
                 run_store_json(&ctx, "memory_sessions", |store| store.list_sessions()).await
@@ -655,6 +663,7 @@ fn memory_patterns() -> ToolDef {
         name: "memory_patterns".to_string(),
         description: "Detect recurring patterns across sessions for the current project.".to_string(),
         parameters: serde_json::json!({ "type": "object", "properties": {} }),
+        mutates_workspace: false,
         execute: make_exec(|_args, ctx| {
             Box::pin(async move {
                 let working_dir = match working_dir_or_error(&ctx, "memory_patterns") {
@@ -683,6 +692,7 @@ fn memory_timeline() -> ToolDef {
             },
             "required": ["anchor"]
         }),
+        mutates_workspace: false,
         execute: make_exec(|args, ctx| {
             Box::pin(async move {
                 let working_dir = match working_dir_or_error(&ctx, "memory_timeline") {
@@ -709,6 +719,7 @@ fn memory_profile() -> ToolDef {
         name: "memory_profile".to_string(),
         description: "Project memory profile: top concepts, file patterns, and usage summary.".to_string(),
         parameters: serde_json::json!({ "type": "object", "properties": {} }),
+        mutates_workspace: false,
         execute: make_exec(|_args, ctx| {
             Box::pin(async move {
                 let working_dir = match working_dir_or_error(&ctx, "memory_profile") {
@@ -735,6 +746,7 @@ fn memory_file_history() -> ToolDef {
             },
             "required": ["files"]
         }),
+        mutates_workspace: false,
         execute: make_exec(|args, ctx| {
             Box::pin(async move {
                 let files = parse_csv_files(&args, "files");
@@ -759,6 +771,7 @@ fn memory_next() -> ToolDef {
         name: "memory_next".to_string(),
         description: "Pick the highest-priority unblocked action from the frontier.".to_string(),
         parameters: serde_json::json!({ "type": "object", "properties": {} }),
+        mutates_workspace: false,
         execute: make_exec(|_args, ctx| {
             Box::pin(async move {
                 let working_dir = match working_dir_or_error(&ctx, "memory_next") {
@@ -785,6 +798,7 @@ fn memory_consolidate() -> ToolDef {
                 "force": { "type": "boolean", "description": "Force consolidation even if recently run" }
             }
         }),
+        mutates_workspace: true,
         execute: make_exec(|args, ctx| {
             Box::pin(async move {
                 let tier = args.get("tier").and_then(|v| v.as_str()).map(str::to_string);
@@ -811,6 +825,7 @@ fn memory_graph_query() -> ToolDef {
                 "maxDepth": { "type": "number", "description": "Max traversal depth (1-8)" }
             }
         }),
+        mutates_workspace: false,
         execute: make_exec(|args, ctx| {
             Box::pin(async move {
                 let query = args
@@ -845,6 +860,7 @@ fn memory_graph_stats() -> ToolDef {
         name: "memory_graph_stats".to_string(),
         description: "Knowledge graph node/edge counts and health.".to_string(),
         parameters: serde_json::json!({ "type": "object", "properties": {} }),
+        mutates_workspace: false,
         execute: make_exec(|_args, ctx| {
             Box::pin(async move {
                 run_store_json(&ctx, "memory_graph_stats", |store| store.fetch_graph_stats()).await
@@ -864,6 +880,7 @@ fn memory_forget() -> ToolDef {
             },
             "required": ["memoryId"]
         }),
+        mutates_workspace: true,
         execute: make_exec(|args, ctx| {
             Box::pin(async move {
                 let memory_id = match require_str(&args, "memoryId") {
@@ -892,6 +909,7 @@ fn memory_evolve() -> ToolDef {
             },
             "required": ["memoryId", "newContent"]
         }),
+        mutates_workspace: true,
         execute: make_exec(|args, ctx| {
             Box::pin(async move {
                 let memory_id = match require_str(&args, "memoryId") {
@@ -929,6 +947,7 @@ fn memory_commits() -> ToolDef {
                 "limit": { "type": "number", "description": "Max results (default 100)" }
             }
         }),
+        mutates_workspace: false,
         execute: make_exec(|args, ctx| {
             Box::pin(async move {
                 let branch = args.get("branch").and_then(|v| v.as_str()).map(str::to_string);
@@ -954,6 +973,7 @@ fn memory_commit_lookup() -> ToolDef {
             },
             "required": ["sha"]
         }),
+        mutates_workspace: false,
         execute: make_exec(|args, ctx| {
             Box::pin(async move {
                 let sha = match require_str(&args, "sha") {

@@ -67,6 +67,7 @@ interface VisibleViewRow {
 }
 
 type VisibleViewEntry =
+  | { type: "empty-folder"; key: string; depth: number }
   | { type: "row"; key: string; row: VisibleViewRow }
   | { type: "create"; key: string; draft: ViewCreateFolderDraft };
 
@@ -89,6 +90,12 @@ interface ViewRenameDraft {
 type ViewContextMenuState =
   | { x: number; y: number; kind: "root" }
   | { x: number; y: number; kind: "folder" | "view"; node: ViewTreeNode };
+
+interface ViewDeleteConfirmState {
+  x: number;
+  y: number;
+  node: ViewTreeNode;
+}
 
 interface ViewPointerDragState {
   node: ViewTreeNode;
@@ -127,7 +134,7 @@ const exportingViewId = ref("");
 const loadError = ref("");
 const expandedState = ref<Record<string, boolean>>(loadExpandedState());
 const contextMenu = ref<ViewContextMenuState | null>(null);
-const deleteConfirm = ref<ViewTreeNode | null>(null);
+const deleteConfirm = ref<ViewDeleteConfirmState | null>(null);
 const createFolderDraft = ref<ViewCreateFolderDraft | null>(null);
 const createFolderInputRef = ref<HTMLInputElement | null>(null);
 const renameDraft = ref<ViewRenameDraft | null>(null);
@@ -213,8 +220,16 @@ const visibleViewEntries = computed<VisibleViewEntry[]>(() => {
           draft: createFolderDraft.value,
         });
       }
-      if (node.kind === "folder" && expanded && hasChildren) {
-        walk(node.children, depth + 1);
+      if (node.kind === "folder" && expanded) {
+        if (hasChildren) {
+          walk(node.children, depth + 1);
+        } else {
+          entries.push({
+            type: "empty-folder",
+            key: `view-empty:${node.key}`,
+            depth: depth + 1,
+          });
+        }
       }
     }
   };
@@ -800,20 +815,23 @@ function requestDeleteEntry() {
   const menu = contextMenu.value;
   if (!menu || menu.kind === "root") return;
   if (!contextNodeEditable(menu.node)) return;
-  deleteConfirm.value = menu.node;
+  deleteConfirm.value = {
+    x: menu.x,
+    y: menu.y,
+    node: menu.node,
+  };
+  closeContextMenu();
 }
 
 function closeDeleteConfirm() {
   deleteConfirm.value = null;
-  closeContextMenu();
 }
 
 async function confirmDeleteEntry() {
-  const node = deleteConfirm.value;
-  if (!node) return;
+  const confirm = deleteConfirm.value;
+  if (!confirm) return;
   try {
-    applyTreeSnapshot(await viewDeleteEntry({ relPath: node.relPath }));
-    closeDeleteConfirm();
+    applyTreeSnapshot(await viewDeleteEntry({ relPath: confirm.node.relPath }));
   } catch (error) {
     const err = normalizeAppError(error);
     loadError.value = err.message;
@@ -822,6 +840,8 @@ async function confirmDeleteEntry() {
       operation: "viewDeleteEntry",
       replaceOperation: true,
     });
+  } finally {
+    closeDeleteConfirm();
   }
 }
 
@@ -849,7 +869,7 @@ function contextNodeEditable(node: ViewTreeNode): boolean {
 }
 
 function canDragNode(node: ViewTreeNode): boolean {
-  return !!node.relPath.trim() && contextNodeEditable(node);
+  return !!node.relPath.trim();
 }
 
 function canPlaceNodeInDir(node: ViewTreeNode | null, targetDirRelPath: string): boolean {
@@ -1126,6 +1146,7 @@ async function moveNodeToTarget(
       operation: "viewMoveEntry",
       replaceOperation: true,
     });
+    void loadViews();
   }
 }
 
@@ -1471,13 +1492,10 @@ onUnmounted(() => {
                     dragTargetPosition === 'after',
                 }"
                 draggable="false"
+                :style="{ '--view-tree-row-indent': `${treeIndentPx(entry.row.depth)}px` }"
                 :data-view-node-key="entry.row.node.key"
                 :data-view-node-kind="entry.row.node.kind"
-                :title="
-                  entry.row.node.view?.packageRoot ||
-                  entry.row.node.folder?.packageRoot ||
-                  entry.row.node.label
-                "
+                :title="entry.row.node.label"
                 @pointerdown="onTreePointerDown(entry.row, $event)"
                 @contextmenu.prevent.stop="openTreeContextMenu($event, entry.row)"
                 @dragstart="onTreeDragStart(entry.row, $event)"
@@ -1558,7 +1576,7 @@ onUnmounted(() => {
                   @click="selectTreeRow(entry.row, $event)"
                 >
                   <span
-                    v-if="entry.row.node.kind === 'folder' && entry.row.hasChildren"
+                    v-if="entry.row.node.kind === 'folder'"
                     class="view-tree-branch-slot"
                     @click.stop="toggleRow(entry.row)"
                   >
@@ -1624,6 +1642,15 @@ onUnmounted(() => {
               </div>
 
               <div
+                v-else-if="entry.type === 'empty-folder'"
+                class="view-tree-empty-folder-row"
+                :style="{ paddingLeft: `${treeIndentPx(entry.depth)}px` }"
+              >
+                <span class="view-tree-branch-spacer" aria-hidden="true"></span>
+                <span class="view-tree-empty-folder-text">{{ t("view.tree.emptyFolder") }}</span>
+              </div>
+
+              <div
                 v-else
                 class="view-tree-create-row"
                 :style="{ paddingLeft: `${treeIndentPx(entry.draft.depth)}px` }"
@@ -1668,7 +1695,7 @@ onUnmounted(() => {
             <div v-else-if="!viewTreeNodes.length && !loading && !createFolderDraft" class="view-empty">
               {{ t("view.list.empty") }}
             </div>
-            <div v-if="loading" class="view-empty">{{ t("common.loading") }}</div>
+            <div v-if="loading && !visibleViewEntries.length" class="view-empty">{{ t("common.loading") }}</div>
           </div>
         </aside>
 
@@ -1825,16 +1852,16 @@ onUnmounted(() => {
 
       <Teleport to="body">
           <div
-            v-if="contextMenu && deleteConfirm"
+            v-if="deleteConfirm"
             class="view-delete-confirm"
-            :style="{ left: contextMenu.x + 'px', top: contextMenu.y + 'px' }"
+            :style="{ left: deleteConfirm.x + 'px', top: deleteConfirm.y + 'px' }"
             @click.stop
           >
             <div class="view-delete-confirm-title">
               {{ t("view.tree.deleteConfirmTitle") }}
             </div>
             <div class="view-delete-confirm-text">
-              {{ t("view.tree.deleteConfirmMessage", deleteConfirm.label) }}
+              {{ t("view.tree.deleteConfirmMessage", deleteConfirm.node.label) }}
             </div>
             <div class="view-delete-confirm-actions">
               <BaseButton class="view-delete-confirm-btn" @click="closeDeleteConfirm">
@@ -1967,7 +1994,7 @@ onUnmounted(() => {
 .view-tree-row-shell.drop-after::after {
   content: "";
   position: absolute;
-  left: 8px;
+  left: var(--view-tree-row-indent, 8px);
   right: 8px;
   height: 2px;
   border-radius: 2px;
@@ -2154,6 +2181,24 @@ onUnmounted(() => {
   color: var(--status-danger-fg);
   font-size: 11px;
   line-height: 1.35;
+}
+
+.view-tree-empty-folder-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 24px;
+  padding: 2px 12px 2px 16px;
+  color: var(--text-secondary);
+  font-size: 12px;
+  opacity: 0.75;
+}
+
+.view-tree-empty-folder-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .view-tree-create-row {

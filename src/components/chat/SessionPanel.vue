@@ -11,7 +11,7 @@ import {
   type ComponentPublicInstance,
 } from "vue";
 import { storeToRefs } from "pinia";
-import { Check, ChevronRight, Folder, FolderOpen, HelpCircle, X } from "lucide";
+import { Check, ChevronRight, Folder, FolderOpen, HelpCircle, ListTree, LoaderCircle, MessageSquarePlus, Settings2, Sparkles, X } from "lucide";
 import { t } from "../../i18n";
 import { buildSessionTree } from "./sessionTree";
 import BaseButton from "../ui/BaseButton.vue";
@@ -67,7 +67,8 @@ interface VisibleViewRow {
 
 type VisibleViewEntry =
   | { type: "row"; key: string; row: VisibleViewRow }
-  | { type: "create"; key: string; draft: ViewCreateFolderDraft };
+  | { type: "create"; key: string; draft: ViewCreateFolderDraft }
+  | { type: "empty-folder"; key: string; depth: number };
 
 interface ViewCreateFolderDraft {
   parentRelPath: string;
@@ -87,7 +88,14 @@ interface ViewRenameDraft {
 
 type ViewContextMenuState =
   | { x: number; y: number; kind: "root" }
-  | { x: number; y: number; kind: "folder" | "view"; node: ViewTreeNode };
+  | { x: number; y: number; kind: "folder" | "view"; node: ViewTreeNode }
+  | { x: number; y: number; kind: "move"; node: ViewTreeNode };
+
+interface ViewDeleteConfirmState {
+  x: number;
+  y: number;
+  node: ViewTreeNode;
+}
 
 interface ViewPointerDragState {
   node: ViewTreeNode;
@@ -178,7 +186,7 @@ const viewTreeOrder = ref<string[]>([]);
 const viewsLoading = ref(false);
 const viewOpeningKey = ref("");
 const viewCtxMenu = ref<ViewContextMenuState | null>(null);
-const viewDeleteConfirm = ref<ViewTreeNode | null>(null);
+const viewDeleteConfirm = ref<ViewDeleteConfirmState | null>(null);
 const viewCreateFolderDraft = ref<ViewCreateFolderDraft | null>(null);
 const viewCreateFolderInputRef = ref<HTMLInputElement | null>(null);
 const viewRenameDraft = ref<ViewRenameDraft | null>(null);
@@ -188,6 +196,7 @@ const viewDragTargetKey = ref("");
 const viewDragTargetPosition = ref<ViewDropTarget["position"] | "">("");
 const viewHelpOpen = ref(false);
 const viewHelpDialogRef = ref<HTMLElement | null>(null);
+const viewHelpBtnRef = ref<HTMLButtonElement | null>(null);
 const hasWorkspace = computed(() => !!props.workingDir?.trim());
 const viewExpandedState = ref<Record<string, boolean>>(loadViewExpandedState());
 const sessionPanelRef = ref<HTMLElement | null>(null);
@@ -409,7 +418,7 @@ function setViewNodeExpanded(key: string, value: boolean) {
 }
 
 function toggleViewRow(row: VisibleViewRow) {
-  if (!row.hasChildren) return;
+  if (row.node.kind !== "folder") return;
   setViewNodeExpanded(row.node.key, !row.expanded);
 }
 
@@ -439,8 +448,16 @@ const visibleViewEntries = computed<VisibleViewEntry[]>(() => {
           draft: viewCreateFolderDraft.value,
         });
       }
-      if (node.kind === "folder" && hasChildren && expanded) {
-        walk(node.children, depth + 1);
+      if (node.kind === "folder" && expanded) {
+        if (hasChildren) {
+          walk(node.children, depth + 1);
+        } else {
+          entries.push({
+            type: "empty-folder",
+            key: `view-empty:${node.key}`,
+            depth: depth + 1,
+          });
+        }
       }
     }
   };
@@ -490,6 +507,16 @@ function cachedViewOpenRequirementError(view: ViewPackageSummary) {
     : null;
 }
 
+function viewOpenKey(view: ViewPackageSummary): string {
+  return `${viewDisplayPath(view)}:${view.id}`;
+}
+
+function isViewRowOpening(row: VisibleViewRow): boolean {
+  if (row.node.kind !== "view" || !row.node.view || !viewOpeningKey.value) return false;
+  const key = viewOpenKey(row.node.view);
+  return viewOpeningKey.value === key || viewOpeningKey.value === `${key}:unity`;
+}
+
 async function openView(view: ViewPackageSummary) {
   if (viewOpeningKey.value) return;
   const cachedRequirementError = cachedViewOpenRequirementError(view);
@@ -498,7 +525,7 @@ async function openView(view: ViewPackageSummary) {
     return;
   }
 
-  const key = `${viewDisplayPath(view)}:${view.id}`;
+  const key = viewOpenKey(view);
   viewOpeningKey.value = key;
   try {
     const requirementError = await checkViewOpenRequirements(view);
@@ -521,7 +548,7 @@ async function openView(view: ViewPackageSummary) {
 
 async function openViewInUnity(view: ViewPackageSummary) {
   if (viewOpeningKey.value) return;
-  const key = `${viewDisplayPath(view)}:${view.id}:unity`;
+  const key = `${viewOpenKey(view)}:unity`;
   viewOpeningKey.value = key;
   try {
     const requirementError = await checkViewOpenRequirements(view);
@@ -711,26 +738,82 @@ async function submitViewRename() {
   }
 }
 
+interface ViewMoveTargetOption {
+  key: string;
+  relPath: string;
+  label: string;
+  depth: number;
+}
+
+const viewMoveTargets = computed<ViewMoveTargetOption[]>(() => {
+  const menu = viewCtxMenu.value;
+  if (!menu || menu.kind === "root") return [];
+  const node = menu.node;
+  const targets: ViewMoveTargetOption[] = [];
+  if (canDropViewNodeInsideDir(node, "")) {
+    targets.push({
+      key: VIEW_ROOT_ANCHOR_KEY,
+      relPath: "",
+      label: t("view.tree.moveToRoot"),
+      depth: 0,
+    });
+  }
+  const walk = (nodes: ViewTreeNode[], depth: number) => {
+    for (const candidate of nodes) {
+      if (candidate.kind !== "folder") continue;
+      if (canDropViewNodeInsideDir(node, candidate.relPath)) {
+        targets.push({
+          key: candidate.key,
+          relPath: candidate.relPath,
+          label: candidate.label,
+          depth,
+        });
+      }
+      walk(candidate.children, depth + 1);
+    }
+  };
+  walk(viewTreeNodes.value, 1);
+  return targets;
+});
+
+function beginMoveViewEntry() {
+  const menu = viewCtxMenu.value;
+  if (!menu || menu.kind === "root" || menu.kind === "move") return;
+  viewDeleteConfirm.value = null;
+  viewCtxMenu.value = { x: menu.x, y: menu.y, kind: "move", node: menu.node };
+}
+
+async function submitMoveViewEntry(targetDirRelPath: string) {
+  const menu = viewCtxMenu.value;
+  if (!menu || menu.kind !== "move") return;
+  const node = menu.node;
+  closeViewContextMenu();
+  await moveViewNodeToDir(node, targetDirRelPath);
+}
+
 function requestDeleteViewEntry() {
   const menu = viewCtxMenu.value;
   if (!menu || menu.kind === "root") return;
-  viewDeleteConfirm.value = menu.node;
+  viewDeleteConfirm.value = {
+    x: menu.x,
+    y: menu.y,
+    node: menu.node,
+  };
+  closeViewContextMenu();
 }
 
 function closeViewDeleteConfirm() {
   viewDeleteConfirm.value = null;
-  closeViewContextMenu();
 }
 
 async function confirmDeleteViewEntry() {
-  const node = viewDeleteConfirm.value;
-  if (!node) return;
+  const confirm = viewDeleteConfirm.value;
+  if (!confirm) return;
   try {
-    const snapshot = await viewDeleteEntry({ relPath: node.relPath });
+    const snapshot = await viewDeleteEntry({ relPath: confirm.node.relPath });
     viewSummaries.value = snapshot.views;
     viewFolders.value = snapshot.folders;
     viewTreeOrder.value = snapshot.order ?? [];
-    closeViewDeleteConfirm();
   } catch (error) {
     const err = normalizeAppError(error);
     notificationStore.addNotice("error", err.message, {
@@ -738,6 +821,8 @@ async function confirmDeleteViewEntry() {
       operation: "deleteViewEntry",
       skipConsoleLog: true,
     });
+  } finally {
+    closeViewDeleteConfirm();
   }
 }
 
@@ -1155,6 +1240,12 @@ function onViewResizeMouseDown(event: MouseEvent) {
 }
 
 function closeViewHelp() {
+  if (
+    viewHelpOpen.value &&
+    viewHelpDialogRef.value?.contains(document.activeElement)
+  ) {
+    viewHelpBtnRef.value?.focus();
+  }
   viewHelpOpen.value = false;
 }
 
@@ -1693,6 +1784,7 @@ function ctxArchive() {
         <span class="sp-view-title">{{ t('view.list.title') }}</span>
         <div class="sp-view-help-wrap">
           <button
+            ref="viewHelpBtnRef"
             type="button"
             class="sp-view-help-btn"
             :title="t('view.list.helpLabel')"
@@ -1731,12 +1823,13 @@ function ctxArchive() {
               'drop-after':
                 viewDragTargetKey === entry.row.node.key &&
                 viewDragTargetPosition === 'after',
-              opening: entry.row.node.kind === 'view' && entry.row.node.view && viewOpeningKey === `${viewDisplayPath(entry.row.node.view)}:${entry.row.node.view.id}`,
+              opening: isViewRowOpening(entry.row),
             }"
             draggable="false"
+            :style="{ '--sp-view-row-indent': `${viewTreeIndentPx(entry.row.depth)}px` }"
             :data-view-node-key="entry.row.node.key"
             :data-view-node-kind="entry.row.node.kind"
-            :title="entry.row.node.view?.packageRoot || entry.row.node.folder?.packageRoot || entry.row.node.label"
+            :title="entry.row.node.label"
             @pointerdown="onViewPointerDown(entry.row, $event)"
             @contextmenu.prevent.stop="openViewContextMenu($event, entry.row)"
             @dragstart="onViewDragStart(entry.row, $event)"
@@ -1818,7 +1911,7 @@ function ctxArchive() {
               @click="onViewRowClick(entry.row, $event)"
             >
               <span
-                v-if="entry.row.node.kind === 'folder' && entry.row.hasChildren"
+                v-if="entry.row.node.kind === 'folder'"
                 class="sp-view-branch-slot"
                 @click.stop="toggleViewRow(entry.row)"
               >
@@ -1849,6 +1942,14 @@ function ctxArchive() {
                 aria-hidden="true"
               >
                 <LucideIcon
+                  v-if="isViewRowOpening(entry.row)"
+                  class="sp-view-opening-spinner"
+                  :icon="LoaderCircle"
+                  :size="13"
+                  :stroke-width="2"
+                />
+                <LucideIcon
+                  v-else
                   :icon="resolveLocusViewIcon(entry.row.node.view?.icon)"
                   :size="13"
                   :stroke-width="2"
@@ -1859,7 +1960,7 @@ function ctxArchive() {
           </div>
 
           <div
-            v-else
+            v-else-if="entry.type === 'create'"
             class="sp-view-create-row"
             :style="{ paddingLeft: `${viewTreeIndentPx(entry.draft.depth)}px` }"
           >
@@ -1898,10 +1999,25 @@ function ctxArchive() {
               </div>
             </div>
           </div>
+
+          <div
+            v-else
+            class="sp-view-empty-folder-row"
+            :style="{ paddingLeft: `${viewTreeIndentPx(entry.depth)}px` }"
+          >
+            <span class="sp-view-branch-spacer" aria-hidden="true"></span>
+            <span class="sp-view-empty-folder-text">{{ t('view.tree.emptyFolder') }}</span>
+          </div>
         </template>
 
-        <div v-if="viewsLoading" class="sp-view-empty">{{ t('common.loading') }}</div>
-        <div v-else-if="!viewTreeNodes.length && !viewCreateFolderDraft" class="sp-view-empty">{{ t('view.list.empty') }}</div>
+        <div v-if="viewsLoading && !visibleViewEntries.length" class="sp-view-empty">{{ t('common.loading') }}</div>
+        <div v-else-if="!viewsLoading && !viewTreeNodes.length && !viewCreateFolderDraft" class="sp-view-empty">
+          <div class="sp-view-empty-title">{{ t('view.list.empty') }}</div>
+          <p class="sp-view-empty-hint">{{ t('view.list.emptyHint') }}</p>
+          <button type="button" class="sp-view-empty-link" @click="openViewHelp">
+            {{ t('view.list.emptyHelpLink') }}
+          </button>
+        </div>
       </div>
     </section>
 
@@ -1917,7 +2033,6 @@ function ctxArchive() {
             ref="viewHelpDialogRef"
             class="sp-view-help-dialog"
             role="dialog"
-            aria-modal="true"
             :aria-labelledby="'session-view-help-title'"
             tabindex="-1"
             @keydown.esc.stop="closeViewHelp"
@@ -1938,16 +2053,40 @@ function ctxArchive() {
             </header>
             <div class="sp-view-help-body">
               <section class="sp-view-help-section">
-                <div class="sp-view-help-section-title">{{ t('view.list.helpFeatureTitle') }}</div>
-                <p>{{ t('view.list.helpBody') }}</p>
+                <span class="sp-view-help-section-icon" aria-hidden="true">
+                  <LucideIcon :icon="Sparkles" :size="15" :stroke-width="1.8" />
+                </span>
+                <div class="sp-view-help-section-copy">
+                  <div class="sp-view-help-section-title">{{ t('view.list.helpFeatureTitle') }}</div>
+                  <p>{{ t('view.list.helpBody') }}</p>
+                </div>
               </section>
               <section class="sp-view-help-section">
-                <div class="sp-view-help-section-title">{{ t('view.list.helpCreateTitle') }}</div>
-                <p>{{ t('view.list.helpCreate') }}</p>
+                <span class="sp-view-help-section-icon" aria-hidden="true">
+                  <LucideIcon :icon="MessageSquarePlus" :size="15" :stroke-width="1.8" />
+                </span>
+                <div class="sp-view-help-section-copy">
+                  <div class="sp-view-help-section-title">{{ t('view.list.helpCreateTitle') }}</div>
+                  <p>{{ t('view.list.helpCreate') }}</p>
+                </div>
               </section>
               <section class="sp-view-help-section">
-                <div class="sp-view-help-section-title">{{ t('view.list.helpSettingsTitle') }}</div>
-                <p>{{ t('view.list.helpSettings') }}</p>
+                <span class="sp-view-help-section-icon" aria-hidden="true">
+                  <LucideIcon :icon="ListTree" :size="15" :stroke-width="1.8" />
+                </span>
+                <div class="sp-view-help-section-copy">
+                  <div class="sp-view-help-section-title">{{ t('view.list.helpOrganizeTitle') }}</div>
+                  <p>{{ t('view.list.helpOrganize') }}</p>
+                </div>
+              </section>
+              <section class="sp-view-help-section">
+                <span class="sp-view-help-section-icon" aria-hidden="true">
+                  <LucideIcon :icon="Settings2" :size="15" :stroke-width="1.8" />
+                </span>
+                <div class="sp-view-help-section-copy">
+                  <div class="sp-view-help-section-title">{{ t('view.list.helpSettingsTitle') }}</div>
+                  <p>{{ t('view.list.helpSettings') }}</p>
+                </div>
               </section>
             </div>
             <footer class="sp-view-help-footer">
@@ -1980,6 +2119,14 @@ function ctxArchive() {
       >
         {{ t('view.tree.rename') }}
       </button>
+      <button
+        v-if="(viewCtxMenu.kind === 'folder' || viewCtxMenu.kind === 'view') && viewMoveTargets.length"
+        type="button"
+        class="sp-ctx-item"
+        @click.stop="beginMoveViewEntry"
+      >
+        {{ t('view.tree.moveTo') }}
+      </button>
       <div v-if="viewCtxMenu.kind === 'folder' || viewCtxMenu.kind === 'view'" class="sp-ctx-sep"></div>
       <button
         v-if="viewCtxMenu.kind === 'view'"
@@ -2006,17 +2153,33 @@ function ctxArchive() {
       >
         {{ t('view.tree.delete') }}
       </button>
+      <template v-if="viewCtxMenu.kind === 'move'">
+        <div class="sp-ctx-label">{{ t('view.tree.moveTo') }}</div>
+        <button
+          v-for="target in viewMoveTargets"
+          :key="target.key"
+          type="button"
+          class="sp-ctx-item sp-ctx-move-target"
+          :style="{ paddingLeft: `${10 + target.depth * 14}px` }"
+          @click.stop="submitMoveViewEntry(target.relPath)"
+        >
+          <span v-if="target.relPath" class="sp-ctx-move-target-icon" aria-hidden="true">
+            <LucideIcon :icon="Folder" :size="12" :stroke-width="2" />
+          </span>
+          <span class="sp-ctx-move-target-label">{{ target.label }}</span>
+        </button>
+      </template>
     </BaseContextMenu>
 
     <Teleport to="body">
         <div
-          v-if="viewCtxMenu && viewDeleteConfirm"
+          v-if="viewDeleteConfirm"
           class="sp-delete-confirm"
-          :style="{ left: viewCtxMenu.x + 'px', top: viewCtxMenu.y + 'px' }"
+          :style="{ left: viewDeleteConfirm.x + 'px', top: viewDeleteConfirm.y + 'px' }"
           @click.stop
         >
           <div class="sp-delete-confirm-title">{{ t('view.tree.deleteConfirmTitle') }}</div>
-          <div class="sp-delete-confirm-text">{{ t('view.tree.deleteConfirmMessage', viewDeleteConfirm.label) }}</div>
+          <div class="sp-delete-confirm-text">{{ t('view.tree.deleteConfirmMessage', viewDeleteConfirm.node.label) }}</div>
           <div class="sp-delete-confirm-actions">
             <BaseButton class="sp-delete-confirm-btn" @click="closeViewDeleteConfirm">
               {{ t('common.cancel') }}
@@ -2197,20 +2360,21 @@ function ctxArchive() {
   display: flex;
   align-items: center;
   justify-content: center;
-  padding: 20px;
-  background: rgba(8, 10, 14, 0.34);
+  padding: 24px;
+  background: rgba(0, 0, 0, 0.32);
 }
 
 .sp-view-help-dialog {
-  width: min(620px, 100%);
-  max-height: min(680px, calc(100vh - 40px));
+  width: min(520px, 100%);
+  max-height: min(640px, 100%);
   display: flex;
   flex-direction: column;
   border: 1px solid var(--border-color);
   border-radius: 12px;
   background: var(--surface-elevated);
-  box-shadow: 0 18px 40px rgba(15, 17, 21, 0.16);
+  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.28);
   overflow: hidden;
+  transform-origin: center;
 }
 
 .sp-view-help-dialog:focus {
@@ -2219,10 +2383,11 @@ function ctxArchive() {
 
 .sp-view-help-header {
   display: flex;
-  align-items: flex-start;
+  align-items: center;
   justify-content: space-between;
-  gap: 16px;
-  padding: 18px 20px 14px;
+  gap: 12px;
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--border-color);
 }
 
 .sp-view-help-header-copy {
@@ -2233,8 +2398,8 @@ function ctxArchive() {
 
 .sp-view-help-title {
   margin: 0;
-  font-size: 18px;
-  font-weight: 700;
+  font-size: 14px;
+  font-weight: 600;
   line-height: 1.3;
   color: var(--text-color);
 }
@@ -2267,31 +2432,47 @@ function ctxArchive() {
 .sp-view-help-body {
   display: flex;
   flex-direction: column;
-  gap: 18px;
-  padding: 0 20px 18px;
+  gap: 16px;
+  padding: 16px;
   overflow: auto;
 }
 
 .sp-view-help-section {
   display: flex;
-  flex-direction: column;
-  gap: 8px;
+  align-items: flex-start;
+  gap: 12px;
 }
 
-.sp-view-help-section + .sp-view-help-section {
-  padding-top: 16px;
-  border-top: 1px solid var(--border-color);
+.sp-view-help-section-icon {
+  flex-shrink: 0;
+  width: 30px;
+  height: 30px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 8px;
+  background: var(--hover-bg);
+  color: var(--accent-color);
+}
+
+.sp-view-help-section-copy {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding-top: 1px;
 }
 
 .sp-view-help-section-title {
   font-size: 13px;
   font-weight: 600;
+  line-height: 1.4;
   color: var(--text-color);
 }
 
 .sp-view-help-section p {
   margin: 0;
-  font-size: 13px;
+  font-size: 12.5px;
   line-height: 1.65;
   color: var(--text-secondary);
 }
@@ -2300,7 +2481,7 @@ function ctxArchive() {
   display: flex;
   justify-content: flex-end;
   gap: 8px;
-  padding: 14px 20px 18px;
+  padding: 12px 16px;
   border-top: 1px solid var(--border-color);
 }
 
@@ -2322,22 +2503,16 @@ function ctxArchive() {
 .sp-view-help-modal-enter-from .sp-view-help-dialog,
 .sp-view-help-modal-leave-to .sp-view-help-dialog {
   opacity: 0;
-  transform: scale(0.96) translateY(8px);
-}
-
-@media (max-width: 720px) {
-  .sp-view-help-dialog {
-    max-height: min(720px, calc(100vh - 24px));
-  }
-
-  .sp-view-help-overlay {
-    padding: 12px;
-  }
+  transform: scale(0.97) translateY(8px);
 }
 
 .sp-view-list {
   flex: 1 1 0;
   min-height: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 2px;
   overflow-y: auto;
   overscroll-behavior: contain;
   padding: 0 6px 8px;
@@ -2354,8 +2529,12 @@ function ctxArchive() {
   align-items: stretch;
   width: 100%;
   min-width: 0;
+  flex-shrink: 0;
+  border: 1px solid transparent;
+  border-radius: 4px;
   background: transparent;
-  transition: background 0.1s ease, box-shadow 0.1s ease, opacity 0.1s ease;
+  transition: background 0.1s ease, box-shadow 0.1s ease, opacity 0.1s ease,
+    border-color 0.1s ease;
 }
 
 .sp-view-row-shell:hover {
@@ -2364,7 +2543,8 @@ function ctxArchive() {
 
 .sp-view-row-shell.opening,
 .sp-view-row-shell.opening:hover {
-  background: color-mix(in srgb, var(--active-bg) 74%, var(--sidebar-bg) 26%);
+  background: color-mix(in srgb, var(--active-bg) 78%, var(--sidebar-bg));
+  border-color: color-mix(in srgb, var(--accent-color) 18%, transparent);
 }
 
 .sp-view-row-shell.dragging {
@@ -2381,7 +2561,7 @@ function ctxArchive() {
 .sp-view-row-shell.drop-after::after {
   content: "";
   position: absolute;
-  left: 8px;
+  left: var(--sp-view-row-indent, 12px);
   right: 8px;
   height: 2px;
   border-radius: 2px;
@@ -2423,7 +2603,6 @@ function ctxArchive() {
 
 .sp-view-row:disabled {
   cursor: progress;
-  opacity: 0.76;
 }
 
 .sp-view-branch-slot,
@@ -2479,6 +2658,16 @@ function ctxArchive() {
 .sp-view-row-shell.opening .sp-view-kind-icon.view,
 .sp-view-row-shell:hover .sp-view-kind-icon.view {
   color: var(--accent-color);
+}
+
+.sp-view-opening-spinner {
+  animation: sp-view-spin 0.9s linear infinite;
+}
+
+@keyframes sp-view-spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 .sp-view-label {
@@ -2623,10 +2812,89 @@ function ctxArchive() {
 }
 
 .sp-view-empty {
-  padding: 8px 7px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 12px;
   color: var(--text-secondary);
   font-size: 12px;
   line-height: 1.5;
+}
+
+.sp-view-empty-title {
+  font-weight: 600;
+}
+
+.sp-view-empty-hint {
+  margin: 0;
+}
+
+.sp-view-empty-link {
+  align-self: flex-start;
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--accent-color);
+  font: inherit;
+  font-size: 12px;
+  line-height: 1.5;
+  cursor: pointer;
+}
+
+.sp-view-empty-link:hover {
+  text-decoration: underline;
+}
+
+.sp-view-empty-link:focus-visible {
+  outline: 2px solid var(--accent-color);
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+
+.sp-view-empty-folder-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 24px;
+  flex-shrink: 0;
+  padding: 2px 12px 2px 16px;
+  color: var(--text-secondary);
+  font-size: 12px;
+  opacity: 0.75;
+}
+
+.sp-view-empty-folder-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sp-ctx-label {
+  padding: 4px 10px 2px;
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 1.4;
+  cursor: default;
+}
+
+.sp-ctx-move-target {
+  gap: 6px;
+}
+
+.sp-ctx-move-target-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  color: color-mix(in srgb, var(--accent-color) 38%, var(--text-secondary) 62%);
+}
+
+.sp-ctx-move-target-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .sp-tree-row.virtual {

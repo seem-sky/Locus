@@ -419,7 +419,8 @@ pub fn run() {
                 lua_runtime::set_managed_lua_resource_dir(resource_dir.clone());
                 rtk_runtime::set_managed_rtk_resource_dir(resource_dir.clone());
                 crate::agentmemory::resolve::set_managed_agentmemory_resource_dir(resource_dir.clone());
-                headroom::resolve::set_managed_headroom_proxy_resource_dir(resource_dir);
+                headroom::resolve::set_managed_headroom_proxy_resource_dir(resource_dir.clone());
+                process_util::set_managed_github_cli_resource_dir(resource_dir);
             }
             commands::restore_saved_git_override(&app.handle().clone());
 
@@ -616,7 +617,20 @@ pub fn run() {
             let memory_store = Arc::new(crate::agentmemory::AgentMemoryState::new());
             let headroom_proxy_for_startup = headroom_proxy_state.clone();
 
-            let undo_manager: UndoManagerHandle = Arc::new(vcs::UndoManager::new(vcs::GitProvider));
+            // Persistent undo stacks: survive restarts; entries for sessions
+            // deleted while the app was closed are dropped at load.
+            let undo_valid_sessions = match store.list_all_session_ids() {
+                Ok(ids) => Some(ids.into_iter().collect::<std::collections::HashSet<_>>()),
+                Err(e) => {
+                    eprintln!("[Locus] failed to list session ids for undo reconcile: {}", e);
+                    None
+                }
+            };
+            let undo_manager: UndoManagerHandle = Arc::new(vcs::UndoManager::with_persistence(
+                vcs::GitProvider,
+                data_dir.join("undo_stacks.json"),
+                undo_valid_sessions,
+            ));
             let view_automation_store = Arc::new(view::ViewAutomationStore::default());
 
             let tool_mode_path = data_dir.join("tool_permission_mode.txt");
@@ -1276,8 +1290,25 @@ pub fn run() {
             commands::get_skill_unity_install_status,
             commands::install_skill_unity_files,
             commands::remove_skill_unity_files,
+            commands::plugin_registry_sources_get,
+            commands::plugin_registry_sources_set,
+            commands::plugin_registry_fetch_manifest,
+            commands::plugin_registry_fetch_shard,
+            commands::plugin_registry_fetch_search_index,
+            commands::plugin_registry_fetch_plugin,
+            commands::plugin_registry_fetch_description,
             commands::plugin_list_installed,
             commands::plugin_install_from_path,
+            commands::plugin_install_from_registry,
+            commands::plugin_install_from_source,
+            commands::plugin_set_enabled,
+            commands::plugin_github_auth_status,
+            commands::plugin_github_repo_star_status,
+            commands::plugin_github_repo_set_starred,
+            commands::plugin_github_auth_save_token,
+            commands::plugin_github_oauth_start,
+            commands::plugin_github_oauth_poll,
+            commands::plugin_github_auth_logout,
             commands::plugin_uninstall,
             commands::plugin_export,
             commands::open_file_external,
@@ -1320,6 +1351,7 @@ pub fn run() {
             commands::undo_preview,
             commands::undo_list,
             commands::undo_check_conflicts,
+            commands::undo_check_dirty,
             commands::get_debug_mode,
             commands::set_debug_mode,
             commands::get_file_tool_workspace_boundary,

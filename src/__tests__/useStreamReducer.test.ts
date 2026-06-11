@@ -1,5 +1,11 @@
 import { describe, it, expect } from "vitest";
-import { buildToolResultMessages, mergeUserMessage, reduceStreamEvent, type StreamState } from "../composables/useStreamReducer";
+import {
+  buildToolResultMessages,
+  isMatchingPendingUserMessage,
+  mergeUserMessage,
+  reduceStreamEvent,
+  type StreamState,
+} from "../composables/useStreamReducer";
 import type { StreamEvent, ToolCallDisplay } from "../types";
 
 function makeState(overrides?: Partial<StreamState>): StreamState {
@@ -735,6 +741,22 @@ describe("reduceStreamEvent", () => {
       expect(messages[0]?.content).toContain("<locus-references>");
     });
 
+    it("exposes the same pending match rule for failed draft restore checks", () => {
+      expect(isMatchingPendingUserMessage({
+        id: "user_pending_1",
+        role: "user",
+        content: "inspect this asset",
+        createdAt: 10,
+        assetRefs: [{ kind: "asset", path: "Assets/Foo.prefab" }],
+      }, {
+        id: "user-1",
+        role: "user",
+        content: "inspect this asset\n\n<locus-references>\n- asset: {@Assets/Foo.prefab}\n</locus-references>",
+        createdAt: 11,
+        assetRefs: [{ kind: "asset", path: "Assets/Foo.prefab" }],
+      })).toBe(true);
+    });
+
     it("does not replace a pending user message with different content only because timestamps are close", () => {
       const messages = mergeUserMessage([
         {
@@ -1160,6 +1182,36 @@ describe("reduceStreamEvent", () => {
       if (qMut?.type === "setQuestion") {
         expect(qMut.question?.questionId).toBe("q1");
         expect(qMut.question?.question).toBe("What file?");
+        expect(qMut.question?.sheet).toBeNull();
+      }
+    });
+
+    it("carries the sheet payload into the pending question", () => {
+      const state = makeState({ isStreaming: true });
+      const event: StreamEvent = { runId: "test-run",
+        type: "askUser",
+        sessionId: "s1",
+        questionId: "q2",
+        toolCallId: "tc2",
+        question: "Publish plugin asset-tools 0.1.0",
+        options: [],
+        sheet: {
+          description: "Creates the zip and installs it locally.",
+          confirmLabel: "Publish",
+          fields: [
+            { key: "id", label: "Plugin id", value: "asset-tools", readonly: true },
+            { key: "version", label: "Version", value: "0.1.0", options: ["0.1.0", "0.2.0"] },
+          ],
+        },
+      };
+      const mutations = reduceStreamEvent(state, event);
+
+      const qMut = mutations.find((m) => m.type === "setQuestion");
+      expect(qMut).toBeDefined();
+      if (qMut?.type === "setQuestion") {
+        expect(qMut.question?.sheet?.confirmLabel).toBe("Publish");
+        expect(qMut.question?.sheet?.fields).toHaveLength(2);
+        expect(qMut.question?.sheet?.fields[0]?.readonly).toBe(true);
       }
     });
   });

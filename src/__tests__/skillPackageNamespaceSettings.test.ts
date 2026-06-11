@@ -18,7 +18,7 @@ describe("skill package namespace settings", () => {
     const knowledgeSettings = read("src/components/settings/KnowledgeSettings.vue");
     const knowledgeService = read("src/services/knowledge.ts");
     const skillCreateTool = read("tools/skill_create.json");
-    const createSkillDoc = read("knowledge/skill/builtin/create-skill.md");
+    const createSkillDoc = read("knowledge/skill/create-skill.md");
     const zh = read("src/language/zh.json");
     const en = read("src/language/en.json");
 
@@ -48,7 +48,7 @@ describe("skill package namespace settings", () => {
 
     expect(skillCreateTool).toContain("short kebab-case package id");
     expect(skillCreateTool).toContain("studio.tools.asset-audit");
-    expect(createSkillDoc).toContain("short kebab-case package IDs");
+    expect(createSkillDoc).toContain("short kebab-case package ids");
     expect(createSkillDoc).toContain("studio.tools.asset-audit");
     expect(zh).toContain('"settings.knowledge.defaultSkillPackageNamespace"');
     expect(en).toContain('"settings.knowledge.defaultSkillPackageNamespace"');

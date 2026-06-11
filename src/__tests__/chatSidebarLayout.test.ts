@@ -367,7 +367,8 @@ describe("chat sidebar layout", () => {
     expect(transcript).toContain("assertCanonicalRenderParts(item.message.renderParts, `message:${item.message.id}`);");
     expect(transcript).toContain("synthesizeLegacyRenderParts(item.message, {");
     expect(transcript).toContain("const canonicalLiveRenderParts = computed(() => {");
-    expect(transcript).toContain("props.liveRenderParts.length > 0");
+    expect(transcript).toContain("useThrottledLiveRenderParts(() => props.liveRenderParts)");
+    expect(transcript).toContain("displayedLiveRenderParts.value.length > 0");
     expect(transcript).toContain("const hasVisibleActiveThinkingBlock = computed(() =>");
     expect(transcript).toContain(":class=\"{ active: segment.active, 'is-clickable': true }\"");
     expect(transcript).toContain("data-render-part-kind=\"toolCall\"");
@@ -380,6 +381,23 @@ describe("chat sidebar layout", () => {
       /<div class="chat-transcript-message-content" :class="`is-\$\{variant\}`">\s*<div class="chat-transcript-item-stack" :class="`is-\$\{variant\}`">\s*<template\s+v-for="segment in transientRenderSegments"/,
     );
     expect(transcript).not.toContain("splitToolCallsByRenderOrder");
+  });
+
+  it("memoizes history groups so streaming text only repaints the live region", () => {
+    const transcript = read("src/components/chat/ChatTranscript.vue");
+    const liveMemoStart = transcript.indexOf("const historyLiveLayoutMemoKey = computed(() => [");
+    const liveMemoEnd = transcript.indexOf("const historyStaticRenderMemoKey = computed(() => [");
+    const liveMemoBlock = transcript.slice(liveMemoStart, liveMemoEnd);
+
+    expect(transcript).toContain("const historyLiveLayoutMemoKey = computed(() => [");
+    expect(transcript).toContain("const historyStaticRenderMemoKey = computed(() => [");
+    expect(transcript).toContain("function historyGroupMemoKey(group: MessageGroup, index: number)");
+    expect(transcript).toContain("index === lastGroupIndex ? historyLiveLayoutMemoKey.value : \"\"");
+    expect(transcript).toContain("v-memo=\"[group, idx, historyGroupMemoKey(group, idx)]\"");
+    expect(transcript).toMatch(/<template\s+v-for="segment in transientRenderSegments"/);
+    expect(liveMemoStart).toBeGreaterThan(-1);
+    expect(liveMemoEnd).toBeGreaterThan(liveMemoStart);
+    expect(liveMemoBlock).not.toContain("streamingText");
   });
 
   it("keeps live thinking above transient status overlays", () => {

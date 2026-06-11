@@ -15,7 +15,7 @@ describe("chat panel toggle layout", () => {
     const tokenUsageBar = read("src/components/chat/TokenUsageBar.vue");
     const transcript = read("src/components/chat/ChatTranscript.vue");
 
-    expect(chatView).toContain("const hasPanelToggleRow = computed(() => chatChangesStore.currentFileCount > 0);");
+    expect(chatView).toContain("const hasPanelToggleRow = computed(() => chatChangesStore.hasAnyChanges);");
     expect(chatView).toContain("const inputControlsCollapsed = ref(false);");
     expect(chatView).toContain("const inputControlsSwitching = ref(false);");
     expect(chatView).toContain("const INPUT_CONTROLS_SWITCH_VISIBLE_MS = 120;");
@@ -36,7 +36,8 @@ describe("chat panel toggle layout", () => {
     expect(chatView).not.toContain("padding-left: 26px;");
     expect(chatView).toMatch(/\.input-backdrop-row \{[\s\S]*display: grid;[\s\S]*grid-template-columns: minmax\(0, 1fr\) minmax\(0, 1fr\);/);
     expect(chatView).not.toContain(".input-backdrop-context {");
-    expect(chatView).toMatch(/<div class="input-backdrop-action">[\s\S]*v-if="!isViewingSubagent && hasPanelToggleRow"[\s\S]*class="changes-toggle-btn ui-select-none"[\s\S]*{{ t\('chat\.changes\.toggle'\) }}/);
+    expect(chatView).toMatch(/<div class="input-backdrop-action">[\s\S]*v-if="!isViewingSubagent && hasPanelToggleRow"[\s\S]*class="changes-toggle-btn ui-select-none"[\s\S]*<LucideIcon :icon="FileDiff" :size="14" \/>[\s\S]*class="changes-toggle-label"[\s\S]*{{ t\('chat\.changes\.toggle'\) }}/);
+    expect(chatView).toContain(':aria-label="t(\'chat.changes.toggle\')"');
     expect(chatView).toContain(":class=\"{ 'is-active': chatChangesStore.currentPanelVisible }\"");
     expect(chatView).toMatch(/\.input-backdrop-action \{[\s\S]*grid-column: 2;[\s\S]*justify-self: end;/);
     expect(chatView).toMatch(/\.input-controls-toggle-zone \{[\s\S]*position: absolute;[\s\S]*top: 10px;[\s\S]*left: 0;/);
@@ -100,7 +101,8 @@ describe("chat panel toggle layout", () => {
     expect(composer).toContain("const showInlineAction = computed(() => props.compact && props.showAction);");
     expect(composer).toContain("const textareaDisabled = computed(() => props.disabled);");
     expect(composer).toContain("const isCancelAction = computed(() => props.isStreaming && !props.canSend);");
-    expect(composer).toContain("const actionDisabled = computed(() => props.disabled || (!isCancelAction.value && !props.canSend));");
+    expect(composer).toContain("const isCancellingAction = computed(() => isCancelAction.value && props.cancelling);");
+    expect(composer).toContain("|| (!isCancelAction.value && !props.canSend));");
     expect(composer).toContain("const COMPACT_TEXTAREA_MIN_HEIGHT = 28;");
     expect(composer).toContain("const minHeight = props.compact ? COMPACT_TEXTAREA_MIN_HEIGHT : DEFAULT_TEXTAREA_MIN_HEIGHT;");
     expect(composer).toContain("Math.max(minHeight, Math.min(contentHeight, props.maxHeight))");
@@ -131,7 +133,8 @@ describe("chat panel toggle layout", () => {
     expect(chatView).toContain("height: 24px;");
     expect(chatView).toContain("line-height: 1;");
     expect(chatView).toMatch(/\.changes-toggle-btn\.is-active \{[\s\S]*background: var\(--active-bg\);/);
-    expect(chatView).toContain("padding: 0 8px;");
+    expect(chatView).toMatch(/\.changes-toggle-btn \{[\s\S]*width: 24px;[\s\S]*height: 24px;[\s\S]*padding: 0;/);
+    expect(chatView).toContain(".changes-toggle-label {");
     expect(chatView).toMatch(/\.changes-toggle-btn:hover:not\(:disabled\),[\s\S]*\.changes-toggle-btn:focus-visible \{[\s\S]*background: var\(--hover-bg\);/);
     expect(chatView).toContain("contain: layout;");
   });

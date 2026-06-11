@@ -1,7 +1,7 @@
 
 <script setup lang="ts">
 import { ref, nextTick, watch, computed, onMounted, onUnmounted } from "vue";
-import { Folder, PanelTopOpen } from "lucide";
+import { FileDiff, Folder, PanelTopOpen } from "lucide";
 import {
   selectUnityAsset,
   openUnityAssetInspector,
@@ -13,7 +13,7 @@ import {
 } from "../services/unity";
 // undoPreview removed — undo UI moved to ChatChangesPanel
 import type { ChatComposerSendPayload, ChatMessage, AgentInfo, TokenUsage, ModelOption, PendingQuestion, PendingToolConfirm, EffortLevel, SessionSummary, AssetDbScanEvent, ScanStats, ImageAttachment, AssetRefAttachment, SkillManifest, UserIntentMeta, SaveRawContextRequest, CodexTransportMode, AssistantRenderPart, UnityConnectionStatus, KnowledgeDocumentType } from "../types";
-import type { ToolCallDisplay } from "../types";
+import type { ChangedFile, ToolCallDisplay } from "../types";
 import ModelEffortSelector from "./ModelEffortSelector.vue";
 import SessionPanel from "./chat/SessionPanel.vue";
 import SessionCompactPicker from "./chat/SessionCompactPicker.vue";
@@ -24,6 +24,7 @@ import RichChatInput from "./chat/RichChatInput.vue";
 import ChatFloatingAssetPreview from "./chat/ChatFloatingAssetPreview.vue";
 import TokenUsageBar from "./chat/TokenUsageBar.vue";
 import AskUserCard from "./chat/AskUserCard.vue";
+import SheetCard from "./chat/SheetCard.vue";
 import ToolConfirmCard from "./chat/ToolConfirmCard.vue";
 import ToolConfirmBatchCard from "./chat/ToolConfirmBatchCard.vue";
 import FileDiffViewer from "./diff/FileDiffViewer.vue";
@@ -66,6 +67,7 @@ import {
   type ResizeObserverHandle,
 } from "../composables/resizeObserver";
 import { forwardWheelToElement } from "../composables/chatWheelPassthrough";
+import { STREAMING_RENDER_THROTTLE_MS } from "../composables/streamingRenderThrottle";
 import { canOpenInEditor } from "../composables/useHideMeta";
 import { useDiffProgress } from "../composables/useDiffProgress";
 import { acquireSelectionLock } from "../composables/useSelectionLock";
@@ -158,7 +160,7 @@ function toggleInputControlsCollapsed() {
 const showInlineDiff = computed(() =>
   !!chatChangesStore.inlineDiffPayload || chatChangesStore.inlineDiffLoading || !!chatChangesStore.inlineDiffError,
 );
-const hasPanelToggleRow = computed(() => chatChangesStore.currentFileCount > 0);
+const hasPanelToggleRow = computed(() => chatChangesStore.hasAnyChanges);
 const showProjectViewFab = computed(() => !showInlineDiff.value);
 const projectViewFabActive = computed(() => chatStore.showProjectViewPanel);
 const projectViewFabTitle = computed(() =>
@@ -197,6 +199,7 @@ const props = defineProps<{
   streamingText: string;
   streamingTextOrder?: number;
   isStreaming: boolean;
+  isCancelling?: boolean;
   isCompacting: boolean;
   isThinking: boolean;
   hasThinking: boolean;
@@ -933,6 +936,37 @@ const messageContextCanAct = computed(() =>
   && messageContextMessage.value.role !== "tool",
 );
 
+function lastRenderableMessage() {
+  for (let index = props.messages.length - 1; index >= 0; index -= 1) {
+    const message = props.messages[index];
+    if (message && hasRenderableTranscriptMessage(message)) {
+      return message;
+    }
+  }
+  return null;
+}
+
+function isLastUserMessageWithoutAssistantAfter(message: ChatMessage) {
+  if (message.role !== "user") return false;
+  if (lastRenderableMessage()?.id !== message.id) return false;
+  const messageIndex = props.messages.findIndex((candidate) => candidate.id === message.id);
+  if (messageIndex < 0) return false;
+  return !props.messages
+    .slice(messageIndex + 1)
+    .some((candidate) => candidate.role === "assistant" && hasRenderableTranscriptMessage(candidate));
+}
+
+const messageContextShouldShowReEdit = computed(() => {
+  const message = messageContextMessage.value;
+  return !!message && isLastUserMessageWithoutAssistantAfter(message);
+});
+
+const messageContextCanReEdit = computed(() =>
+  !!props.activeSessionId
+  && !props.isStreaming
+  && messageContextShouldShowReEdit.value,
+);
+
 async function doMessageCopy() {
   const menu = messageCtxMenu.value;
   if (!menu || !messageContextCanCopy.value) return;
@@ -959,6 +993,18 @@ async function doMessageCopy() {
       operation: "messageCopy",
       replaceOperation: true,
     });
+  }
+}
+
+async function doMessageReEdit() {
+  const message = messageContextMessage.value;
+  if (!message || !messageContextCanReEdit.value) return;
+  const draft = buildUserMessageDraft(message);
+  closeMessageContextMenu();
+  chatChangesStore.closeInlineDiff();
+  const undone = await chatStore.undoLatestConversationTurn();
+  if (undone) {
+    uiStore.stageChatDraftPrefill(draft);
   }
 }
 
@@ -1103,10 +1149,37 @@ function defaultUndoChoice(): UndoChoice {
   return canUndoFilesAndConversation.value ? "files" : "conversation";
 }
 
+const undoChooserDirtyFiles = ref<ChangedFile[]>([]);
+/** Whether the dirty preflight for the current chooser target completed. */
+const undoChooserDirtyChecked = ref(false);
+const undoChooserDirtyPreview = computed(() => {
+  const paths = undoChooserDirtyFiles.value.map((file) => file.path);
+  if (paths.length <= 5) return paths.join("\n");
+  return [...paths.slice(0, 5), `+${paths.length - 5}`].join("\n");
+});
+
+function refreshUndoChooserDirtyState() {
+  undoChooserDirtyFiles.value = [];
+  undoChooserDirtyChecked.value = false;
+  const targetId = currentUndoTarget.value?.fileUndoTarget;
+  if (!targetId) return;
+  void chatStore.checkUndoDirty(targetId).then(
+    (files) => {
+      if (currentUndoTarget.value?.fileUndoTarget !== targetId) return;
+      undoChooserDirtyFiles.value = files;
+      undoChooserDirtyChecked.value = true;
+    },
+    (e) => {
+      console.warn("[ChatView] undo_check_dirty failed:", e);
+    },
+  );
+}
+
 async function openUndoChooser(messageId: string | null = null) {
   undoTargetMessageId.value = messageId;
   selectedUndoChoice.value = defaultUndoChoice();
   undoChooserVisible.value = true;
+  refreshUndoChooserDirtyState();
   await nextTick();
   undoChooserRef.value?.focus();
 }
@@ -1115,6 +1188,8 @@ function closeUndoChooser() {
   if (undoChooserBusy.value) return;
   undoChooserVisible.value = false;
   undoTargetMessageId.value = null;
+  undoChooserDirtyFiles.value = [];
+  undoChooserDirtyChecked.value = false;
 }
 
 function restoreUndoMessage(message: ChatMessage | null) {
@@ -1193,16 +1268,22 @@ async function undoFilesAndConversation() {
   if (!targetId || !canUndoFilesAndConversation.value || undoChooserBusy.value) return;
   undoAction.value = "files";
   chatChangesStore.closeInlineDiff();
+  // The chooser showed the dirty file list (or verified it empty); if the
+  // preflight never completed, leave acceptDirty off so the backend re-checks.
+  const acceptDirty = undoChooserDirtyChecked.value;
   try {
     const undone = targetMessageId
       ? await chatStore.rollbackToMessage(targetMessageId, {
           includeFiles: true,
           fileUndoTarget: targetId,
+          acceptDirty,
         })
-      : await chatStore.performUndo(targetId);
+      : await chatStore.performUndo(targetId, { acceptDirty });
     if (undone) {
       undoChooserVisible.value = false;
       undoTargetMessageId.value = null;
+      undoChooserDirtyFiles.value = [];
+      undoChooserDirtyChecked.value = false;
       restoreUndoMessage(turn.userMessage);
     }
   } finally {
@@ -1229,11 +1310,29 @@ async function applyExternalComposerPrefill(text: string) {
   await focusComposerInput();
 }
 
+function isComposerDraftEmpty() {
+  return composerPanelRef.value?.isDraftEmpty() ?? inputText.value.length === 0;
+}
+
+function canApplyPendingChatPrefill(prefill: NonNullable<typeof uiStore.pendingChatPrefill>) {
+  if (prefill.sessionId !== undefined && prefill.sessionId !== props.activeSessionId) {
+    return false;
+  }
+  if (prefill.requireEmptyComposer && !isComposerDraftEmpty()) {
+    return false;
+  }
+  return true;
+}
+
 watch(
   () => uiStore.pendingChatPrefill?.id,
   async (prefillId) => {
     const prefill = uiStore.pendingChatPrefill;
     if (!prefillId || !prefill) return;
+    if (!canApplyPendingChatPrefill(prefill)) {
+      uiStore.clearPendingChatPrefill(prefillId);
+      return;
+    }
     if (prefill.append) {
       await nextTick();
       if (composerPanelRef.value) {
@@ -1245,6 +1344,10 @@ watch(
       await focusComposerInput();
     } else if (prefill.draft) {
       await nextTick();
+      if (!canApplyPendingChatPrefill(prefill)) {
+        uiStore.clearPendingChatPrefill(prefillId);
+        return;
+      }
       if (composerPanelRef.value) {
         await composerPanelRef.value.applyDraftPrefill(prefill.draft);
       } else {
@@ -1289,6 +1392,7 @@ function hasRenderableTranscriptMessage(message: ChatMessage) {
     return !!(
       message.content
       || (message.images && message.images.length > 0)
+      || (message.assetRefs && message.assetRefs.length > 0)
       || message.intentMeta?.mode
       || (message.intentMeta?.skills && message.intentMeta.skills.length > 0)
     );
@@ -1324,7 +1428,7 @@ let pendingStreamingText = "";
 let streamingTextFlushTimer: ReturnType<typeof setTimeout> | null = null;
 let sessionRestoreLayoutTimer: ReturnType<typeof setTimeout> | null = null;
 const userScrollIntent = createUserScrollIntentTracker();
-const STREAMING_TEXT_RENDER_DELAY_MS = 80;
+const STREAMING_TEXT_RENDER_DELAY_MS = STREAMING_RENDER_THROTTLE_MS;
 const STREAM_END_SCROLL_SETTLE_MS = 320;
 const SESSION_RESTORE_LAYOUT_STABILIZE_MS = 180;
 const sessionRestoreLayoutStabilizing = ref(false);
@@ -2533,7 +2637,7 @@ onUnmounted(() => {
           <div class="empty-state">
             <div class="empty-icon">L</div>
             <div class="empty-title">Locus</div>
-            <div class="empty-subtitle">{{ t("onboarding.welcome.subtitle") }}</div>
+            <div v-if="displaySettings.showWelcomeSubtitle" class="empty-subtitle">{{ t("onboarding.welcome.subtitle") }}</div>
           </div>
         </div>
       </div>
@@ -2569,8 +2673,13 @@ onUnmounted(() => {
         </BaseButton>
       </div>
 
+      <SheetCard
+        v-if="pendingQuestion && pendingQuestion.sheet && !isViewingSubagent"
+        :question="pendingQuestion"
+        @answer="handleQuestionAnswer"
+      />
       <AskUserCard
-        v-if="pendingQuestion && !isViewingSubagent"
+        v-else-if="pendingQuestion && !isViewingSubagent"
         :question="pendingQuestion"
         @answer="handleQuestionAnswer"
       />
@@ -2686,9 +2795,11 @@ onUnmounted(() => {
             type="button"
             :disabled="isStreaming"
             :aria-pressed="chatChangesStore.currentPanelVisible"
+            :aria-label="t('chat.changes.toggle')"
             @click="chatChangesStore.togglePanel()"
           >
-            {{ t('chat.changes.toggle') }}
+            <LucideIcon :icon="FileDiff" :size="14" />
+            <span class="changes-toggle-label">{{ t('chat.changes.toggle') }}</span>
           </button>
         </div>
       </div>
@@ -2699,6 +2810,7 @@ onUnmounted(() => {
         :skills="skills"
         :placeholder="chatInputPlaceholder"
         :is-streaming="isStreaming"
+        :cancelling="isCancelling"
         :send-label="isStreaming ? runningSendLabel : t('common.send')"
         :cancel-label="t('common.cancel')"
         :compact="inputControlsCollapsed"
@@ -2793,6 +2905,13 @@ onUnmounted(() => {
                   {{ t("chat.changes.undoing") }}
                 </span>
               </button>
+              <div
+                v-if="canUndoFilesAndConversation && undoChooserDirtyFiles.length > 0"
+                class="undo-chooser-warning"
+              >
+                <div>{{ t("chat.undo.dirtyWarning") }}</div>
+                <div class="undo-chooser-warning-files">{{ undoChooserDirtyPreview }}</div>
+              </div>
               <div v-if="!canUndoFilesAndConversation" class="undo-chooser-note">
                 {{ t("chat.undo.noFileUndo") }}
               </div>
@@ -2818,6 +2937,16 @@ onUnmounted(() => {
             @click="doMessageCopy"
           >
             {{ t("chat.messageMenu.copyMessage") }}
+          </button>
+          <button
+            v-if="messageContextShouldShowReEdit"
+            type="button"
+            class="asset-ref-ctx-item ui-select-none"
+            role="menuitem"
+            :disabled="!messageContextCanReEdit"
+            @click="doMessageReEdit"
+          >
+            {{ t("chat.messageMenu.reEditUserMessage") }}
           </button>
           <div class="asset-ref-ctx-sep"></div>
           <button
@@ -3544,24 +3673,24 @@ onUnmounted(() => {
   min-height: 28px;
 }
 
+/* Icon button mirroring .chat-status-icon-btn so the row reads as one family. */
 .changes-toggle-btn {
+  position: relative;
   display: inline-flex;
   align-items: center;
   justify-content: center;
+  width: 24px;
+  min-width: 24px;
+  height: 24px;
+  min-height: 24px;
+  line-height: 1;
+  padding: 0;
   border: 1px solid transparent;
   border-radius: 5px;
   background: transparent;
   color: var(--text-secondary);
-  font-size: 12px;
-  font-family: inherit;
-  font-weight: 600;
-  height: 24px;
-  min-height: 24px;
-  line-height: 1;
-  padding: 0 8px;
   cursor: pointer;
   box-shadow: none;
-  white-space: nowrap;
   transition: background 0.12s ease, border-color 0.12s ease, color 0.12s ease, opacity 0.12s ease;
 }
 
@@ -3574,6 +3703,7 @@ onUnmounted(() => {
 .changes-toggle-btn:hover:not(:disabled),
 .changes-toggle-btn:focus-visible {
   background: var(--hover-bg);
+  border-color: color-mix(in srgb, currentColor 22%, transparent);
   color: var(--text-color);
 }
 
@@ -3584,6 +3714,36 @@ onUnmounted(() => {
 .changes-toggle-btn:disabled {
   opacity: 0.48;
   cursor: not-allowed;
+}
+
+/* Hover tooltip mirroring .chat-status-icon-label, anchored right at the panel edge. */
+.changes-toggle-label {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 6px);
+  z-index: 35;
+  max-width: 180px;
+  padding: 4px 7px;
+  border: 1px solid var(--border-color);
+  border-radius: 5px;
+  background: var(--surface-elevated, var(--panel-bg));
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.16);
+  color: currentColor;
+  pointer-events: none;
+  overflow: hidden;
+  font-size: 11px;
+  line-height: 1.3;
+  opacity: 0;
+  transform: translateY(3px);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  transition: opacity 0.1s ease, transform 0.1s ease;
+}
+
+.changes-toggle-btn:not(.is-active):hover .changes-toggle-label,
+.changes-toggle-btn:not(.is-active):focus-visible .changes-toggle-label {
+  opacity: 1;
+  transform: translateY(0);
 }
 
 /* ── Ask User Card ── */
@@ -3873,6 +4033,27 @@ onUnmounted(() => {
 
 .undo-chooser-note {
   padding: 0 2px 2px;
+}
+
+.undo-chooser-warning {
+  padding: 8px 10px;
+  border: 1px solid var(--warning-border, var(--border-color));
+  border-radius: 6px;
+  background: var(--warning-bg, var(--bg-color));
+  color: var(--warning-text, var(--text-color));
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.undo-chooser-warning-files {
+  margin-top: 4px;
+  color: var(--text-secondary);
+  font-family: var(--font-mono-identifier);
+  font-size: 11px;
+  white-space: pre-line;
+  word-break: break-word;
+  max-height: 120px;
+  overflow-y: auto;
 }
 
 .undo-chooser-empty {
