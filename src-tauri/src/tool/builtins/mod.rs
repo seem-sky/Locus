@@ -1,5 +1,7 @@
 pub mod agentmemory;
 pub mod codegraph;
+mod code;
+mod code_unity;
 mod filesystem;
 mod knowledge;
 mod lua_gc_analyze;
@@ -38,6 +40,12 @@ pub fn register_all(registry: &mut ToolRegistry) {
     registry.register_builtin(unity::unity_capture_viewport());
     registry.register_builtin(unity::unity_recompile());
     registry.register_builtin(unity::unity_ref_search());
+    registry.register_builtin(code::code_find_references());
+    registry.register_builtin(code::code_goto_definition());
+    registry.register_builtin(code::code_symbol_search());
+    registry.register_builtin(code::code_diagnostics());
+    registry.register_builtin(code::code_hover());
+    registry.register_builtin(code_unity::unity_code_usages());
     registry.register_builtin(unity::unity_yaml_list());
     registry.register_builtin(unity::unity_yaml_search());
     registry.register_builtin(unity::unity_yaml_read());

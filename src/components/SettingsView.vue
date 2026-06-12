@@ -22,6 +22,7 @@ import ApiProviders from "./settings/ApiProviders.vue";
 import CustomEndpointModal from "./settings/CustomEndpointModal.vue";
 import ModelDefaultsPanel from "./settings/ModelDefaults.vue";
 import ToolPermissions from "./settings/ToolPermissions.vue";
+import CodeAnalysisSettings from "./settings/CodeAnalysisSettings.vue";
 import ArchivedSessionsSettings from "./settings/ArchivedSessionsSettings.vue";
 import KnowledgeSettings from "./settings/KnowledgeSettings.vue";
 import MemorySettings from "./settings/MemorySettings.vue";
@@ -168,6 +169,16 @@ watch(
             <path d="M8 1.5a3.75 3.75 0 1 0 0 7.5 3.75 3.75 0 0 0 0-7.5zM4.25 4.25a3.75 3.75 0 1 1 7.5 0 3.75 3.75 0 0 1-7.5 0zM2.5 12.25c0-1.38 2.24-2.25 5.5-2.25s5.5.87 5.5 2.25V14a.75.75 0 0 1-.75.75h-9.5A.75.75 0 0 1 2.5 14v-1.75z"/>
           </svg>
           <span>{{ t("settings.tab.memory") }}</span>
+        </button>
+        <button
+          class="sidebar-item"
+          :class="{ active: activeCategory === 'codeAnalysis' }"
+          @click="activeCategory = 'codeAnalysis'"
+        >
+          <svg viewBox="0 0 16 16" fill="currentColor" width="14" height="14">
+            <path d="M5.72 4.22a.75.75 0 0 1 0 1.06L2.999 8l2.72 2.72a.75.75 0 1 1-1.06 1.06l-3.25-3.25a.75.75 0 0 1 0-1.06l3.25-3.25a.75.75 0 0 1 1.06 0zm4.56 0a.75.75 0 0 1 1.06 0l3.25 3.25a.75.75 0 0 1 0 1.06l-3.25 3.25a.75.75 0 1 1-1.06-1.06L13.001 8l-2.72-2.72a.75.75 0 0 1 0-1.06zM9.262 2.07a.75.75 0 0 1 .545.91l-2.5 10a.75.75 0 0 1-1.455-.364l2.5-10a.75.75 0 0 1 .91-.546z"/>
+          </svg>
+          <span>{{ t("settings.tab.codeAnalysis") }}</span>
         </button>
         <button
           class="sidebar-item"
@@ -318,6 +329,10 @@ watch(
           @remove-workflow-whitelist-bash="removeWorkflowWhitelistBashCommand"
           @clear-workflow-tool-whitelist="clearWorkflowToolWhitelist"
         />
+      </template>
+
+      <template v-if="activeCategory === 'codeAnalysis'">
+        <CodeAnalysisSettings />
       </template>
 
       <template v-if="activeCategory === 'knowledge'">

@@ -37,7 +37,13 @@
     "memory_forget",
     "memory_evolve",
     "memory_commits",
-    "memory_commit_lookup"
+    "memory_commit_lookup",
+    "code_find_references",
+    "code_goto_definition",
+    "code_symbol_search",
+    "code_diagnostics",
+    "code_hover",
+    "unity_code_usages"
   ],
   "sub_agents": [],
   "default": false,

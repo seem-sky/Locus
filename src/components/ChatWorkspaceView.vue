@@ -11,6 +11,7 @@ import { useChatChangesStore } from "../stores/chatChanges";
 import { useModelStore } from "../stores/model";
 import { useNotificationStore } from "../stores/notification";
 import { useProjectStore } from "../stores/project";
+import { useUiStore } from "../stores/ui";
 import { useSkills } from "../composables/useSkills";
 import {
   createAnimationFrameResizeObserver,
@@ -41,6 +42,7 @@ const chatChangesStore = useChatChangesStore();
 const modelStore = useModelStore();
 const notificationStore = useNotificationStore();
 const projectStore = useProjectStore();
+const uiStore = useUiStore();
 const { skillItems } = useSkills();
 const workspaceRef = ref<HTMLElement | null>(null);
 const workspaceWidth = ref(0);
@@ -111,6 +113,7 @@ function beforeEnterSidebarPanel(element: Element) {
 function enterSidebarPanel(element: Element, done: () => void) {
   const shell = element as HTMLElement;
   const isBottomLayout = shell.dataset.enterAxis === "vertical";
+  uiStore.beginAssistantSidebarTransition();
   let finished = false;
   let fallbackTimer = 0;
   let measureFrame = 0;
@@ -124,6 +127,7 @@ function enterSidebarPanel(element: Element, done: () => void) {
     cancelAnimationFrame(finishFrame);
     window.clearTimeout(fallbackTimer);
     shell.removeEventListener("transitionend", onTransitionEnd);
+    uiStore.endAssistantSidebarTransition();
     done();
   };
   const queueFinish = () => {
@@ -232,6 +236,7 @@ function beforeLeaveSidebarPanel(element: Element) {
 function leaveSidebarPanel(element: Element, done: () => void) {
   const shell = element as HTMLElement;
   const isBottomLayout = shell.dataset.exitAxis === "vertical";
+  uiStore.beginAssistantSidebarTransition();
   let finished = false;
   let fallbackTimer = 0;
   const finish = () => {
@@ -239,6 +244,7 @@ function leaveSidebarPanel(element: Element, done: () => void) {
     finished = true;
     window.clearTimeout(fallbackTimer);
     shell.removeEventListener("transitionend", onTransitionEnd);
+    uiStore.endAssistantSidebarTransition();
     done();
   };
   const onTransitionEnd = (event: TransitionEvent) => {

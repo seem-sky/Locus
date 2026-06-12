@@ -16,7 +16,7 @@ use crate::{ApiKeyState, ProviderKeysState};
 
 pub type CodexAuthStateHandle = Arc<tokio::sync::Mutex<CodexAuthState>>;
 
-const HIDDEN_PROVIDER_IDS: &[&str] = &["anthropic_sdk"];
+const HIDDEN_PROVIDER_IDS: &[&str] = &[];
 
 fn is_provider_hidden(provider_id: &str) -> bool {
     HIDDEN_PROVIDER_IDS.contains(&provider_id)
@@ -112,6 +112,11 @@ pub struct ProviderStatus {
     pub name: String,
     pub has_key: bool,
     pub key_hint: String,
+    /// Auth state for providers whose credentials live outside Locus
+    /// (currently only `claude_code`): `Some(false)` means installed but not
+    /// logged in; `None` means unknown or not applicable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logged_in: Option<bool>,
 }
 
 #[tauri::command]
@@ -123,8 +128,17 @@ pub async fn get_providers(
     let openrouter_key = api_key_state.read().await.clone();
     let keys = provider_keys.read().await;
     let auth_guard = auth.lock().await;
-    let (anthropic_sdk_available, anthropic_sdk_hint) =
-        crate::llm::anthropic_agent_sdk::claude_cli_status();
+    let (claude_code_available, claude_code_hint) =
+        crate::llm::claude_code_cli::claude_cli_status();
+    let claude_code_logged_in = if claude_code_available {
+        match crate::llm::claude_code_cli::claude_cli_login_status().0 {
+            crate::llm::claude_code_cli::ClaudeCliLoginState::LoggedIn => Some(true),
+            crate::llm::claude_code_cli::ClaudeCliLoginState::LoggedOut => Some(false),
+            crate::llm::claude_code_cli::ClaudeCliLoginState::Unknown => None,
+        }
+    } else {
+        None
+    };
 
     let mut providers = vec![
         ProviderStatus {
@@ -132,21 +146,24 @@ pub async fn get_providers(
             name: "OpenRouter".to_string(),
             has_key: !openrouter_key.is_empty(),
             key_hint: mask_key(&openrouter_key),
+            logged_in: None,
         },
         ProviderStatus {
             id: "anthropic".to_string(),
             name: "Anthropic (OAuth)".to_string(),
             has_key: auth_guard.is_authenticated(),
             key_hint: auth_guard.email().unwrap_or_default(),
+            logged_in: None,
         },
     ];
 
-    if !is_provider_hidden("anthropic_sdk") {
+    if !is_provider_hidden("claude_code") {
         providers.push(ProviderStatus {
-            id: "anthropic_sdk".to_string(),
-            name: "Anthropic Agent SDK".to_string(),
-            has_key: anthropic_sdk_available,
-            key_hint: anthropic_sdk_hint,
+            id: "claude_code".to_string(),
+            name: "Claude Code CLI".to_string(),
+            has_key: claude_code_available,
+            key_hint: claude_code_hint,
+            logged_in: claude_code_logged_in,
         });
     }
 
@@ -157,6 +174,7 @@ pub async fn get_providers(
                 name: provider_display_name(id),
                 has_key: !key.is_empty(),
                 key_hint: mask_key(key),
+                logged_in: None,
             });
         }
     }
@@ -172,6 +190,7 @@ pub async fn get_providers(
                 name: provider_display_name(id),
                 has_key: false,
                 key_hint: String::new(),
+                logged_in: None,
             });
         }
     }
@@ -261,7 +280,7 @@ fn provider_display_name(id: &str) -> String {
     match id {
         "openrouter" => "OpenRouter".to_string(),
         "anthropic" => "Anthropic (OAuth)".to_string(),
-        "anthropic_sdk" => "Anthropic Agent SDK".to_string(),
+        "claude_code" => "Claude Code CLI".to_string(),
         other => other.to_string(),
     }
 }

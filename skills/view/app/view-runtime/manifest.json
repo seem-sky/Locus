@@ -5,7 +5,7 @@
   "files": [
     {
       "path": "src/components/view/viewRuntime.ts",
-      "bytes": 81536
+      "bytes": 82940
     },
     {
       "path": "src/components/view/viewCompiler.ts",
@@ -21,7 +21,7 @@
     },
     {
       "path": "src/components/view/viewHostPreview.ts",
-      "bytes": 16342
+      "bytes": 8203
     },
     {
       "path": "src/components/canvas/index.ts",
@@ -68,12 +68,28 @@
       "bytes": 45309
     },
     {
+      "path": "src/components/table/index.ts",
+      "bytes": 748
+    },
+    {
+      "path": "src/components/table/serializedTable.ts",
+      "bytes": 8237
+    },
+    {
+      "path": "src/components/table/SerializedTableView.vue",
+      "bytes": 22814
+    },
+    {
       "path": "src/components/icons/LucideIcon.vue",
       "bytes": 722
     },
     {
       "path": "src/components/icons/unityAssetIcons.ts",
       "bytes": 7250
+    },
+    {
+      "path": "src/components/asset/AssetTextViewer.vue",
+      "bytes": 3367
     },
     {
       "path": "src/components/diff/BinaryPreviewHost.vue",
@@ -141,19 +157,31 @@
     },
     {
       "path": "src/components/unity/index.ts",
-      "bytes": 823
+      "bytes": 1113
     },
     {
       "path": "src/components/unity/unitySerializedValue.ts",
-      "bytes": 16841
+      "bytes": 23937
     },
     {
       "path": "src/components/unity/UnityBoolField.vue",
       "bytes": 1981
     },
     {
+      "path": "src/components/unity/UnityBoundsField.vue",
+      "bytes": 5139
+    },
+    {
       "path": "src/components/unity/UnityColorField.vue",
       "bytes": 3305
+    },
+    {
+      "path": "src/components/unity/UnityColorHdrField.vue",
+      "bytes": 5225
+    },
+    {
+      "path": "src/components/unity/UnityCurveField.vue",
+      "bytes": 5915
     },
     {
       "path": "src/components/unity/UnityEnumField.vue",
@@ -164,36 +192,40 @@
       "bytes": 3423
     },
     {
+      "path": "src/components/unity/UnityGradientField.vue",
+      "bytes": 6280
+    },
+    {
       "path": "src/components/unity/UnityLayerMaskField.vue",
       "bytes": 908
     },
     {
       "path": "src/components/unity/UnityNumberField.vue",
-      "bytes": 8785
+      "bytes": 9248
     },
     {
       "path": "src/components/unity/UnityObjectReferenceField.vue",
-      "bytes": 19105
+      "bytes": 26136
     },
     {
       "path": "src/components/unity/UnityPropertyDraw.vue",
-      "bytes": 2971
+      "bytes": 5006
     },
     {
       "path": "src/components/unity/UnityPropertyEditor.vue",
-      "bytes": 8794
+      "bytes": 11781
     },
     {
       "path": "src/components/unity/UnitySerializedPropertyTree.vue",
-      "bytes": 38337
+      "bytes": 43431
     },
     {
       "path": "src/components/unity/UnityVectorField.vue",
-      "bytes": 3943
+      "bytes": 4439
     },
     {
       "path": "src/components/unity/unityPropertyBinding.ts",
-      "bytes": 18953
+      "bytes": 19996
     },
     {
       "path": "src/components/unity-preview/index.ts",
@@ -201,7 +233,7 @@
     },
     {
       "path": "src/components/unity-preview/unityObjectPreview.ts",
-      "bytes": 12037
+      "bytes": 12532
     },
     {
       "path": "src/components/unity-preview/UnityObjectEditorPanel.vue",
@@ -213,7 +245,7 @@
     },
     {
       "path": "src/components/unity-preview/UnityObjectPreview.vue",
-      "bytes": 66038
+      "bytes": 67796
     },
     {
       "path": "src/components/ui/BaseButton.vue",
@@ -245,7 +277,7 @@
     },
     {
       "path": "src/composables/useUnityReferenceDragSource.ts",
-      "bytes": 10453
+      "bytes": 10666
     },
     {
       "path": "src/composables/resizeObserver.ts",
@@ -256,16 +288,20 @@
       "bytes": 669
     },
     {
+      "path": "src/hljs.ts",
+      "bytes": 2661
+    },
+    {
       "path": "src/i18n.ts",
       "bytes": 3289
     },
     {
       "path": "src/language/en.json",
-      "bytes": 217216
+      "bytes": 227023
     },
     {
       "path": "src/language/zh.json",
-      "bytes": 211319
+      "bytes": 218313
     },
     {
       "path": "src/services/asset.ts",
@@ -281,7 +317,7 @@
     },
     {
       "path": "src/services/view.ts",
-      "bytes": 19278
+      "bytes": 19539
     },
     {
       "path": "src/services/unity.ts",
@@ -293,7 +329,7 @@
     },
     {
       "path": "src/services/unityObjectDrawer.ts",
-      "bytes": 11882
+      "bytes": 12226
     },
     {
       "path": "src/services/unityObjectReferencePicker.ts",
@@ -301,11 +337,15 @@
     },
     {
       "path": "src/services/propertyTree.ts",
-      "bytes": 59901
+      "bytes": 60938
     },
     {
       "path": "src/services/unityPropertyPath.ts",
-      "bytes": 7311
+      "bytes": 8890
+    },
+    {
+      "path": "src/services/unityValueEditorWindow.ts",
+      "bytes": 6065
     },
     {
       "path": "src/services/startupPerf.ts",
@@ -325,7 +365,7 @@
     },
     {
       "path": "src/types.ts",
-      "bytes": 70915
+      "bytes": 72593
     }
   ]
 }

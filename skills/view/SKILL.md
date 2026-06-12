@@ -40,7 +40,7 @@ Use this workflow when the user asks for a Locus View or a frontend-built Unity 
 
 3. Edit only inside the returned `packageRoot`.
    - Manifest `view.json` owns `id`, `name`, `template`, `apiVersion`, entry/style paths, scripts, capabilities, and requirements. Keep every path package-relative with forward slashes; never write absolute Unity project paths.
-   - Main UI: `src/App.vue`. Entry: `src/main.ts`. Shared state: `src/store.ts`. Styles: `src/style.css`. Optional Unity script: `unity/ViewApi.cs`. Additional modules may be created under `packageRoot` as needed.
+   - Main UI: `src/App.vue`. Entry: `src/main.ts`. Styles: `src/style.css` (template styles extend a shared base block — keep it and append rules). Optional Unity script: `unity/ViewApi.cs`. Additional modules (for example a `src/store.ts` for shared state) may be created under `packageRoot` as needed.
    - Code shared across Views in the same workspace lives in the workspace `src/` and is imported as `@locus/project-view`.
 
 4. Resolve API details through the stable View contract, in this order:
@@ -58,7 +58,7 @@ import { UnitySerializedPropertyTree, GraphView } from "@locus/components";
 5. Use the right runtime path for Unity data.
    - `SerializedProperty` editing from package code: `property.fromPath("asset/<assetPath>/property/<propertyPath>")` — also `selection/…`, `guid/<assetGuid>/…`, `scene/…`, and `prefab/…` path forms — then `tree.drawDefaultEditor()`, `tree.require(path).draw()`, `property.write(target, value)`, or batched `property.apply([...])`.
    - Unknown property paths: `view_property_discover` before hardcoding any path. Agent-side spot checks and one-off fixes: `view_property_read`, `view_property_write`, `view_property_apply`.
-   - Custom property rendering: `propertyDrawer.registerValue/registerField/registerAttribute/registerPropertyPath/register`, passed as `propertyDrawers` into `UnitySerializedPropertyTree`, `UnityPropertyDraw`, or `UnityObjectPreview`. Whole-object rendering: `unityObjectDrawer.register(...)`, passed as `objectDrawers` into `UnityObjectPreview`.
+   - Custom property rendering: `propertyDrawer.registerValue/registerField/registerAttribute/registerPropertyPath/register`, passed as `propertyDrawers` into `UnitySerializedPropertyTree`, `UnityPropertyDraw`, or `UnityObjectPreview`. Whole-object rendering: `unityObjectDrawer.register(...)`, passed as `objectDrawers` into `UnityObjectPreview`. App-wide drawers (affecting chat fences and the Locus Inspector, not just this View) ship as plugin drawer packages instead — see `runtime-api.md` "Plugin Drawer Packages".
    - Custom Unity logic: declare the C# file in `view.json` `scripts[]`, then call it with `view.callScript` from package code or `view_compile_script` + `view_call_script` from the agent.
    - Selection-driven panels: `onEditorUpdate(handler)`. Unity selection and inspectors: `unity.select(...)`, `unity.inspect(...)`, `unity.selectAsset(...)`, `unity.selectSceneObject(...)`.
    - Locus <-> Unity drag and drop: `useUnityReferenceDrag`, `useUnityAssetDropTarget`, `UnityReferenceChip`, `UnityDropZone`.

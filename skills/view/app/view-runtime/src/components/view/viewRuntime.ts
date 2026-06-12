@@ -34,9 +34,13 @@ import {
   type CanvasViewport,
 } from "../canvas";
 import UnityBoolField from "../unity/UnityBoolField.vue";
+import UnityBoundsField from "../unity/UnityBoundsField.vue";
 import UnityColorField from "../unity/UnityColorField.vue";
+import UnityColorHdrField from "../unity/UnityColorHdrField.vue";
+import UnityCurveField from "../unity/UnityCurveField.vue";
 import UnityEnumField from "../unity/UnityEnumField.vue";
 import UnityFlagsField from "../unity/UnityFlagsField.vue";
+import UnityGradientField from "../unity/UnityGradientField.vue";
 import UnityLayerMaskField from "../unity/UnityLayerMaskField.vue";
 import UnityNumberField from "../unity/UnityNumberField.vue";
 import UnityObjectReferenceField from "../unity/UnityObjectReferenceField.vue";
@@ -127,6 +131,13 @@ import {
   type GraphPort,
   type GraphPortDirection,
 } from "../graph";
+import {
+  SerializedTableView,
+  dedupeSerializedTableSources,
+  normalizeSerializedTableSource,
+  resolveSerializedTableSources,
+  serializedTableSourcesFromAssets,
+} from "../table";
 import type {
   AssetRefAttachment,
   AssetRefKind,
@@ -171,6 +182,28 @@ export {
   defineGraphView,
   layoutGraphDocument,
 } from "../graph";
+export {
+  SerializedTableView,
+  dedupeSerializedTableSources,
+  normalizeSerializedTableSource,
+  resolveSerializedTableSources,
+  serializedTableSourcesFromAssets,
+} from "../table";
+export type {
+  SerializedTableCell,
+  SerializedTableColumnConfig,
+  SerializedTableCommitEvent,
+  SerializedTableEnumOption,
+  SerializedTableManagedReferenceType,
+  SerializedTableProgress,
+  SerializedTablePropertyOverride,
+  SerializedTableResolveSourcesOptions,
+  SerializedTableResolvedSources,
+  SerializedTableRow,
+  SerializedTableSourceConfig,
+  SerializedTableSourceProvider,
+  SerializedTableSourceProviderContext,
+} from "../table";
 
 export type {
   CanvasClipboardEvent,
@@ -736,7 +769,7 @@ const UnityDropZone = defineComponent({
   },
 });
 
-const LOCUS_COMPONENTS = {
+export const LOCUS_COMPONENTS = {
   BaseButton,
   BaseCheckbox,
   BaseDropdown,
@@ -744,10 +777,15 @@ const LOCUS_COMPONENTS = {
   BaseSwitch,
   CanvasView,
   GraphView,
+  SerializedTableView,
   UnityBoolField,
+  UnityBoundsField,
   UnityColorField,
+  UnityColorHdrField,
+  UnityCurveField,
   UnityEnumField,
   UnityFlagsField,
+  UnityGradientField,
   UnityLayerMaskField,
   UnityNumberField,
   UnityObjectReferenceField,
@@ -1029,7 +1067,7 @@ function createViewPropertyRuntime(api: ViewRuntimeApi, undo: ReturnType<typeof 
   };
 }
 
-const LOCUS_COMPONENT_MODULE = {
+export const LOCUS_COMPONENT_MODULE = {
   ...LOCUS_COMPONENTS,
 };
 
@@ -1683,6 +1721,7 @@ function createViewRuntimeApiUncached(detail: ViewPackageDetail, api: ViewRuntim
     CanvasView,
     GraphView,
     GraphViewController,
+    SerializedTableView,
     UnityPropertyDraw,
     UnityPropertyEditor,
     UnitySerializedPropertyTree,
@@ -1690,6 +1729,10 @@ function createViewRuntimeApiUncached(detail: ViewPackageDetail, api: ViewRuntim
     UnityReferenceChip,
     UnityDropZone,
     layoutGraphDocument,
+    dedupeSerializedTableSources,
+    normalizeSerializedTableSource,
+    resolveSerializedTableSources,
+    serializedTableSourcesFromAssets,
     ...PropertyTreeService,
     ...UnityPropertyBinding,
     ...UnitySerializedValue,

@@ -128,6 +128,62 @@ export interface AssetRefAttachment {
   source?: "unity" | "manual";
 }
 
+export type CsharpLspPhase =
+  | "disabled"
+  | "idle"
+  | "preparing"
+  | "downloading"
+  | "starting"
+  | "loading"
+  | "ready"
+  | "error";
+
+export interface CsharpLspStatus {
+  enabled: boolean;
+  supported: boolean;
+  phase: CsharpLspPhase;
+  message?: string | null;
+  downloadComponent?: string | null;
+  downloadReceived?: number | null;
+  downloadTotal?: number | null;
+  workspace?: string | null;
+  projectFile?: string | null;
+  serverVersion: string;
+  dotnetSource?: string | null;
+  projectCount?: number | null;
+  loadedProjects?: number | null;
+  openDocuments?: number | null;
+  queryReferences?: number;
+  queryDefinitions?: number;
+  querySymbols?: number;
+  uptimeSecs?: number | null;
+}
+
+/** Per-tool switches for the code-analysis tool family (camelCase mirror of
+ * the Rust `CodeAnalysisToolsConfig`). `unityAnalyzers` is not a tool: it
+ * injects Microsoft.Unity.Analyzers into the Roslyn language server. */
+export interface CodeAnalysisToolsConfig {
+  codeSymbolSearch: boolean;
+  codeGotoDefinition: boolean;
+  codeFindReferences: boolean;
+  codeDiagnostics: boolean;
+  codeHover: boolean;
+  unityCodeUsages: boolean;
+  unityAnalyzers: boolean;
+}
+
+export function defaultCodeAnalysisToolsConfig(): CodeAnalysisToolsConfig {
+  return {
+    codeSymbolSearch: true,
+    codeGotoDefinition: true,
+    codeFindReferences: true,
+    codeDiagnostics: true,
+    codeHover: false,
+    unityCodeUsages: true,
+    unityAnalyzers: true,
+  };
+}
+
 export type UnityEditorProcessState = "running" | "not_running" | "unknown";
 
 export type UnityBackgroundHookState =
@@ -409,7 +465,7 @@ export interface ModelOption {
   provider:
     | "openrouter"
     | "anthropic"
-    | "anthropic_sdk"
+    | "claude_code"
     | "openai_codex"
     | "custom";
   defaultEffort?: EffortLevel | null;
@@ -454,6 +510,8 @@ export interface ModelDefaults {
   mainModel: string;
   planModel: string;
   subagentModels: Record<string, string>;
+  /** Opt-in: Claude Code CLI models only join the model list when true. */
+  claudeCodeEnabled?: boolean;
 }
 
 export type CodexTransportMode = "http" | "websocket";
@@ -2017,6 +2075,8 @@ export interface InjectedToolMeta {
   directLoadDefault?: boolean;
   directLoadOverride?: boolean | null;
   canConfigureDirectLoad?: boolean;
+  enabled?: boolean;
+  canToggleEnabled?: boolean;
   nativeLazy?: boolean;
   toolSource?: "builtIn" | "skill" | string;
 }

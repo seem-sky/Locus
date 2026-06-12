@@ -73,6 +73,9 @@ export interface ProviderStatus {
   name: string;
   hasKey: boolean;
   keyHint: string;
+  /** Auth state for providers managing credentials outside Locus (claude_code):
+   *  false = installed but not logged in; absent = unknown / not applicable. */
+  loggedIn?: boolean;
 }
 
 export interface CodexStatusState {
@@ -295,7 +298,7 @@ export function useSettingsState(emit: SettingsEmit) {
   }
 
   // ── Navigation ───────────────────────────────────────────────────────
-  const activeCategory = ref<"api" | "models" | "permissions" | "proxy" | "headroom" | "general" | "display" | "notifications" | "shortcuts" | "knowledge" | "memory" | "archived" | "console" | "about">("general");
+  const activeCategory = ref<"api" | "models" | "permissions" | "codeAnalysis" | "proxy" | "headroom" | "general" | "display" | "notifications" | "shortcuts" | "knowledge" | "memory" | "archived" | "console" | "about">("general");
 
   // ── Provider / API key state ─────────────────────────────────────────
   const providers = ref<ProviderStatus[]>([]);
@@ -789,6 +792,12 @@ export function useSettingsState(emit: SettingsEmit) {
     { name: "unity_run_states",   label: "unity_run_states",   desc: t("tool.desc.unity_run_states"),   defaultMode: "ask"  as const },
     { name: "unity_recompile",    label: "unity_recompile",    desc: t("tool.desc.unity_recompile"),    defaultMode: "auto" as const },
     { name: "unity_ref_search",   label: "unity_ref_search",   desc: t("tool.desc.unity_ref_search"),   defaultMode: "auto" as const },
+    { name: "code_find_references", label: "code_find_references", desc: t("tool.desc.code_find_references"), defaultMode: "auto" as const },
+    { name: "code_goto_definition", label: "code_goto_definition", desc: t("tool.desc.code_goto_definition"), defaultMode: "auto" as const },
+    { name: "code_symbol_search",   label: "code_symbol_search",   desc: t("tool.desc.code_symbol_search"),   defaultMode: "auto" as const },
+    { name: "code_diagnostics",     label: "code_diagnostics",     desc: t("tool.desc.code_diagnostics"),     defaultMode: "auto" as const },
+    { name: "code_hover",           label: "code_hover",           desc: t("tool.desc.code_hover"),           defaultMode: "auto" as const },
+    { name: "unity_code_usages",    label: "unity_code_usages",    desc: t("tool.desc.unity_code_usages"),    defaultMode: "auto" as const },
     { name: "unity_asset_search", label: "unity_asset_search", desc: t("tool.desc.unity_asset_search"), defaultMode: "auto" as const },
     { name: "unity_yaml_list",    label: "unity_yaml_list",    desc: t("tool.desc.unity_yaml_list"),    defaultMode: "auto" as const },
     { name: "unity_yaml_search",  label: "unity_yaml_search",  desc: t("tool.desc.unity_yaml_search"),  defaultMode: "auto" as const },

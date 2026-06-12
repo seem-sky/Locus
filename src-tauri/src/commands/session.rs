@@ -562,7 +562,7 @@ pub async fn get_agent_rendered_env_prompt(
     let instance = AgentInstance::new(
         Arc::new(def),
         "__agent-preview__",
-        LlmBackend::AnthropicAgentSdk,
+        LlmBackend::ClaudeCodeCli,
         false,
         registry_snapshot,
         tool_registry.inner().clone(),
@@ -608,7 +608,7 @@ pub async fn get_agent_system_prompt_stats(
     let instance = AgentInstance::new(
         Arc::new(def),
         "__agent-preview__",
-        LlmBackend::AnthropicAgentSdk,
+        LlmBackend::ClaudeCodeCli,
         false,
         registry_snapshot,
         tool_registry.inner().clone(),
@@ -649,7 +649,7 @@ async fn resolve_model_backend(
 
     let is_custom = selected_model.starts_with("custom/");
     let is_openrouter = selected_model.starts_with("openrouter/");
-    let is_anthropic_sdk = selected_model.starts_with("anthropic_sdk/");
+    let is_claude_code = selected_model.starts_with("claude_code/");
     let is_openai_codex = selected_model.starts_with("openai/");
     let is_anthropic_direct = !selected_model.contains('/');
 
@@ -720,8 +720,8 @@ async fn resolve_model_backend(
         };
     }
 
-    if is_anthropic_sdk {
-        return Ok(LlmBackend::AnthropicAgentSdk);
+    if is_claude_code {
+        return Ok(LlmBackend::ClaudeCodeCli);
     }
 
     if is_anthropic_direct {
@@ -747,7 +747,7 @@ async fn resolve_model_backend(
     }
 
     Err(format!(
-        "Unrecognized model provider: {}. Use openrouter/, anthropic_sdk/, or openai/ prefix, or Anthropic direct format",
+        "Unrecognized model provider: {}. Use openrouter/, claude_code/, or openai/ prefix, or Anthropic direct format",
         selected_model
     )
     .into())
@@ -781,7 +781,7 @@ pub async fn list_agent_injected_items(
     let instance = AgentInstance::new(
         Arc::new(def),
         "__agent-preview__",
-        LlmBackend::AnthropicAgentSdk,
+        LlmBackend::ClaudeCodeCli,
         false,
         registry_snapshot,
         tool_registry.inner().clone(),
@@ -981,7 +981,7 @@ pub async fn chat(
     // - "openai/..." → OpenAI Codex
     let is_custom = selected_model.starts_with("custom/");
     let is_openrouter = selected_model.starts_with("openrouter/");
-    let is_anthropic_sdk = selected_model.starts_with("anthropic_sdk/");
+    let is_claude_code = selected_model.starts_with("claude_code/");
     let is_openai_codex = selected_model.starts_with("openai/");
     let is_anthropic_direct = !selected_model.contains('/');
 
@@ -1047,8 +1047,8 @@ pub async fn chat(
                 return Err(format!("OpenAI Codex token failed (please re-login): {}", e).into());
             }
         }
-    } else if is_anthropic_sdk {
-        LlmBackend::AnthropicAgentSdk
+    } else if is_claude_code {
+        LlmBackend::ClaudeCodeCli
     } else if is_anthropic_direct {
         let mut auth_guard = auth.lock().await;
         if auth_guard.is_authenticated() {
@@ -1074,7 +1074,7 @@ pub async fn chat(
         }
     } else {
         return Err(format!(
-            "Unrecognized model provider: {}. Use openrouter/, anthropic_sdk/, or openai/ prefix, or Anthropic direct format",
+            "Unrecognized model provider: {}. Use openrouter/, claude_code/, or openai/ prefix, or Anthropic direct format",
             selected_model
         ).into());
     };

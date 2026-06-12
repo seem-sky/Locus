@@ -39,6 +39,8 @@ function createDisplayState(): DisplaySettings {
     thinkingAutoExpand: true,
     chatDiffReviewTarget: "inline",
     gitDiffReviewTarget: "inline",
+    assetRefClickAction: "locusInspectorEmbedded",
+    unityEmbedAssetRefClickAction: "unityInspector",
     rightAlignUserMessages: false,
     compactToolCalls: true,
     hideThinkingBlocks: true,
