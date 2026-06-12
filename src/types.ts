@@ -220,17 +220,6 @@ export interface KnowledgeProposal {
   updatedAt: number;
 }
 
-
-  proposalId: string;
-  status: KnowledgeProposalStatus;
-  confidence: number;
-  verify: KnowledgeProposalVerify;
-  estTokens: number;
-  items: KnowledgeProposalItem[];
-  createdAt: number;
-  updatedAt: number;
-}
-
 export type MemoryCategory = "user" | "feedback" | "topic" | "reference";
 export type MemoryScope = "project" | "user";
 export type MemoryProposalStatus = KnowledgeProposalStatus;
@@ -592,6 +581,13 @@ export interface HeadroomSettings {
   apiKey: string;
   rtkPath: string;
   minCompressChars: number;
+}
+
+export interface HeadroomSettingsStatus {
+  settings: HeadroomSettings;
+  libraryAvailable: boolean;
+  contextLibraryAvailable: boolean;
+  proxy: HeadroomProxyRuntimeStatus;
 }
 
 export type HeadroomProxySource =
@@ -971,6 +967,8 @@ export interface BasicToolConfirmDisplay {
   kind: "basic";
   toolName: string;
   arguments: string;
+  workflowNote?: string | null;
+  workflowWhitelistOffered?: boolean;
 }
 
 export type KnowledgeToolConfirmDirectoryMode = "auto" | "approval";

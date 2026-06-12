@@ -76,6 +76,7 @@ import {
   getChatSubmitModifierLabel,
   useChatInputSettings,
 } from "../composables/useChatInputSettings";
+import { useDisplaySettings } from "../composables/useDisplaySettings";
 import { provideComposerAssetRefDrop } from "../composables/useComposerAssetRefDrop";
 import { useKnowledgeAccessMode } from "../composables/useKnowledgeAccessMode";
 import {
@@ -105,6 +106,7 @@ const uiStore = useUiStore();
 const notificationStore = useNotificationStore();
 const { state: shortcutState } = useKeyboardShortcuts();
 const { state: chatInputSettings } = useChatInputSettings();
+const { state: displaySettings } = useDisplaySettings();
 const { state: knowledgeAccessState, setMode: setKnowledgeAccessMode } = useKnowledgeAccessMode();
 
 const isPlanStreaming = computed(() => !!chatStore.pendingPlanRun && props.isStreaming);

@@ -7,6 +7,7 @@ import {
   hasSessionTokenUsage,
   sessionInputTokenTotal,
   shouldShowTokenUsageBar,
+  visibleTokenUsageMetrics,
 } from "../components/chat/tokenUsageDisplay";
 
 function makeUsage(overrides: Partial<TokenUsage> = {}): TokenUsage {
@@ -110,6 +111,22 @@ describe("tokenUsageDisplay", () => {
     expect(hasSessionTokenUsage(usage)).toBe(true);
     expect(shouldShowTokenUsageBar(usage)).toBe(true);
     expect(formatTokenCount(4700)).toBe("4.7k");
+  });
+
+  it("filters zero-value metrics except cache buckets", () => {
+    const metrics = visibleTokenUsageMetrics(makeUsage({
+      totalInputTokens: 900,
+      totalOutputTokens: 240,
+      totalCacheReadTokens: 3200,
+      totalCacheWriteTokens: 0,
+    }));
+
+    expect(metrics.map((metric) => metric.key)).toEqual([
+      "uncached-input",
+      "cached-input-write",
+      "cached-input-read",
+      "output",
+    ]);
   });
 
   it("shows the bar for context window usage without session totals", () => {

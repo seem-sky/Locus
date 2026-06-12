@@ -18,6 +18,15 @@ describe("chat sidebar layout", () => {
     );
   });
 
+  it("keeps list-view file rows aligned like staging file copy layout", () => {
+    const changesPanel = read("src/components/ChatChangesPanel.vue");
+
+    expect(changesPanel).toContain('<span class="changes-file-copy">');
+    expect(changesPanel).toMatch(/\.changes-file-copy\s*\{[\s\S]*display:\s*flex;/);
+    expect(changesPanel).toMatch(/\.changes-file-copy \.file-name\s*\{[\s\S]*flex:\s*0 1 auto;/);
+    expect(changesPanel).toMatch(/\.changes-file-copy \.file-dir\s*\{[\s\S]*flex:\s*1 1 auto;/);
+  });
+
   it("locks the chat changes undo action while undo is running", () => {
     const changesPanel = read("src/components/ChatChangesPanel.vue");
     const zh = read("src/language/zh.json");

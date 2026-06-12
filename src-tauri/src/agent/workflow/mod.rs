@@ -28,6 +28,11 @@ const SOURCE_CODE_DISCIPLINE: &str = "At every phase: read relevant source in fu
 /// Options for `ask_user_question` during PLAN phase.
 const PLAN_ASK_USER_OPTIONS: &str = "确认执行 / 取消 / 修改";
 
+/// How `ask_user_question.question` must present the plan (UI shows only this field).
+const PLAN_ASK_USER_QUESTION_FORMAT: &str = "ask_user_question.question MUST be a concise numbered list (1. 2. 3. …): \
+one line per file or logical change (path — target — what changes); optional final lines for impact and rollback; \
+no wall-of-text — the AskUser card displays only this field";
+
 /// Max auto-continuations when the model ends a turn with text only while workflow is incomplete.
 const MAX_WORKFLOW_TEXT_STOP_NUDGES: u32 = 3;
 
@@ -38,7 +43,7 @@ current behavior; planned behavior; before→after snippet or pseudo-diff; runti
 /// Full PLAN content checklist (file list + per-file detail + impact + rollback).
 const PLAN_CONTENT_CHECKLIST: &str = "modification plan: (1) file list, (2) detailed per-file changes \
 (change type, symbols/lines, current vs planned behavior, before→after snippets, per-file runtime notes), \
-(3) impact assessment, (4) rollback strategy";
+(3) impact assessment, (4) rollback strategy; then call ask_user_question with the scannable summary in question as a numbered list";
 
 /// Per-session workflow state (survives across `chat` invocations on the same session).
 pub type DevWorkflowGateStore = Arc<Mutex<HashMap<String, WorkflowGate>>>;
@@ -275,7 +280,8 @@ impl WorkflowGate {
             CodeEditPhase::Plan if !self.plan_confirmed => Some(
                 "Do not end the turn yet. You wrote a modification plan (or said you would) but did not call ask_user_question. \
                  Natural-language \"please confirm\" does NOT show UI — you MUST call ask_user_question with options \
-                 确认执行 / 取消 / 修改 so the user can confirm the plan before task(implementer).",
+                 确认执行 / 取消 / 修改 so the user can confirm the plan before task(implementer). \
+                 Put the plan summary in question as a numbered list (1. 2. 3. …) — one line per file/change.",
             ),
             CodeEditPhase::Plan if self.plan_confirmed && self.plan_zero_change => None,
             CodeEditPhase::Plan if self.plan_confirmed => Some(
@@ -571,7 +577,7 @@ impl WorkflowGate {
                 Some(self.block_message(&detail))
             }
             CodeEditPhase::Plan => Some(self.block_message(&format!(
-                "Tool '{}' is blocked in PLAN phase. Present the {PLAN_CONTENT_CHECKLIST} and call ask_user_question with options {PLAN_ASK_USER_OPTIONS} — do not edit until the user confirms.",
+                "Tool '{}' is blocked in PLAN phase. Present the {PLAN_CONTENT_CHECKLIST} and call ask_user_question with options {PLAN_ASK_USER_OPTIONS}. {PLAN_ASK_USER_QUESTION_FORMAT} — do not edit until the user confirms.",
                 tool_name
             ))),
             CodeEditPhase::Implement => Some(self.block_message(&format!(
@@ -632,7 +638,8 @@ impl WorkflowGate {
                     return Some(self.block_message(&format!(
                         "Cannot dispatch implementer yet: READ is complete — enter PLAN phase first. \
                          Write the {PLAN_CONTENT_CHECKLIST}. {PLAN_FILE_CHANGE_DETAIL} \
-                         Then call ask_user_question with options {PLAN_ASK_USER_OPTIONS} and wait for user confirmation.",
+                         Then call ask_user_question with options {PLAN_ASK_USER_OPTIONS}. {PLAN_ASK_USER_QUESTION_FORMAT} \
+                         and wait for user confirmation.",
                     )));
                 }
                 if subagent == "reviewer" {
@@ -649,7 +656,8 @@ impl WorkflowGate {
                         return Some(self.block_message(&format!(
                             "Cannot dispatch implementer: plan not confirmed. \
                              Present the {PLAN_CONTENT_CHECKLIST}. {PLAN_FILE_CHANGE_DETAIL} \
-                             Then call ask_user_question with options {PLAN_ASK_USER_OPTIONS} and wait for the user.",
+                             Then call ask_user_question with options {PLAN_ASK_USER_OPTIONS}. {PLAN_ASK_USER_QUESTION_FORMAT} \
+                             and wait for the user.",
                         )));
                     }
                     if self.plan_zero_change {
@@ -812,7 +820,7 @@ impl WorkflowGate {
                 "Next: enter PLAN — write modification plan; task(reviewer) for read-only review (no edits). Do NOT use edit/write on dev."
             }
             (CodeEditPhase::Plan, _, false) => {
-                "Next: write the modification plan and call ask_user_question (确认执行 / 取消 / 修改), or dispatch task(subagent_type=reviewer) for read-only review without edits. After plan confirmation, use task(implementer) → task(optimizer) → task(reviewer)."
+                "Next: write the modification plan and call ask_user_question (确认执行 / 取消 / 修改) with the plan as a numbered list in question (1. 2. 3. …), or dispatch task(subagent_type=reviewer) for read-only review without edits. After plan confirmation, use task(implementer) → task(optimizer) → task(reviewer)."
             }
             (CodeEditPhase::Plan, _, true) if self.plan_zero_change => {
                 "Next: zero-change plan confirmed — workflow complete. Summarize for the user; do NOT dispatch implementer/optimizer/reviewer."
@@ -1005,11 +1013,11 @@ fn read_partial_progress_hint(gate: &WorkflowGate) -> Option<String> {
 fn read_complete_hint(review_cycle: u32) -> String {
     if review_cycle > 0 {
         format!(
-            "[Dev workflow] READ gate satisfied (retry cycle #{review_cycle}). Next required step: enter PLAN — write the {PLAN_CONTENT_CHECKLIST} ({PLAN_FILE_CHANGE_DETAIL}) incorporating review feedback, then call ask_user_question ({PLAN_ASK_USER_OPTIONS}) and wait for user confirmation before task(implementer). {SOURCE_CODE_DISCIPLINE}"
+            "[Dev workflow] READ gate satisfied (retry cycle #{review_cycle}). Next required step: enter PLAN — write the {PLAN_CONTENT_CHECKLIST} ({PLAN_FILE_CHANGE_DETAIL}) incorporating review feedback, then call ask_user_question ({PLAN_ASK_USER_OPTIONS}). {PLAN_ASK_USER_QUESTION_FORMAT} Wait for user confirmation before task(implementer). {SOURCE_CODE_DISCIPLINE}"
         )
     } else {
         format!(
-            "[Dev workflow] READ gate satisfied. Next: enter PLAN — write the {PLAN_CONTENT_CHECKLIST} ({PLAN_FILE_CHANGE_DETAIL}), call ask_user_question with options {PLAN_ASK_USER_OPTIONS}, and wait for user confirmation. For read-only review (no edits), dispatch task(subagent_type=\"reviewer\") from PLAN before plan confirmation. {SOURCE_CODE_DISCIPLINE}"
+            "[Dev workflow] READ gate satisfied. Next: enter PLAN — write the {PLAN_CONTENT_CHECKLIST} ({PLAN_FILE_CHANGE_DETAIL}), call ask_user_question with options {PLAN_ASK_USER_OPTIONS}. {PLAN_ASK_USER_QUESTION_FORMAT} Wait for user confirmation. For read-only review (no edits), dispatch task(subagent_type=\"reviewer\") from PLAN before plan confirmation. {SOURCE_CODE_DISCIPLINE}"
         )
     }
 }
@@ -1046,7 +1054,7 @@ fn plan_revise_hint(feedback: &str) -> String {
     format!(
         "[Dev workflow] User requested plan changes (修改): {feedback}\n\
          Revise the {PLAN_CONTENT_CHECKLIST}. {PLAN_FILE_CHANGE_DETAIL} \
-         Call ask_user_question again with {PLAN_ASK_USER_OPTIONS}."
+         Call ask_user_question again with {PLAN_ASK_USER_OPTIONS}. {PLAN_ASK_USER_QUESTION_FORMAT}"
     )
 }
 
@@ -1225,7 +1233,7 @@ fn review_retry_message(cycle: u32, verdict: ReviewVerdict) -> String {
         "[Dev workflow] {reason}. Starting review retry cycle #{cycle}: phase reset to READ.\n\
          Next steps (mandatory loop):\n\
          1. READ — re-read affected files AND re-run CodeGraph (codegraph_context + codegraph_impact on changed symbols); reason about runtime edge cases\n\
-         2. PLAN — write {PLAN_CONTENT_CHECKLIST} + ask_user_question ({PLAN_ASK_USER_OPTIONS}); wait for user confirmation\n\
+         2. PLAN — write {PLAN_CONTENT_CHECKLIST} + ask_user_question ({PLAN_ASK_USER_OPTIONS}); {PLAN_ASK_USER_QUESTION_FORMAT}; wait for user confirmation\n\
          3. IMPLEMENT — task(subagent_type=implementer) with fixes from review feedback; minimal cautious edits only\n\
          4. OPTIMIZE — task(subagent_type=optimizer) to refine efficiency, concision, and runtime behavior\n\
          5. REVIEW — task(subagent_type=reviewer) again until PASS or PASS_WITH_RISKS\n\
@@ -3068,6 +3076,7 @@ mod tests {
         assert!(gate.needs_incomplete_workflow_continuation());
         let nudge = gate.take_incomplete_text_stop_nudge().unwrap();
         assert!(nudge.contains("ask_user_question"));
+        assert!(nudge.contains("numbered list"));
         assert_eq!(gate.workflow_text_stop_nudges, 1);
     }
 

@@ -613,8 +613,10 @@ function onOpenInEditor(ev: MouseEvent, path: string) {
             <span class="file-status" :class="fileStatusClass(item.fileChange.status)">
               {{ fileStatusLabel(item.fileChange.status) }}
             </span>
-            <span class="file-name">{{ fileName(item.fileChange.path) }}</span>
-            <span class="file-dir">{{ dirPath(item.fileChange.path) }}</span>
+            <span class="changes-file-copy">
+              <span class="file-name">{{ fileName(item.fileChange.path) }}</span>
+              <span class="file-dir">{{ dirPath(item.fileChange.path) }}</span>
+            </span>
           </button>
           <span class="file-actions">
             <button
@@ -929,6 +931,26 @@ function onOpenInEditor(ev: MouseEvent, path: string) {
   color: var(--git-status-renamed);
 }
 
+.changes-file-copy {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.changes-file-copy .file-name {
+  min-width: 0;
+  flex: 0 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.changes-file-copy .file-dir {
+  flex: 1 1 auto;
+}
+
 .file-name {
   font-size: 12px;
   font-family: var(--font-mono-identifier);
@@ -939,7 +961,6 @@ function onOpenInEditor(ev: MouseEvent, path: string) {
 }
 
 .file-dir {
-  flex: 1;
   font-size: 11px;
   font-family: var(--font-mono-identifier);
   color: var(--text-secondary);
@@ -947,8 +968,7 @@ function onOpenInEditor(ev: MouseEvent, path: string) {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  direction: rtl;
-  text-align: left;
+  min-width: 0;
 }
 
 .file-actions {

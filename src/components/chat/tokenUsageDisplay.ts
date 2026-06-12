@@ -44,6 +44,15 @@ export function metricI18nKey(key: TokenUsageMetric["key"]): string {
   }
 }
 
+export function shouldShowTokenUsageMetric(metric: TokenUsageMetric): boolean {
+  if (metric.value > 0) return true;
+  return metric.key === "cached-input-write" || metric.key === "cached-input-read";
+}
+
+export function visibleTokenUsageMetrics(usage: TokenUsage): TokenUsageMetric[] {
+  return buildTokenUsageMetrics(usage).filter(shouldShowTokenUsageMetric);
+}
+
 export function buildTokenUsageMetrics(usage: TokenUsage): TokenUsageMetric[] {
   const hasCache = usage.totalCacheReadTokens > 0 || usage.totalCacheWriteTokens > 0;
 

@@ -187,12 +187,22 @@ pub fn prepare_print(
 ) -> (String, String, Level) {
     let normalized = rendered.trim_end_matches(['\r', '\n']).to_string();
     let (module, message) =
-        normalize_module_and_message(&normalize_target(module_path), None, normalized);
-    (
-        module,
-        message.clone(),
-        classify_print_level(&message, is_stderr),
-    )
+        normalize_module_and_message(&normalize_target(module_path), None, normalized.clone());
+    let level = if is_explicit_debug_dump(&normalized) {
+        Level::DEBUG
+    } else {
+        classify_print_level(&message, is_stderr)
+    };
+    (module, message, level)
+}
+
+/// True when the writer prefixed the line with `[DEBUG]` / `[TRACE]` (e.g. LLM request-body dumps).
+fn is_explicit_debug_dump(message: &str) -> bool {
+    let trimmed = message.trim_start();
+    trimmed.starts_with("[DEBUG]")
+        || trimmed.starts_with("[debug]")
+        || trimmed.starts_with("[TRACE]")
+        || trimmed.starts_with("[trace]")
 }
 
 fn allow_level(level: &Level, target: &str, debug_flag: &std::sync::atomic::AtomicBool) -> bool {
@@ -368,7 +378,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        allow_level, classify_print_level, extract_bracket_prefix, normalize_module_and_message,
+        allow_level, classify_print_level, extract_bracket_prefix, is_explicit_debug_dump,
+        normalize_module_and_message, prepare_print,
     };
     use std::sync::atomic::AtomicBool;
     use tracing::Level;
@@ -405,6 +416,25 @@ mod tests {
             classify_print_level("queued changed Unity assets", true),
             Level::INFO
         );
+    }
+
+    #[test]
+    fn is_explicit_debug_dump_recognizes_debug_and_trace_prefixes() {
+        assert!(is_explicit_debug_dump("[DEBUG][Custom Chat] request body:\n{}"));
+        assert!(is_explicit_debug_dump("  [trace] tail"));
+        assert!(!is_explicit_debug_dump("[INFO] started"));
+    }
+
+    #[test]
+    fn prepare_print_keeps_debug_level_for_llm_request_body_dumps() {
+        let payload = concat!(
+            "[DEBUG][Custom Chat] request body:\n",
+            r#"{"messages":[{"content":"error explanations and error paths"}]}"#,
+        );
+        let (module, message, level) = prepare_print("locus::llm", true, payload.to_string());
+        assert_eq!(module, "Custom Chat");
+        assert!(message.starts_with("request body:"));
+        assert_eq!(level, Level::DEBUG);
     }
 
     #[test]

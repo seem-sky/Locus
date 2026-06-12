@@ -38,4 +38,12 @@ describe("code preview display settings", () => {
     expect(diffViewer).toContain("code-preview-surface");
     expect(diffViewer).toContain("var(--code-preview-font-size)");
   });
+
+  it("preserves file formatting alignment in diff text content", () => {
+    const diffViewer = read("src/components/diff/FileDiffViewer.vue");
+
+    expect(diffViewer).toMatch(/\.diff-content\s*\{[\s\S]*white-space:\s*pre;/);
+    expect(diffViewer).toMatch(/\.diff-content\s*\{[\s\S]*tab-size:\s*2;/);
+    expect(diffViewer).toMatch(/\.diff-sbs-cell\s*\{[\s\S]*white-space:\s*pre;/);
+  });
 });

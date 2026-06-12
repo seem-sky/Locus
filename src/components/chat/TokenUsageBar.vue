@@ -4,13 +4,11 @@ import { computed } from "vue";
 import type { TokenUsage } from "../../types";
 import { t } from "../../i18n";
 import {
-  buildTokenUsageMetrics,
   formatTokenCount,
   hasContextWindowUsage,
-  hasSessionTokenUsage,
   metricI18nKey,
-  sessionInputTokenTotal,
   shouldShowTokenUsageBar,
+  visibleTokenUsageMetrics,
 } from "./tokenUsageDisplay";
 
 const props = defineProps<{
@@ -24,7 +22,6 @@ function formatUsd(n: number): string {
 }
 
 const hasPrice = computed(() => props.tokenUsage.pricedRounds > 0);
-const hasSessionTotals = computed(() => hasSessionTokenUsage(props.tokenUsage));
 const visible = computed(() => shouldShowTokenUsageBar(props.tokenUsage));
 
 const contextTokens = computed(() => props.tokenUsage.contextTokens);
@@ -40,48 +37,10 @@ const contextIndicatorColor = computed(() => {
   return "var(--text-secondary)";
 });
 
-const compactLabel = computed(() => {
-  if (!hasSessionTotals.value) return "";
-  return t(
-    "chat.tokenUsage.sessionCompact",
-    formatTokenCount(sessionInputTokenTotal(props.tokenUsage)),
-    formatTokenCount(props.tokenUsage.totalOutputTokens),
-  );
-});
+const visibleMetrics = computed(() => visibleTokenUsageMetrics(props.tokenUsage));
 
-const usageTooltip = computed(() => {
-  const u = props.tokenUsage;
-  const parts: string[] = [t("chat.tokenUsage.sessionTitle")];
-
-  for (const metric of buildTokenUsageMetrics(u)) {
-    if (metric.value <= 0 && metric.key !== "cached-input-write" && metric.key !== "cached-input-read") {
-      continue;
-    }
-    parts.push(
-      t(metricI18nKey(metric.key), formatTokenCount(metric.value)),
-    );
-  }
-
-  if (hasContext.value) {
-    parts.push(
-      t(
-        "chat.tokenUsage.context",
-        formatTokenCount(contextTokens.value),
-        formatTokenCount(contextLimit.value),
-        contextPercent.value.toFixed(1),
-      ),
-    );
-  }
-
-  if (hasPrice.value) {
-    parts.push(t("chat.tokenUsage.cost", formatUsd(u.totalCostUsd)));
-  }
-
-  return parts.join(" · ");
-});
-
-const contextAriaLabel = computed(() => {
-  if (!hasContext.value) return usageTooltip.value;
+const contextSummary = computed(() => {
+  if (!hasContext.value) return "";
   return t(
     "chat.tokenUsage.context",
     formatTokenCount(contextTokens.value),
@@ -90,14 +49,33 @@ const contextAriaLabel = computed(() => {
   );
 });
 
+const usageAriaLabel = computed(() => {
+  const parts: string[] = [t("chat.tokenUsage.sessionTitle")];
+
+  for (const metric of visibleMetrics.value) {
+    parts.push(t(metricI18nKey(metric.key), formatTokenCount(metric.value)));
+  }
+
+  if (contextSummary.value) {
+    parts.push(contextSummary.value);
+  }
+
+  if (hasPrice.value) {
+    parts.push(t("chat.tokenUsage.cost", formatUsd(props.tokenUsage.totalCostUsd)));
+  }
+
+  return parts.join(" · ");
+});
+
+const contextAriaLabel = computed(() => contextSummary.value || usageAriaLabel.value);
+
 </script>
 
 <template>
   <div
     v-if="visible"
     class="token-usage-bar"
-    :aria-label="usageTooltip"
-    tabindex="0"
+    :aria-label="usageAriaLabel"
   >
     <div
       v-if="hasContext"
@@ -132,26 +110,45 @@ const contextAriaLabel = computed(() => {
         />
       </svg>
     </div>
-    <span
-      v-if="hasSessionTotals"
-      class="token-usage-compact"
+    <div
+      v-if="visibleMetrics.length > 0 || contextSummary || hasPrice"
+      class="token-usage-metrics"
       aria-hidden="true"
-    >{{ compactLabel }}</span>
-    <span class="token-usage-tooltip">{{ usageTooltip }}</span>
+    >
+      <span
+        v-for="metric in visibleMetrics"
+        :key="metric.key"
+        class="token-usage-metric"
+      >
+        {{ t(metricI18nKey(metric.key), formatTokenCount(metric.value)) }}
+      </span>
+      <span
+        v-if="contextSummary"
+        class="token-usage-metric token-usage-context"
+      >
+        {{ contextSummary }}
+      </span>
+      <span
+        v-if="hasPrice"
+        class="token-usage-metric token-usage-cost"
+      >
+        {{ t("chat.tokenUsage.cost", formatUsd(tokenUsage.totalCostUsd)) }}
+      </span>
+    </div>
   </div>
 </template>
 
 <style scoped>
 .token-usage-bar {
-  position: relative;
   display: inline-flex;
   align-items: center;
   gap: 6px;
+  flex: 1 1 100%;
+  flex-shrink: 0;
   align-self: center;
-  max-width: min(220px, 42vw);
+  min-width: 0;
+  max-width: 100%;
   color: var(--text-secondary);
-  cursor: default;
-  outline: none;
 }
 
 .token-usage-group {
@@ -189,43 +186,30 @@ const contextAriaLabel = computed(() => {
   transition: stroke-dasharray 0.2s ease, stroke 0.2s ease;
 }
 
-.token-usage-compact {
-  font-size: 11px;
-  line-height: 1.2;
-  font-variant-numeric: tabular-nums;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.token-usage-tooltip {
-  position: absolute;
-  left: 50%;
-  bottom: calc(100% + 6px);
-  z-index: 35;
-  max-width: 320px;
-  padding: 4px 7px;
-  border: 1px solid var(--border-color);
-  border-radius: 5px;
-  background: var(--surface-elevated, var(--panel-bg));
-  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.16);
-  color: var(--text-color);
-  pointer-events: none;
-  overflow: hidden;
+.token-usage-metrics {
+  display: flex;
+  flex: 1 1 auto;
+  flex-wrap: wrap;
+  align-items: center;
+  align-content: center;
+  gap: 4px 10px;
+  min-width: 0;
+  min-height: 28px;
   font-size: 11px;
   line-height: 1.35;
-  opacity: 0;
-  transform: translate(-50%, 3px);
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  transition: opacity 0.1s ease, transform 0.1s ease;
 }
 
-.token-usage-bar:hover .token-usage-tooltip,
-.token-usage-bar:focus-visible .token-usage-tooltip {
-  opacity: 1;
-  transform: translate(-50%, 0);
-  white-space: normal;
+.token-usage-metric {
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.token-usage-context {
+  color: inherit;
+}
+
+.token-usage-cost {
+  color: var(--text-secondary);
 }
 
 </style>

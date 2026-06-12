@@ -67,10 +67,10 @@ describe("chat panel toggle layout", () => {
     expect(tokenUsageBar).toContain('class="context-progress-track"');
     expect(tokenUsageBar).toContain('class="context-progress-value"');
     expect(tokenUsageBar).toContain(':stroke-dasharray="`${contextPercent} 100`"');
-    expect(tokenUsageBar).toContain('class="token-usage-tooltip"');
-    expect(tokenUsageBar).toContain('class="token-usage-compact"');
+    expect(tokenUsageBar).toContain('class="token-usage-metrics"');
+    expect(tokenUsageBar).toContain('class="token-usage-metric"');
     expect(tokenUsageBar).toContain('role="meter"');
-    expect(tokenUsageBar).toContain(".token-usage-bar:hover .token-usage-tooltip");
+    expect(tokenUsageBar).toContain("flex-wrap: wrap");
     expect(tokenUsageBar).not.toContain("@keyframes");
     expect(tokenUsageBar).not.toContain("animation:");
     expect(tokenUsageBar).not.toContain("context-bar-track");

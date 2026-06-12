@@ -1333,7 +1333,11 @@ onUnmounted(() => {
 }
 
 .diff-content {
-  overflow: hidden;
+  min-width: 0;
+  white-space: pre;
+  tab-size: 2;
+  overflow-x: auto;
+  overflow-y: hidden;
 }
 
 .diff-hunk-separator {
@@ -1354,6 +1358,8 @@ onUnmounted(() => {
   grid-template-columns: 52px minmax(0, 1fr);
   gap: 8px;
   padding: 2px 12px;
+  white-space: pre;
+  tab-size: 2;
 }
 
 .diff-sbs-cell.add {

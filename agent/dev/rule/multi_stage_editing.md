@@ -66,9 +66,11 @@ Present the plan to the user, then call `ask_user_question` with these options (
 
 **Do NOT ask for confirmation in prose only** (e.g. "请确认是否执行") — the UI shows plan options **only** when `ask_user_question` runs. Ending the turn with text alone leaves the user with nothing to confirm.
 
+**Put the scannable plan summary in `question`** as a **concise numbered list** (`1.` `2.` `3.` …). The AskUser card displays **only** the `question` field — not your preceding assistant text. One line per file or logical change; keep each line short.
+
 ```json
 {
-  "question": "请确认以下修改计划，或选择取消/修改。",
+  "question": "请确认以下修改计划：\n\n1. src/foo.ts — 修改 handleX()：增加 null 检查\n2. src/bar.ts — 新增 validateY()\n3. 影响：handleX 的 3 个调用方\n4. 回滚：git checkout -- src/foo.ts src/bar.ts",
   "options": [
     { "label": "确认执行", "description": "按计划进入实现阶段" },
     { "label": "取消", "description": "取消本次修改计划，回到 Read 阶段重新分析" },
@@ -76,6 +78,8 @@ Present the plan to the user, then call `ask_user_question` with these options (
   ]
 }
 ```
+
+Zero-change example — `question`: `请确认以下修改计划：\n\n1. 修改文件：无（保持现状）`
 
 - **确认执行** — runtime sets `plan_confirmed=true`; dispatch `task(implementer)` next. If a complex edit skipped CodeGraph during READ, run `codegraph_context` / `codegraph_impact` in PLAN phase first to satisfy `codegraph_gate`, then dispatch implementer.
 - **取消** — phase resets to READ; re-explore before a new plan
