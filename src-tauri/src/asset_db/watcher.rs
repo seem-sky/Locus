@@ -7,7 +7,9 @@ use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
+use notify::event::ModifyKind;
+use notify::{Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use rayon::prelude::*;
 use serde::Serialize;
 
 use super::db;
@@ -50,8 +52,6 @@ const RECENT_ENQUEUE_RETENTION_MS: u64 = 5 * 60_000;
 const RECENT_ENQUEUE_SAMPLE_LIMIT: usize = 8;
 const RECENT_ENQUEUE_BUFFER_LIMIT: usize = 512;
 const QUEUE_SUMMARY_LOG_INTERVAL_SECS: u64 = 3;
-const RECONCILE_PROGRESS_TARGET_EVENTS: u64 = 96;
-const RECONCILE_PROGRESS_MIN_STEP: u64 = 32;
 
 #[derive(Debug, Clone, Copy)]
 struct MtimeScanOptions {
@@ -91,22 +91,6 @@ impl StartupReconcileProgress {
 }
 
 type ReconcileProgressCallback<'a> = Option<&'a dyn Fn(&StartupReconcileProgress)>;
-
-fn reconcile_progress_emit_step(total: u64) -> u64 {
-    if total == 0 {
-        1
-    } else {
-        (total / RECONCILE_PROGRESS_TARGET_EVENTS).max(RECONCILE_PROGRESS_MIN_STEP)
-    }
-}
-
-fn should_emit_reconcile_progress(completed: u64, total: u64) -> bool {
-    if total == 0 {
-        return completed == 0;
-    }
-    let step = reconcile_progress_emit_step(total);
-    completed == 0 || completed == 1 || completed == total || completed % step == 0
-}
 
 fn emit_reconcile_progress(
     on_progress: ReconcileProgressCallback<'_>,
@@ -470,18 +454,21 @@ fn is_unity_asset_path(rel_path: &str) -> bool {
     )
 }
 
-fn asset_rel_path_and_reason(rel: String) -> Option<(String, QueueEnqueueReason)> {
+/// Whether a workspace-relative path (forward slashes) lives inside the
+/// scanned roots and crosses no ignored component. Shared by the per-file
+/// event filter and the directory-subtree discovery path so both agree with
+/// the full-scan walker.
+fn rel_path_is_scannable(rel: &str) -> bool {
     if !rel.starts_with("Assets/") && !rel.starts_with("Packages/") {
-        return None;
+        return false;
     }
+    rel.split('/')
+        .all(|component| !scanner::is_ignored_name(component))
+}
 
-    for component in rel.split('/') {
-        if scanner::IGNORED_DIRS
-            .iter()
-            .any(|d| d.eq_ignore_ascii_case(component))
-        {
-            return None;
-        }
+fn asset_rel_path_and_reason(rel: String) -> Option<(String, QueueEnqueueReason)> {
+    if !rel_path_is_scannable(&rel) {
+        return None;
     }
 
     if !is_unity_asset_path(&rel) {
@@ -569,6 +556,86 @@ fn to_asset_rel_paths_and_reasons(
     results
 }
 
+/// Directory creates and renames are the only events that move whole
+/// subtrees: on Windows, `ReadDirectoryChangesW` reports just the directory
+/// itself — none of the children fire events of their own — so without a
+/// targeted walk a renamed-in folder stays invisible until the next 10-minute
+/// discovery sweep. Plain data modifications are excluded on purpose: parent
+/// directories receive write events whenever a child changes, and walking the
+/// subtree on every file save would be pathological.
+fn is_structural_event(kind: &EventKind) -> bool {
+    matches!(
+        kind,
+        EventKind::Create(_) | EventKind::Modify(ModifyKind::Name(_))
+    )
+}
+
+/// Whether an absolute directory path maps into the scanned roots (directly
+/// or through a linked asset root) without crossing an ignored component.
+fn dir_maps_into_scan_roots(
+    project_root: &Path,
+    abs_path: &Path,
+    linked_roots: &[LinkedAssetRoot],
+) -> bool {
+    if let Ok(rel) = abs_path.strip_prefix(project_root) {
+        let rel = rel.to_string_lossy().replace('\\', "/");
+        if rel_path_is_scannable(&rel) {
+            return true;
+        }
+    }
+    linked_asset_rel_paths_for_abs(abs_path, linked_roots)
+        .iter()
+        .any(|rel| rel_path_is_scannable(rel))
+}
+
+/// Walk a freshly created/renamed directory and queue every .meta found
+/// inside it. Only metas are queued — loose P1 files without a meta would
+/// just round-trip through `process_dirty_asset` as deletions — and the
+/// queue's set semantics dedupe against per-file events that may also arrive.
+fn enqueue_dir_subtree_metas(
+    dir_abs: &Path,
+    project_root: &Path,
+    linked_roots: &[LinkedAssetRoot],
+    queue: &DirtyQueue,
+    activity: &RecentQueueActivityLog,
+) -> u64 {
+    let mut enqueued = 0u64;
+    let walker = walkdir::WalkDir::new(dir_abs)
+        .follow_links(true)
+        .into_iter()
+        .filter_entry(|entry| {
+            let name = entry.file_name().to_string_lossy();
+            !scanner::is_ignored_name(&name)
+        });
+    for entry in walker.filter_map(|e| e.ok()) {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let is_meta = entry
+            .path()
+            .extension()
+            .map(|ext| ext.eq_ignore_ascii_case("meta"))
+            .unwrap_or(false);
+        if !is_meta {
+            continue;
+        }
+        for (rel, _reason) in
+            to_asset_rel_paths_and_reasons(project_root, entry.path(), linked_roots)
+        {
+            if enqueue_with_activity(
+                queue,
+                activity,
+                rel,
+                QueueEnqueueReason::NewMetaDiscovered,
+                None,
+            ) {
+                enqueued += 1;
+            }
+        }
+    }
+    enqueued
+}
+
 fn file_mtime_ns(path: &Path) -> u64 {
     std::fs::metadata(path)
         .ok()
@@ -587,31 +654,6 @@ fn sort_linked_asset_roots(mut roots: Vec<LinkedAssetRoot>) -> Vec<LinkedAssetRo
             .then_with(|| left.link_rel_path.cmp(&right.link_rel_path))
     });
     roots
-}
-
-fn record_linked_asset_root(
-    project_root: &Path,
-    entry: &walkdir::DirEntry,
-    linked_asset_roots: &mut Vec<LinkedAssetRoot>,
-    linked_asset_rel_paths: &mut HashSet<String>,
-) {
-    if !entry.path_is_symlink() || !entry.file_type().is_dir() {
-        return;
-    }
-
-    let Ok(rel) = entry.path().strip_prefix(project_root) else {
-        return;
-    };
-    let link_rel_path = rel.to_string_lossy().replace('\\', "/");
-    if !linked_asset_rel_paths.insert(link_rel_path.clone()) {
-        return;
-    }
-    let target_path =
-        dunce::canonicalize(entry.path()).unwrap_or_else(|_| entry.path().to_path_buf());
-    linked_asset_roots.push(LinkedAssetRoot {
-        link_rel_path,
-        target_path,
-    });
 }
 
 fn cached_linked_asset_roots(graph_state: &Arc<Mutex<Option<AssetDb>>>) -> Vec<LinkedAssetRoot> {
@@ -877,26 +919,6 @@ fn sleep_interruptible(duration: Duration, stop: &AtomicBool) -> bool {
     stop.load(Ordering::Relaxed)
 }
 
-fn resolve_guid_paths_for_content(
-    content: &[u8],
-    graph_state: &Arc<Mutex<Option<AssetDb>>>,
-) -> Result<HashMap<Guid, String>, String> {
-    let text = String::from_utf8_lossy(content);
-    let lines: Vec<&str> = text.lines().collect();
-    let guids = unity_yaml::collect_guids_from_lines(&lines, 0, lines.len());
-    if guids.is_empty() {
-        return Ok(HashMap::new());
-    }
-
-    let guard = graph_state
-        .lock()
-        .map_err(|e| format!("Lock error: {}", e))?;
-    match guard.as_ref() {
-        Some(graph) => db::batch_resolve_paths(&graph.conn, &guids),
-        None => Ok(HashMap::new()),
-    }
-}
-
 fn process_dirty_asset(
     asset_rel_path: &str,
     project_root: &Path,
@@ -911,7 +933,16 @@ fn process_dirty_asset(
     let asset_abs = project_root.join(asset_rel_path);
 
     let meta_exists = meta_abs.is_file();
-    let asset_exists = asset_abs.is_file();
+    // `exists_on_disk` must count directories (folder assets) to match the
+    // full-scan probe — otherwise references to folder GUIDs flip between
+    // "resolved" and "broken" depending on which path indexed them last.
+    // Content reads and mtime/size capture still require a real file.
+    let asset_fs_meta = std::fs::metadata(&asset_abs).ok();
+    let asset_is_file = asset_fs_meta
+        .as_ref()
+        .map(|metadata| metadata.is_file())
+        .unwrap_or(false);
+    let asset_exists = asset_fs_meta.is_some();
 
     if !meta_exists {
         if stop.load(Ordering::Relaxed) {
@@ -975,12 +1006,30 @@ fn process_dirty_asset(
     let mut yaml_docs: Option<Vec<unity_yaml::YamlDoc>> = None;
     let mut script_type_by_guid: HashMap<Guid, db::StoredScriptMetadata> = HashMap::new();
 
-    if asset_exists && is_yaml_asset_ext(&ext) {
+    if asset_is_file && is_yaml_asset_ext(&ext) {
         let content = std::fs::read(&asset_abs)
             .map_err(|e| format!("Failed to read {}: {}", asset_abs.display(), e))?;
-        let guid_to_path = resolve_guid_paths_for_content(&content, graph_state)?;
-        let refs = unity_yaml::extract_refs_with_resolver(&content, Some(&guid_to_path));
-        let docs = unity_yaml::parse_yaml_docs(&content);
+        // Single parse pass produces both the docs and the raw refs; the
+        // referenced guids are then resolved with one targeted DB batch
+        // instead of a third line scan over the file.
+        let (docs, raw_refs) = unity_yaml::parse_yaml_docs_with_refs(&content);
+        let guid_to_path = {
+            let mut ref_guids: Vec<Guid> = raw_refs.iter().map(|r| r.dst_guid).collect();
+            ref_guids.sort_unstable();
+            ref_guids.dedup();
+            if ref_guids.is_empty() {
+                HashMap::new()
+            } else {
+                let guard = graph_state
+                    .lock()
+                    .map_err(|e| format!("Lock error: {}", e))?;
+                match guard.as_ref() {
+                    Some(graph) => db::batch_resolve_paths(&graph.conn, &ref_guids)?,
+                    None => HashMap::new(),
+                }
+            }
+        };
+        let refs = unity_yaml::build_refs_from_docs(&docs, raw_refs, Some(&guid_to_path));
         content_hash = hash128(&content);
         let metadata = std::fs::metadata(&asset_abs).ok();
         asset_mtime = metadata.as_ref().map(scanner::get_mtime_ns).unwrap_or(0);
@@ -1002,15 +1051,15 @@ fn process_dirty_asset(
         }
 
         edges = refs
-            .iter()
+            .into_iter()
             .map(|r| RefEdge {
                 src_guid: guid,
                 src_file_id: r.src_file_id,
                 dst_guid: r.dst_guid,
                 dst_file_id: r.dst_file_id,
                 class_id_hint: r.class_id_hint,
-                field_hint: r.field_hint.clone(),
-                ref_path: r.ref_path.clone(),
+                field_hint: r.field_hint,
+                ref_path: r.ref_path,
             })
             .collect();
 
@@ -1029,7 +1078,7 @@ fn process_dirty_asset(
             }
         }
         yaml_docs = Some(docs);
-    } else if asset_exists && ext == "cs" {
+    } else if asset_is_file && ext == "cs" {
         let snapshot = script_parser::read_script_file_snapshot(&asset_abs)
             .ok_or_else(|| format!("Failed to read script file: {}", asset_abs.display()))?;
         kind = AssetKind::Script;
@@ -1100,24 +1149,10 @@ fn process_dirty_asset(
             }
         }
     } else {
-        kind = match ext.as_str() {
-            "png" | "jpg" | "jpeg" | "tga" | "psd" | "tif" | "tiff" | "bmp" | "gif" | "exr"
-            | "hdr" => AssetKind::Texture,
-            "wav" | "mp3" | "ogg" | "aif" | "aiff" => AssetKind::Audio,
-            "shader" | "cginc" | "hlsl" | "glsl" | "compute" => AssetKind::Shader,
-            "fbx" | "obj" | "blend" | "dae" | "3ds" | "max" => AssetKind::Model,
-            _ => {
-                if asset_exists {
-                    AssetKind::OtherYaml
-                } else {
-                    AssetKind::MetaOnly
-                }
-            }
-        };
-        if asset_exists {
-            let metadata = std::fs::metadata(&asset_abs).ok();
-            asset_mtime = metadata.as_ref().map(scanner::get_mtime_ns).unwrap_or(0);
-            asset_size = metadata.map(|m| m.len()).unwrap_or(0);
+        kind = AssetKind::non_yaml_kind_from_ext(&ext).unwrap_or(AssetKind::MetaOnly);
+        if let Some(metadata) = asset_fs_meta.as_ref().filter(|m| m.is_file()) {
+            asset_mtime = scanner::get_mtime_ns(metadata);
+            asset_size = metadata.len();
         }
     }
 
@@ -1323,6 +1358,89 @@ fn file_hash128(path: &Path) -> Option<[u8; 16]> {
     std::fs::read(path).ok().map(|content| hash128(&content))
 }
 
+/// Records per parallel mtime-scan round. Each chunk fans its stat (+
+/// optional hash) probes out on the rayon pool; enqueueing and progress
+/// emission happen between chunks on the scanning thread.
+const MTIME_SCAN_PAR_CHUNK: usize = 2048;
+
+/// One read-only dirtiness probe for an indexed asset row. A single
+/// `fs::metadata` per path replaces the old `is_file` + `file_mtime_ns` +
+/// `metadata().len()` triple, and the function runs from the parallel mtime
+/// scan, so it must stay free of queue/db access.
+fn asset_record_is_dirty(
+    project_root: &Path,
+    record: &db::AssetMtimeRecord,
+    verify_hashes: bool,
+) -> bool {
+    let meta_path = project_root.join(format!("{}.meta", record.path));
+    let content_path = project_root.join(&record.path);
+
+    let meta_file = std::fs::metadata(&meta_path)
+        .ok()
+        .filter(|metadata| metadata.is_file());
+    let meta_exists = meta_file.is_some();
+    let meta_mtime = meta_file.as_ref().map(scanner::get_mtime_ns).unwrap_or(0);
+
+    let content_file = std::fs::metadata(&content_path)
+        .ok()
+        .filter(|metadata| metadata.is_file());
+    let content_exists = content_file.is_some();
+    let content_mtime = content_file
+        .as_ref()
+        .map(scanner::get_mtime_ns)
+        .unwrap_or(0);
+
+    let disk_mtime = meta_mtime.max(content_mtime);
+    let content_should_exist = record.exists_on_disk && record.kind != AssetKind::MetaOnly;
+    let content_missing = content_should_exist && !content_exists;
+    let content_size_changed = content_should_exist
+        && content_file
+            .as_ref()
+            .map(|metadata| metadata.len() != record.size)
+            .unwrap_or(false);
+    let content_hash_changed = verify_hashes
+        && content_should_exist
+        && content_exists
+        && should_hash_asset_content(record.kind)
+        && !content_size_changed
+        && file_hash128(&content_path)
+            .map(|hash| hash != record.content_hash)
+            .unwrap_or(false);
+
+    !meta_exists
+        || content_missing
+        || disk_mtime > record.mtime_ns
+        || content_size_changed
+        || content_hash_changed
+}
+
+/// Read-only dirtiness probe for one `files` bookkeeping row; parallel-safe
+/// like [`asset_record_is_dirty`].
+fn file_record_is_dirty(
+    project_root: &Path,
+    record: &db::FileMtimeRecord,
+    verify_hashes: bool,
+) -> bool {
+    let abs_path = project_root.join(&record.path);
+    let file = std::fs::metadata(&abs_path)
+        .ok()
+        .filter(|metadata| metadata.is_file());
+    let file_exists = file.is_some();
+    let file_mtime = file.as_ref().map(scanner::get_mtime_ns).unwrap_or(0);
+    let file_size_changed = file
+        .as_ref()
+        .map(|metadata| metadata.len() != record.size)
+        .unwrap_or(false);
+    let file_hash_changed = verify_hashes
+        && file_exists
+        && !file_size_changed
+        && file_hash128(&abs_path)
+            .map(|hash| hash != record.hash128)
+            .unwrap_or(false);
+
+    !file_exists || file_mtime > record.mtime_ns || file_size_changed || file_hash_changed
+}
+
 fn event_receiver_loop(
     rx: std::sync::mpsc::Receiver<Result<notify::Event, notify::Error>>,
     queue: Arc<DirtyQueue>,
@@ -1339,14 +1457,45 @@ fn event_receiver_loop(
                     .read()
                     .map(|roots| roots.clone())
                     .unwrap_or_default();
+                let structural = is_structural_event(&event.kind);
                 for path in &event.paths {
-                    for (rel, reason) in to_asset_rel_paths_and_reasons(
+                    let mapped = to_asset_rel_paths_and_reasons(
                         &project_root,
                         path,
                         linked_roots_snapshot.as_slice(),
-                    ) {
+                    );
+                    let mapped_any = !mapped.is_empty();
+                    for (rel, reason) in mapped {
                         if enqueue_with_activity(&queue, &activity, rel.clone(), reason, None) {
                             eprintln!("[AssetDb Watcher] dirty (OS/{:?}): {}", reason, rel);
+                        }
+                    }
+                    // A created or renamed-in directory arrives as a single
+                    // event with no per-child notifications; walk it now
+                    // instead of waiting for the 10-minute discovery sweep.
+                    if structural
+                        && !mapped_any
+                        && path.is_dir()
+                        && dir_maps_into_scan_roots(
+                            &project_root,
+                            path,
+                            linked_roots_snapshot.as_slice(),
+                        )
+                    {
+                        let discovered = enqueue_dir_subtree_metas(
+                            path,
+                            &project_root,
+                            linked_roots_snapshot.as_slice(),
+                            &queue,
+                            &activity,
+                        );
+                        if discovered > 0 {
+                            eprintln!(
+                                "[AssetDb Watcher] dir event ({:?}): queued {} assets under {}",
+                                event.kind,
+                                discovered,
+                                path.display()
+                            );
                         }
                     }
                 }
@@ -1510,49 +1659,20 @@ fn mtime_scan_once_with_options(
         },
     );
 
-    for record in &asset_records {
+    // Both record sweeps below are read-only stat (+ optional hash) probes,
+    // so each chunk fans out on the rayon pool — with `verify_hashes` this
+    // also spreads the content hashing that used to run on one core.
+    // Enqueueing and progress emission stay on this thread between chunks.
+    for chunk in asset_records.chunks(MTIME_SCAN_PAR_CHUNK) {
         if stop.load(Ordering::Relaxed) {
             break;
         }
 
-        let meta_path = project_root.join(format!("{}.meta", record.path));
-        let content_path = project_root.join(&record.path);
-
-        let meta_exists = meta_path.is_file();
-        let content_exists = content_path.is_file();
-        let meta_mtime = if meta_exists {
-            file_mtime_ns(&meta_path)
-        } else {
-            0
-        };
-        let content_mtime = if content_exists {
-            file_mtime_ns(&content_path)
-        } else {
-            0
-        };
-        let disk_mtime = meta_mtime.max(content_mtime);
-        let content_should_exist = record.exists_on_disk && record.kind != AssetKind::MetaOnly;
-        let content_missing = content_should_exist && !content_exists;
-        let content_size_changed = content_should_exist
-            && content_exists
-            && std::fs::metadata(&content_path)
-                .map(|metadata| metadata.len() != record.size)
-                .unwrap_or(false);
-        let content_hash_changed = options.verify_hashes
-            && content_should_exist
-            && content_exists
-            && should_hash_asset_content(record.kind)
-            && !content_size_changed
-            && file_hash128(&content_path)
-                .map(|hash| hash != record.content_hash)
-                .unwrap_or(false);
-
-        if !meta_exists
-            || content_missing
-            || disk_mtime > record.mtime_ns
-            || content_size_changed
-            || content_hash_changed
-        {
+        let dirty: Vec<&db::AssetMtimeRecord> = chunk
+            .par_iter()
+            .filter(|record| asset_record_is_dirty(project_root, record, options.verify_hashes))
+            .collect();
+        for record in dirty {
             enqueue_with_activity(
                 queue,
                 activity,
@@ -1562,79 +1682,69 @@ fn mtime_scan_once_with_options(
             );
         }
 
-        scan_completed += 1;
-        if should_emit_reconcile_progress(scan_completed, scan_total) {
-            emit_reconcile_progress(
-                on_progress,
-                StartupReconcileProgress {
-                    verify_hashes: options.verify_hashes,
-                    stage: "scanning",
-                    total: Some(scan_total),
-                    completed: Some(scan_completed),
-                    queued: Some(queue.len() as u64),
-                    failed: Some(0),
-                },
-            );
-        }
+        scan_completed += chunk.len() as u64;
+        emit_reconcile_progress(
+            on_progress,
+            StartupReconcileProgress {
+                verify_hashes: options.verify_hashes,
+                stage: "scanning",
+                total: Some(scan_total),
+                completed: Some(scan_completed),
+                queued: Some(queue.len() as u64),
+                failed: Some(0),
+            },
+        );
     }
 
     let mut indexed_meta_paths = HashSet::new();
     for record in &file_records {
+        if record.file_role == FileRole::Meta {
+            indexed_meta_paths.insert(
+                record
+                    .path
+                    .strip_suffix(".meta")
+                    .unwrap_or(&record.path)
+                    .to_string(),
+            );
+        }
+    }
+
+    for chunk in file_records.chunks(MTIME_SCAN_PAR_CHUNK) {
         if stop.load(Ordering::Relaxed) {
             break;
         }
 
-        let asset_path = record
-            .path
-            .strip_suffix(".meta")
-            .unwrap_or(&record.path)
-            .to_string();
-        if record.file_role == FileRole::Meta {
-            indexed_meta_paths.insert(asset_path.clone());
-        }
-
-        let abs_path = project_root.join(&record.path);
-        let file_exists = abs_path.is_file();
-        let file_mtime = if file_exists {
-            file_mtime_ns(&abs_path)
-        } else {
-            0
-        };
-        let file_size_changed = file_exists
-            && std::fs::metadata(&abs_path)
-                .map(|metadata| metadata.len() != record.size)
-                .unwrap_or(false);
-        let file_hash_changed = options.verify_hashes
-            && file_exists
-            && !file_size_changed
-            && file_hash128(&abs_path)
-                .map(|hash| hash != record.hash128)
-                .unwrap_or(false);
-
-        if !file_exists || file_mtime > record.mtime_ns || file_size_changed || file_hash_changed {
+        let dirty: Vec<&db::FileMtimeRecord> = chunk
+            .par_iter()
+            .filter(|record| file_record_is_dirty(project_root, record, options.verify_hashes))
+            .collect();
+        for record in dirty {
+            let asset_path = record
+                .path
+                .strip_suffix(".meta")
+                .unwrap_or(&record.path)
+                .to_string();
             enqueue_with_activity(
                 queue,
                 activity,
-                asset_path.clone(),
+                asset_path,
                 QueueEnqueueReason::MtimeResync,
                 None,
             );
         }
 
-        scan_completed += 1;
-        if should_emit_reconcile_progress(scan_completed, scan_total) {
-            emit_reconcile_progress(
-                on_progress,
-                StartupReconcileProgress {
-                    verify_hashes: options.verify_hashes,
-                    stage: "scanning",
-                    total: Some(scan_total),
-                    completed: Some(scan_completed),
-                    queued: Some(queue.len() as u64),
-                    failed: Some(0),
-                },
-            );
-        }
+        scan_completed += chunk.len() as u64;
+        emit_reconcile_progress(
+            on_progress,
+            StartupReconcileProgress {
+                verify_hashes: options.verify_hashes,
+                stage: "scanning",
+                total: Some(scan_total),
+                completed: Some(scan_completed),
+                queued: Some(queue.len() as u64),
+                failed: Some(0),
+            },
+        );
     }
 
     if !options.discover_new_meta {
@@ -1653,82 +1763,39 @@ fn mtime_scan_once_with_options(
         },
     );
 
-    let scan_roots = ["Assets", "Packages"];
-    let mut linked_asset_roots = Vec::new();
-    let mut linked_asset_rel_paths = HashSet::new();
-    for root_name in &scan_roots {
+    // One parallel scanner pass replaces the old serial walkdir sweep: it
+    // yields exactly what this phase needs (meta files + linked roots) and
+    // skips the per-file probe table it doesn't.
+    let discover_snapshot = scanner::scan_directory_with_options(project_root, stop, false);
+
+    for entry in &discover_snapshot.meta_files {
         if stop.load(Ordering::Relaxed) {
             break;
         }
-        let root_path = project_root.join(root_name);
-        if !root_path.is_dir() {
-            continue;
-        }
-
-        let walker = walkdir::WalkDir::new(&root_path)
-            .follow_links(true)
-            .into_iter()
-            .filter_entry(|entry| {
-                if entry.file_type().is_dir() {
-                    let name = entry.file_name().to_string_lossy();
-                    !scanner::IGNORED_DIRS
-                        .iter()
-                        .any(|d| d.eq_ignore_ascii_case(&name))
-                } else {
-                    true
-                }
-            });
-
-        for entry in walker.filter_map(|e| e.ok()) {
-            if stop.load(Ordering::Relaxed) {
-                break;
-            }
-
-            record_linked_asset_root(
-                project_root,
-                &entry,
-                &mut linked_asset_roots,
-                &mut linked_asset_rel_paths,
+        let asset_path = entry
+            .rel_path
+            .strip_suffix(".meta")
+            .unwrap_or(&entry.rel_path)
+            .to_string();
+        if !indexed_meta_paths.contains(&asset_path) {
+            enqueue_with_activity(
+                queue,
+                activity,
+                asset_path,
+                QueueEnqueueReason::NewMetaDiscovered,
+                None,
             );
-
-            if !entry.file_type().is_file() {
-                continue;
-            }
-
-            let abs_path = entry.path();
-            let ext = abs_path
-                .extension()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_lowercase();
-
-            if ext != "meta" {
-                continue;
-            }
-
-            let rel = abs_path
-                .strip_prefix(project_root)
-                .unwrap_or(abs_path)
-                .to_string_lossy()
-                .replace('\\', "/");
-            let asset_path = rel.strip_suffix(".meta").unwrap_or(&rel).to_string();
-
-            if !indexed_meta_paths.contains(&asset_path) {
-                enqueue_with_activity(
-                    queue,
-                    activity,
-                    asset_path,
-                    QueueEnqueueReason::NewMetaDiscovered,
-                    None,
-                );
-            }
         }
     }
 
     if stop.load(Ordering::Relaxed) {
         return;
     }
-    refresh_linked_asset_roots(state, linked_watch_state, linked_asset_roots);
+    refresh_linked_asset_roots(
+        state,
+        linked_watch_state,
+        discover_snapshot.linked_asset_roots,
+    );
 }
 
 fn queue_summary_logger_loop(
@@ -2001,52 +2068,126 @@ fn reconcile_graph_state_with_options(
         },
     );
 
-    while let Some(rel_path) = queue.try_dequeue() {
-        if stop.load(Ordering::Relaxed) {
-            break;
-        }
+    // Concurrent drain: `process_dirty_asset` is the same thread-safe unit
+    // the live watcher workers run (file IO + parse outside the db lock, a
+    // short transaction inside), so the startup backlog fans out across a
+    // scoped worker pool. Cascade enqueues feed back into the same queue;
+    // a worker only exits once the queue is empty AND no peer is mid-item,
+    // because an in-flight peer can still repopulate the queue.
+    let processed = AtomicU64::new(0);
+    let failed = AtomicU64::new(0);
+    let queued_total = AtomicU64::new(stats.queued);
+    let in_flight = AtomicUsize::new(0);
 
-        stats.processed += 1;
-        match process_dirty_asset(&rel_path, project_root, &state, stop) {
-            Ok(cascade_paths) => {
-                for request in cascade_paths {
-                    if enqueue_with_activity(
-                        &queue,
-                        &activity,
-                        request.rel_path,
-                        request.reason,
-                        request.source_path,
-                    ) {
-                        stats.queued += 1;
+    let worker_count = startup_reconcile_worker_count(stats.queued);
+    if worker_count > 0 {
+        std::thread::scope(|scope| {
+            let mut workers = Vec::with_capacity(worker_count);
+            for _ in 0..worker_count {
+                workers.push(scope.spawn(|| loop {
+                    if stop.load(Ordering::Relaxed) {
+                        break;
                     }
-                }
+                    // Increment BEFORE the dequeue attempt so a peer that
+                    // sees an empty queue can't conclude "all idle" while
+                    // this worker is between dequeue and processing.
+                    in_flight.fetch_add(1, Ordering::AcqRel);
+                    let Some(rel_path) = queue.try_dequeue() else {
+                        let remaining = in_flight.fetch_sub(1, Ordering::AcqRel) - 1;
+                        if remaining == 0 && queue.len() == 0 {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(1));
+                        continue;
+                    };
+
+                    match process_dirty_asset(&rel_path, project_root, &state, stop) {
+                        Ok(cascade_paths) => {
+                            for request in cascade_paths {
+                                if enqueue_with_activity(
+                                    &queue,
+                                    &activity,
+                                    request.rel_path,
+                                    request.reason,
+                                    request.source_path,
+                                ) {
+                                    queued_total.fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            failed.fetch_add(1, Ordering::Relaxed);
+                            eprintln!(
+                                "[AssetDb Watcher] startup reconcile failed for {}: {}",
+                                rel_path, error
+                            );
+                        }
+                    }
+                    processed.fetch_add(1, Ordering::Relaxed);
+                    in_flight.fetch_sub(1, Ordering::AcqRel);
+                }));
             }
-            Err(error) => {
-                stats.failed += 1;
-                eprintln!(
-                    "[AssetDb Watcher] startup reconcile failed for {}: {}",
-                    rel_path, error
+
+            // The progress callback isn't Sync, so emission stays on this
+            // thread while the workers run; 50ms cadence + change detection
+            // keeps the event volume close to the old per-item throttle.
+            let mut last_emitted = u64::MAX;
+            while workers.iter().any(|worker| !worker.is_finished()) {
+                std::thread::sleep(Duration::from_millis(50));
+                let done = processed.load(Ordering::Relaxed);
+                if done == last_emitted {
+                    continue;
+                }
+                last_emitted = done;
+                emit_reconcile_progress(
+                    on_progress,
+                    StartupReconcileProgress {
+                        verify_hashes: options.verify_hashes,
+                        stage: "processing",
+                        total: Some(queued_total.load(Ordering::Relaxed).max(done)),
+                        completed: Some(done),
+                        queued: Some(queue.len() as u64),
+                        failed: Some(failed.load(Ordering::Relaxed)),
+                    },
                 );
             }
-        }
-
-        let total = stats.queued.max(stats.processed);
-        if should_emit_reconcile_progress(stats.processed, total) || queue.len() == 0 {
-            emit_reconcile_progress(
-                on_progress,
-                StartupReconcileProgress {
-                    verify_hashes: options.verify_hashes,
-                    stage: "processing",
-                    total: Some(total),
-                    completed: Some(stats.processed),
-                    queued: Some(queue.len() as u64),
-                    failed: Some(stats.failed),
-                },
-            );
-        }
+        });
     }
 
+    stats.processed = processed.load(Ordering::Relaxed);
+    stats.failed = failed.load(Ordering::Relaxed);
+    stats.queued = queued_total.load(Ordering::Relaxed);
+
+    emit_reconcile_progress(
+        on_progress,
+        StartupReconcileProgress {
+            verify_hashes: options.verify_hashes,
+            stage: "processing",
+            total: Some(stats.queued.max(stats.processed)),
+            completed: Some(stats.processed),
+            queued: Some(queue.len() as u64),
+            failed: Some(stats.failed),
+        },
+    );
+
     Ok(stats)
+}
+
+/// Worker pool size for the startup reconcile drain. The backlog is a burst
+/// (often thousands of items after a branch switch or an out-of-app edit
+/// session), so it gets more hands than the steady-state live watcher
+/// default — still bounded by [`MAX_WORKER_THREADS`] and the backlog size.
+fn startup_reconcile_worker_count(queued: u64) -> usize {
+    if queued == 0 {
+        return 0;
+    }
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    cores
+        .saturating_sub(1)
+        .clamp(1, MAX_WORKER_THREADS)
+        .min(queued as usize)
 }
 
 pub struct AssetDbWatcher {
@@ -3049,5 +3190,150 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn full_scan_binary_assets_record_content_stats_and_stay_clean_on_resync() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let root = temp.path().join("project");
+        std::fs::create_dir_all(root.join("Assets")).expect("create assets dir");
+        let png_bytes: &[u8] = b"png-bytes-not-a-real-texture";
+        write_asset(
+            &root,
+            "Assets/Tex.png",
+            png_bytes,
+            "deadbeefdeadbeefdeadbeefdeadbe01",
+        );
+
+        let graph = scan_test_graph(&root);
+        let records = db::get_all_asset_mtime_records(&graph.conn).expect("read asset records");
+        let tex = records
+            .iter()
+            .find(|record| record.path == "Assets/Tex.png")
+            .expect("texture indexed");
+        assert_eq!(tex.kind, AssetKind::Texture);
+        assert!(tex.exists_on_disk);
+        // The content file's stats — recording the .meta's size here used to
+        // make every binary asset look size-changed and requeued the whole
+        // project on the first reconcile after each full scan.
+        assert_eq!(tex.size, png_bytes.len() as u64);
+        let meta_mtime = file_mtime_ns(&root.join("Assets/Tex.png.meta"));
+        let content_mtime = file_mtime_ns(&root.join("Assets/Tex.png"));
+        assert_eq!(tex.mtime_ns, meta_mtime.max(content_mtime));
+
+        let queue = DirtyQueue::new();
+        let stop = AtomicBool::new(false);
+        let activity = RecentQueueActivityLog::new();
+        let state = Arc::new(Mutex::new(Some(graph)));
+        mtime_scan_once(&queue, &stop, &state, &root, &activity, false);
+        assert_eq!(queue.len(), 0, "fresh scan must not requeue binary assets");
+    }
+
+    #[test]
+    fn process_dirty_asset_keeps_full_scan_kind_and_exists_semantics() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let root = temp.path().join("project");
+        std::fs::create_dir_all(root.join("Assets")).expect("create assets dir");
+        // Unknown extension: indexed as MetaOnly by the full scan; the
+        // watcher used to flip it to OtherYaml.
+        write_asset(
+            &root,
+            "Assets/Note.txt",
+            b"hello",
+            "deadbeefdeadbeefdeadbeefdeadbe02",
+        );
+        // Folder asset: exists_on_disk must survive the watcher, which used
+        // to test is_file() and mark directories as missing.
+        std::fs::create_dir_all(root.join("Assets/Folder")).expect("create folder asset");
+        std::fs::write(
+            root.join("Assets/Folder.meta"),
+            b"fileFormatVersion: 2\nguid: deadbeefdeadbeefdeadbeefdeadbe03\n",
+        )
+        .expect("write folder meta");
+
+        let graph = scan_test_graph(&root);
+        let state = Arc::new(Mutex::new(Some(graph)));
+        let stop = AtomicBool::new(false);
+
+        let snapshot = |state: &Arc<Mutex<Option<AssetDb>>>| -> HashMap<String, (AssetKind, bool)> {
+            let guard = state.lock().expect("lock state");
+            db::get_all_asset_mtime_records(&guard.as_ref().expect("graph").conn)
+                .expect("read records")
+                .into_iter()
+                .map(|record| (record.path, (record.kind, record.exists_on_disk)))
+                .collect()
+        };
+
+        let before = snapshot(&state);
+        assert_eq!(before["Assets/Note.txt"], (AssetKind::MetaOnly, true));
+        assert_eq!(before["Assets/Folder"], (AssetKind::MetaOnly, true));
+
+        process_dirty_asset("Assets/Note.txt", &root, &state, &stop).expect("process txt");
+        process_dirty_asset("Assets/Folder", &root, &state, &stop).expect("process folder");
+
+        let after = snapshot(&state);
+        assert_eq!(after["Assets/Note.txt"], (AssetKind::MetaOnly, true));
+        assert_eq!(after["Assets/Folder"], (AssetKind::MetaOnly, true));
+    }
+
+    #[test]
+    fn dir_subtree_discovery_queues_metas_and_skips_ignored_names() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let root = temp.path().join("project");
+        std::fs::create_dir_all(root.join("Assets")).expect("create assets dir");
+        write_asset(
+            &root,
+            "Assets/NewStuff/A.prefab",
+            b"%YAML 1.1\n",
+            "deadbeefdeadbeefdeadbeefdeadbe04",
+        );
+        write_asset(
+            &root,
+            "Assets/NewStuff/Sub/B.mat",
+            b"%YAML 1.1\n",
+            "deadbeefdeadbeefdeadbeefdeadbe05",
+        );
+        write_asset(
+            &root,
+            "Assets/NewStuff/Samples~/C.prefab",
+            b"%YAML 1.1\n",
+            "deadbeefdeadbeefdeadbeefdeadbe06",
+        );
+
+        let queue = DirtyQueue::new();
+        let activity = RecentQueueActivityLog::new();
+        let queued =
+            enqueue_dir_subtree_metas(&root.join("Assets/NewStuff"), &root, &[], &queue, &activity);
+        assert_eq!(queued, 2);
+
+        let mut paths = Vec::new();
+        while let Some(path) = queue.try_dequeue() {
+            paths.push(path);
+        }
+        paths.sort();
+        assert_eq!(
+            paths,
+            vec![
+                "Assets/NewStuff/A.prefab".to_string(),
+                "Assets/NewStuff/Sub/B.mat".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn structural_event_kinds_gate_dir_discovery() {
+        use notify::event::{CreateKind, DataChange, MetadataKind, RemoveKind, RenameMode};
+
+        assert!(is_structural_event(&EventKind::Create(CreateKind::Folder)));
+        assert!(is_structural_event(&EventKind::Modify(ModifyKind::Name(
+            RenameMode::To
+        ))));
+        assert!(!is_structural_event(&EventKind::Modify(ModifyKind::Data(
+            DataChange::Any
+        ))));
+        assert!(!is_structural_event(&EventKind::Modify(
+            ModifyKind::Metadata(MetadataKind::Any)
+        )));
+        assert!(!is_structural_event(&EventKind::Remove(RemoveKind::Any)));
     }
 }

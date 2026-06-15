@@ -83,7 +83,8 @@
     "code_symbol_search",
     "code_diagnostics",
     "code_hover",
-    "unity_code_usages"
+    "unity_code_usages",
+    "unity_hot_reload"
   ],
   "sub_agents": [
     "explorer",

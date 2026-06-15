@@ -47,6 +47,7 @@ src-tauri/gen/headroom-bundle/node_modules/
 src-tauri/gen/headroom-bundle/manifest.json
 src-tauri/gen/rtk/rtk
 src-tauri/gen/rtk/manifest.json
+src-tauri/gen/compile-server/
 src-tauri/data/state_store.db/
 
 # Editor directories and files
@@ -63,6 +64,7 @@ src-tauri/data/state_store.db/
 .claude
 
 # Workspace-only directories
+plans/
 experiments/
 ref
 AGENTS.md

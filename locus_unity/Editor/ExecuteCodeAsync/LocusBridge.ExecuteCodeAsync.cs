@@ -37,6 +37,7 @@ namespace Locus
         private static ExecuteCodeProgressSnapshot _executeCodeProgress =
             new ExecuteCodeProgressSnapshot { active = false, title = "", info = "", progress = 0, revision = 0 };
         private static int _executeCodeProgressRevision;
+        private static readonly bool ExecuteCodeDebugLoggingEnabled = IsExecuteCodeDebugLoggingEnabled();
 
         private sealed class CompiledAsyncSnippet
         {
@@ -308,6 +309,45 @@ namespace Locus
             }
         }
 
+        private static void LogExecuteCodeDebug(string requestId, string message)
+        {
+            if (!ExecuteCodeDebugLoggingEnabled)
+                return;
+
+            Debug.Log("[Locus] execute_code[" + (requestId ?? "?") + "] " + message);
+        }
+
+        private static void LogExecuteLoadedDebug(string requestId, string message)
+        {
+            if (!ExecuteCodeDebugLoggingEnabled)
+                return;
+
+            Debug.Log("[Locus] execute_loaded[" + (requestId ?? "?") + "] " + message);
+        }
+
+        private static bool IsExecuteCodeDebugLoggingEnabled()
+        {
+            return IsTruthyEnvironmentValue(Environment.GetEnvironmentVariable("LOCUS_EXECUTE_CODE_DEBUG"))
+                || IsTruthyEnvironmentValue(Environment.GetEnvironmentVariable("LOCUS_UNITY_EXECUTE_DEBUG"));
+        }
+
+        private static bool IsTruthyEnvironmentValue(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+                return false;
+
+            string normalized = value.Trim();
+            return string.Equals(normalized, "1", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(normalized, "true", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(normalized, "yes", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(normalized, "on", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static long DebugElapsedMilliseconds(System.Diagnostics.Stopwatch stopwatch)
+        {
+            return stopwatch != null ? stopwatch.ElapsedMilliseconds : 0;
+        }
+
         private static PipeEnvelope HandleCancelExecuteCode(string requestId)
         {
             ExecuteCodeRequestState requestState;
@@ -367,14 +407,219 @@ namespace Locus
             if (string.IsNullOrWhiteSpace(code))
                 return ErrorResponse(requestId, "empty code");
 
+            return await ExecuteSnippetRequestAsync(
+                requestId,
+                prepareCompiler: true,
+                compileStage: "Compiling snippet",
+                compile: delegate { return CompileAsyncSnippet(code); });
+        }
+
+        // ───────────────── execute_loaded (compile-server sidecar) ─────────────────
+
+        [Serializable]
+        private sealed class ExecuteLoadedRequest
+        {
+            public string assembly_b64;
+            public string assembly_path;
+            public string entry_type;
+        }
+
+        /// <summary>
+        /// Sidecar variant of execute_code: the snippet was already compiled
+        /// by the Locus compile server; load the assembly bytes and run the
+        /// entry point through the same execution pipeline (progress,
+        /// heartbeat, cancellation) as the in-Unity compile path.
+        /// </summary>
+        private static async Task<PipeEnvelope> HandleExecuteLoaded(string requestId, string requestJson)
+        {
+            if (string.IsNullOrWhiteSpace(requestJson))
+            {
+                LogExecuteLoadedDebug(requestId, "empty request payload");
+                return ErrorResponse(requestId, "empty execute_loaded request");
+            }
+
+            if (ExecuteCodeDebugLoggingEnabled)
+                LogExecuteLoadedDebug(requestId, "received payload chars=" + requestJson.Length);
+
+            ExecuteLoadedRequest request;
+            try
+            {
+                request = JsonUtility.FromJson<ExecuteLoadedRequest>(requestJson);
+            }
+            catch (Exception ex)
+            {
+                if (ExecuteCodeDebugLoggingEnabled)
+                    LogExecuteLoadedDebug(requestId, "parse failed: " + ex.Message);
+                return ErrorResponse(requestId, "execute_loaded request parse failed: " + ex.Message);
+            }
+
+            if (request == null ||
+                (string.IsNullOrEmpty(request.assembly_b64) &&
+                 string.IsNullOrEmpty(request.assembly_path)))
+            {
+                LogExecuteLoadedDebug(requestId, "missing assembly bytes");
+                return ErrorResponse(requestId, "execute_loaded request missing assembly bytes");
+            }
+
+            byte[] assemblyBytes;
+            try
+            {
+                assemblyBytes = ReadAssemblyPayload(request.assembly_b64, request.assembly_path);
+            }
+            catch (Exception ex)
+            {
+                if (ExecuteCodeDebugLoggingEnabled)
+                    LogExecuteLoadedDebug(requestId, "assembly load failed: " + ex.Message);
+                return ErrorResponse(requestId, "execute_loaded assembly load failed: " + ex.Message);
+            }
+
+            string entryTypeName = string.IsNullOrEmpty(request.entry_type)
+                ? "Locus.RuntimeSnippets.__LocusAsyncSnippetHost"
+                : request.entry_type;
+            if (ExecuteCodeDebugLoggingEnabled)
+            {
+                LogExecuteLoadedDebug(
+                    requestId,
+                    "decoded assembly bytes=" + assemblyBytes.Length + ", entry=" + entryTypeName);
+            }
+
+            return await ExecuteSnippetRequestAsync(
+                requestId,
+                prepareCompiler: false,
+                compileStage: "Loading compiled snippet",
+                compile: delegate { return LoadCompiledSnippet(requestId, assemblyBytes, entryTypeName); });
+        }
+
+        /// <summary>
+        /// Load a sidecar-compiled snippet assembly and bind its entry point.
+        /// Error wording mirrors TryCompileAsyncSnippet so the agent-facing
+        /// error shape stays identical across both compile paths.
+        /// </summary>
+        private static CompiledAsyncSnippet LoadCompiledSnippet(
+            string requestId,
+            byte[] assemblyBytes,
+            string entryTypeName)
+        {
+            Type hostType;
+            MethodInfo executeMethod;
+            System.Diagnostics.Stopwatch loadStarted = ExecuteCodeDebugLoggingEnabled
+                ? System.Diagnostics.Stopwatch.StartNew()
+                : null;
+            try
+            {
+                if (ExecuteCodeDebugLoggingEnabled)
+                {
+                    LogExecuteLoadedDebug(
+                        requestId,
+                        "Assembly.Load begin, bytes=" + (assemblyBytes == null ? 0 : assemblyBytes.Length));
+                }
+                Assembly assembly = Assembly.Load(assemblyBytes);
+                if (ExecuteCodeDebugLoggingEnabled)
+                {
+                    LogExecuteLoadedDebug(
+                        requestId,
+                        "Assembly.Load complete in " + DebugElapsedMilliseconds(loadStarted) + "ms: " +
+                        assembly.FullName);
+                }
+                hostType = assembly.GetType(entryTypeName, true);
+                if (ExecuteCodeDebugLoggingEnabled)
+                    LogExecuteLoadedDebug(requestId, "entry type resolved: " + hostType.FullName);
+                executeMethod = hostType.GetMethod(
+                    "ExecuteAsync",
+                    BindingFlags.Public | BindingFlags.Static
+                );
+            }
+            catch (Exception ex)
+            {
+                if (ExecuteCodeDebugLoggingEnabled)
+                {
+                    LogExecuteLoadedDebug(
+                        requestId,
+                        "assembly load/bootstrap failed after " +
+                        DebugElapsedMilliseconds(loadStarted) +
+                        "ms: " +
+                        ex.Message);
+                }
+                throw new Exception("assembly load/bootstrap failed: " + ex);
+            }
+
+            if (executeMethod == null)
+            {
+                if (ExecuteCodeDebugLoggingEnabled)
+                    LogExecuteLoadedDebug(requestId, "missing ExecuteAsync method on " + entryTypeName);
+                throw new Exception("compiled async snippet missing ExecuteAsync method");
+            }
+
+            try
+            {
+                var executor =
+                    (Func<ScriptGlobals, ExecuteCodeContext, CancellationToken, Task<object>>)
+                        Delegate.CreateDelegate(
+                            typeof(Func<ScriptGlobals, ExecuteCodeContext, CancellationToken, Task<object>>),
+                            executeMethod
+                        );
+
+                if (ExecuteCodeDebugLoggingEnabled)
+                {
+                    LogExecuteLoadedDebug(
+                        requestId,
+                        "ExecuteAsync delegate bound in " + DebugElapsedMilliseconds(loadStarted) + "ms");
+                }
+                return new CompiledAsyncSnippet(executor);
+            }
+            catch (Exception ex)
+            {
+                if (ExecuteCodeDebugLoggingEnabled)
+                {
+                    LogExecuteLoadedDebug(
+                        requestId,
+                        "delegate bind failed after " +
+                        DebugElapsedMilliseconds(loadStarted) +
+                        "ms: " +
+                        ex.Message);
+                }
+                throw new Exception("assembly load/bootstrap failed: " + ex);
+            }
+        }
+
+        /// <summary>
+        /// Shared execute_code / execute_loaded pipeline: lock, request
+        /// state, heartbeat monitor, snippet acquisition via `compile`,
+        /// main-thread execution, progress and error mapping.
+        /// </summary>
+        private static async Task<PipeEnvelope> ExecuteSnippetRequestAsync(
+            string requestId,
+            bool prepareCompiler,
+            string compileStage,
+            Func<CompiledAsyncSnippet> compile)
+        {
+            System.Diagnostics.Stopwatch requestStarted = ExecuteCodeDebugLoggingEnabled
+                ? System.Diagnostics.Stopwatch.StartNew()
+                : null;
+            if (ExecuteCodeDebugLoggingEnabled)
+            {
+                LogExecuteCodeDebug(
+                    requestId,
+                    "begin, prepareCompiler=" + prepareCompiler + ", acquireStage=" + compileStage);
+            }
+
             if (ActiveExecuteCodeRequest == null)
                 SetExecuteCodeStage("Waiting for Unity execute lock");
 
             bool lockTaken = false;
             try
             {
+                LogExecuteCodeDebug(requestId, "waiting for execute lock");
                 if (!await _executeCodeLock.WaitAsync(ExecuteCodeLockWaitTimeoutMs))
                 {
+                    if (ExecuteCodeDebugLoggingEnabled)
+                    {
+                        LogExecuteCodeDebug(
+                            requestId,
+                            "execute lock wait timed out after " +
+                            (ExecuteCodeLockWaitTimeoutMs / 1000) +
+                            "s");
+                    }
                     if (ActiveExecuteCodeRequest == null)
                         ResetExecuteCodeProgress();
                     return ErrorResponse(
@@ -385,9 +630,17 @@ namespace Locus
                 }
 
                 lockTaken = true;
+                if (ExecuteCodeDebugLoggingEnabled)
+                {
+                    LogExecuteCodeDebug(
+                        requestId,
+                        "execute lock acquired after " + DebugElapsedMilliseconds(requestStarted) + "ms");
+                }
             }
             catch (ObjectDisposedException ex)
             {
+                if (ExecuteCodeDebugLoggingEnabled)
+                    LogExecuteCodeDebug(requestId, "execute lock unavailable: " + ex.Message);
                 if (ActiveExecuteCodeRequest == null)
                     ResetExecuteCodeProgress();
                 return ErrorResponse(requestId, "execute_code lock unavailable: " + ex.Message);
@@ -402,56 +655,109 @@ namespace Locus
                     _activeExecuteCodeRequest = requestState;
                 }
                 _ = MonitorExecuteCodeClientHeartbeatAsync(requestState);
+                LogExecuteCodeDebug(requestId, "request state registered");
 
                 ResetExecuteCodeProgress();
-                SetExecuteCodeStage("Checking compiler cache");
 
-                string prepareError = await EnsureExecuteCodeCompilationReadyAsync(
-                    SetExecuteCodeStage,
-                    requestState.Cancellation.Token);
-                if (!string.IsNullOrEmpty(prepareError))
+                if (prepareCompiler)
                 {
-                    requestState.ThrowIfCancellationRequested();
-                    SetExecuteCodeStage("Compiler preparation failed");
-                    return ErrorResponse(requestId, prepareError);
-                }
+                    SetExecuteCodeStage("Checking compiler cache");
+                    LogExecuteCodeDebug(requestId, "checking Unity compiler cache");
 
-                requestState.ThrowIfCancellationRequested();
+                    string prepareError = await EnsureExecuteCodeCompilationReadyAsync(
+                        SetExecuteCodeStage,
+                        requestState.Cancellation.Token);
+                    if (!string.IsNullOrEmpty(prepareError))
+                    {
+                        requestState.ThrowIfCancellationRequested();
+                        SetExecuteCodeStage("Compiler preparation failed");
+                        if (ExecuteCodeDebugLoggingEnabled)
+                            LogExecuteCodeDebug(requestId, "compiler preparation failed: " + prepareError);
+                        return ErrorResponse(requestId, prepareError);
+                    }
+
+                    requestState.ThrowIfCancellationRequested();
+                    if (ExecuteCodeDebugLoggingEnabled)
+                    {
+                        LogExecuteCodeDebug(
+                            requestId,
+                            "Unity compiler cache ready after " + DebugElapsedMilliseconds(requestStarted) + "ms");
+                    }
+                }
 
                 CompiledAsyncSnippet snippet;
                 try
                 {
-                    SetExecuteCodeStage("Compiling snippet");
+                    SetExecuteCodeStage(compileStage);
                     requestState.ThrowIfCancellationRequested();
-                    snippet = CompileAsyncSnippet(code);
+                    if (ExecuteCodeDebugLoggingEnabled)
+                        LogExecuteCodeDebug(requestId, "acquiring snippet: " + compileStage);
+                    long acquireStartedMs = DebugElapsedMilliseconds(requestStarted);
+                    snippet = compile();
                     requestState.ThrowIfCancellationRequested();
+                    if (ExecuteCodeDebugLoggingEnabled)
+                    {
+                        LogExecuteCodeDebug(
+                            requestId,
+                            "snippet ready in " +
+                            (DebugElapsedMilliseconds(requestStarted) - acquireStartedMs) +
+                            "ms");
+                    }
                 }
                 catch (OperationCanceledException)
                 {
+                    LogExecuteCodeDebug(requestId, "canceled while acquiring snippet");
                     throw;
                 }
                 catch (Exception ex)
                 {
                     SetExecuteCodeStage("Compilation failed");
+                    if (ExecuteCodeDebugLoggingEnabled)
+                        LogExecuteCodeDebug(requestId, "snippet acquisition failed: " + ex.Message);
                     return ErrorResponse(requestId, "async snippet compilation exception: " + ex.Message);
                 }
 
                 SetExecuteCodeStage("Executing snippet");
+                LogExecuteCodeDebug(requestId, "queueing snippet on Unity main thread");
+                long executeStartedMs = DebugElapsedMilliseconds(requestStarted);
                 string resultText = await ExecuteAsyncSnippetOnMainThreadAsync(snippet, requestState);
+                if (ExecuteCodeDebugLoggingEnabled)
+                {
+                    LogExecuteCodeDebug(
+                        requestId,
+                        "main-thread execution returned in " +
+                        (DebugElapsedMilliseconds(requestStarted) - executeStartedMs) +
+                        "ms, output chars=" +
+                        (resultText == null ? 0 : resultText.Length));
+                }
 
                 if (resultText.StartsWith("__ERROR__: ", StringComparison.Ordinal))
                 {
                     requestState.ThrowIfCancellationRequested();
                     SetExecuteCodeStage("Execution failed");
+                    if (ExecuteCodeDebugLoggingEnabled)
+                        LogExecuteCodeDebug(requestId, "execution failed: " + resultText);
                     return ErrorResponse(requestId, resultText.Substring("__ERROR__: ".Length));
                 }
 
                 requestState.ThrowIfCancellationRequested();
                 SetExecuteCodeStage("Execution complete");
+                if (ExecuteCodeDebugLoggingEnabled)
+                {
+                    LogExecuteCodeDebug(
+                        requestId,
+                        "complete after " + DebugElapsedMilliseconds(requestStarted) + "ms");
+                }
                 return OkResponse(requestId, resultText);
             }
             catch (OperationCanceledException)
             {
+                if (ExecuteCodeDebugLoggingEnabled)
+                {
+                    LogExecuteCodeDebug(
+                        requestId,
+                        "canceled after " + DebugElapsedMilliseconds(requestStarted) + "ms");
+                }
                 return ErrorResponse(requestId, "execute_code canceled");
             }
             finally
@@ -466,6 +772,12 @@ namespace Locus
                 ResetExecuteCodeProgress();
                 if (lockTaken)
                     _executeCodeLock.Release();
+                if (ExecuteCodeDebugLoggingEnabled)
+                {
+                    LogExecuteCodeDebug(
+                        requestId,
+                        "finished cleanup after " + DebugElapsedMilliseconds(requestStarted) + "ms");
+                }
             }
         }
 

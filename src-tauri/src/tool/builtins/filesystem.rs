@@ -258,6 +258,62 @@ pub(crate) fn is_binary_extension(filepath: &str) -> bool {
     binary_exts.iter().any(|ext| lower.ends_with(ext))
 }
 
+async fn append_unity_csharp_status(
+    output: String,
+    working_dir: Option<&str>,
+    file_path: &str,
+) -> String {
+    let Some(project) = working_dir else {
+        return output;
+    };
+    match crate::unity_hotreload::coordinator::format_pending_edit_status(project, file_path).await
+    {
+        Some(status) if !status.trim().is_empty() => format!("{output}\n\n{status}"),
+        _ => output,
+    }
+}
+
+const EDIT_WRITE_DIAGNOSTIC_MAX_RESULTS: usize = 30;
+const EDIT_WRITE_PROJECT_REF_MAX_PROBLEMS: usize = 20;
+
+fn is_csharp_source_file(file_path: &str) -> bool {
+    std::path::Path::new(file_path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.eq_ignore_ascii_case("cs"))
+        .unwrap_or(false)
+}
+
+async fn append_unity_csharp_write_feedback(
+    output: String,
+    working_dir: Option<&str>,
+    file_path: &str,
+) -> String {
+    let output = append_unity_csharp_status(output, working_dir, file_path).await;
+    let Some(project) = working_dir else {
+        return output;
+    };
+    if !is_csharp_source_file(file_path)
+        || !crate::csharp_lsp::is_enabled()
+        || !crate::code_tools::edit_write_diagnostics_enabled()
+    {
+        return output;
+    }
+
+    match super::code::file_diagnostics_output(
+        project,
+        file_path,
+        2,
+        EDIT_WRITE_DIAGNOSTIC_MAX_RESULTS,
+        EDIT_WRITE_PROJECT_REF_MAX_PROBLEMS,
+    )
+    .await
+    {
+        Ok(diagnostics) => format!("{output}\n\nC# diagnostics:\n{diagnostics}"),
+        Err(error) => format!("{output}\n\nC# diagnostics unavailable: {error}"),
+    }
+}
+
 // ─── write ──────────────────────────────────────────────────────────────────
 
 pub(super) fn write() -> ToolDef {
@@ -327,10 +383,29 @@ pub(super) fn write() -> ToolDef {
                 }
 
                 match tokio::fs::write(&file_path, &content).await {
-                    Ok(()) => ToolResult {
-                        output: format!("{remap_prefix}Created {file_path}"),
-                        is_error: false,
-                    },
+                    Ok(()) => {
+                        // Hot reload tracks the pre-edit baseline of every
+                        // touched .cs source; a brand-new file's baseline is
+                        // empty (all of it is "new types").
+                        if let Some(project) = ctx.working_dir.as_deref() {
+                            crate::unity_hotreload::coordinator::note_cs_written(
+                                project,
+                                &file_path,
+                                String::new(),
+                            )
+                            .await;
+                        }
+                        let output = append_unity_csharp_write_feedback(
+                            format!("Created {}", file_path),
+                            ctx.working_dir.as_deref(),
+                            &file_path,
+                        )
+                        .await;
+                        ToolResult {
+                            output: format!("{remap_prefix}{output}"),
+                            is_error: false,
+                        }
+                    }
                     Err(e) => ToolResult {
                         output: format!("Failed to write file '{}': {}", file_path, e),
                         is_error: true,
@@ -499,8 +574,22 @@ pub(super) fn edit() -> ToolDef {
                         let rewritten = apply_line_ending(&op.new_string, file_eol);
                         match tokio::fs::write(&file_path, rewritten).await {
                             Ok(()) => {
+                                if let Some(project) = ctx.working_dir.as_deref() {
+                                    crate::unity_hotreload::coordinator::note_cs_written(
+                                        project,
+                                        &file_path,
+                                        content.clone(),
+                                    )
+                                    .await;
+                                }
+                                let output = append_unity_csharp_write_feedback(
+                                    format!("Created {}", file_path),
+                                    ctx.working_dir.as_deref(),
+                                    &file_path,
+                                )
+                                .await;
                                 return ToolResult {
-                                    output: format!("{remap_prefix}Created {file_path}"),
+                                    output: format!("{remap_prefix}{output}"),
                                     is_error: false,
                                 };
                             }
@@ -542,6 +631,17 @@ pub(super) fn edit() -> ToolDef {
                 let rewritten = apply_line_ending(&current_content, file_eol);
                 match tokio::fs::write(&file_path, rewritten).await {
                     Ok(()) => {
+                        // Baseline for hot reload = the file as it was when
+                        // the loaded assemblies were compiled (first edit's
+                        // pre-content wins inside the coordinator).
+                        if let Some(project) = ctx.working_dir.as_deref() {
+                            crate::unity_hotreload::coordinator::note_cs_written(
+                                project,
+                                &file_path,
+                                content.clone(),
+                            )
+                            .await;
+                        }
                         let lines_info = if !start_lines.is_empty() {
                             let nums: Vec<String> =
                                 start_lines.iter().map(|n| n.to_string()).collect();
@@ -549,15 +649,22 @@ pub(super) fn edit() -> ToolDef {
                         } else {
                             String::new()
                         };
+                        let output = if applied_count > 1 {
+                            format!(
+                                "Edited {} ({} edits applied){}",
+                                file_path, applied_count, lines_info
+                            )
+                        } else {
+                            format!("Edited {}{}", file_path, lines_info)
+                        };
+                        let output = append_unity_csharp_write_feedback(
+                            output,
+                            ctx.working_dir.as_deref(),
+                            &file_path,
+                        )
+                        .await;
                         ToolResult {
-                            output: if applied_count > 1 {
-                                format!(
-                                    "{remap_prefix}Edited {} ({} edits applied){}",
-                                    file_path, applied_count, lines_info
-                                )
-                            } else {
-                                format!("{remap_prefix}Edited {}{}", file_path, lines_info)
-                            },
+                            output: format!("{remap_prefix}{output}"),
                             is_error: false,
                         }
                     }

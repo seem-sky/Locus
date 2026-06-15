@@ -23,6 +23,9 @@ import CustomEndpointModal from "./settings/CustomEndpointModal.vue";
 import ModelDefaultsPanel from "./settings/ModelDefaults.vue";
 import ToolPermissions from "./settings/ToolPermissions.vue";
 import CodeAnalysisSettings from "./settings/CodeAnalysisSettings.vue";
+import HotReloadSettings from "./settings/HotReloadSettings.vue";
+import UnityConnectionSettings from "./settings/UnityConnectionSettings.vue";
+import TestingSettings from "./settings/TestingSettings.vue";
 import ArchivedSessionsSettings from "./settings/ArchivedSessionsSettings.vue";
 import KnowledgeSettings from "./settings/KnowledgeSettings.vue";
 import MemorySettings from "./settings/MemorySettings.vue";
@@ -48,6 +51,7 @@ const emit = defineEmits<{
 const {
   resetConfirm, handleResetOnboarding, activeCategory,
   providers, editingProvider, editKey, errorMsg, successMsg, isLoading,
+  claudeCodeTestStatus, claudeCodeTestResult, testClaudeCode,
   startEdit, cancelEdit, saveKey, deleteKey, handleKeydown,
   dynamicToolLoadingMode, dynamicToolLoadingBusy, setDynamicToolLoadingMode,
   oauthStep, oauthCode, submitOAuthCode, cancelOAuth, oauthLogout, handleOAuthKeydown,
@@ -90,6 +94,100 @@ watch(
         </button>
       </div>
       <div class="sidebar-nav">
+        <div class="sidebar-group-label">{{ t("settings.group.models") }}</div>
+        <button
+          class="sidebar-item"
+          :class="{ active: activeCategory === 'api' }"
+          @click="activeCategory = 'api'"
+        >
+          <svg viewBox="0 0 16 16" fill="currentColor" width="14" height="14">
+            <path d="M8 0a4 4 0 0 0-4 4v1H3a1 1 0 0 0-1 1v8a1 1 0 0 0 1 1h10a1 1 0 0 0 1-1V6a1 1 0 0 0-1-1h-1V4a4 4 0 0 0-4-4zm2.5 5V4a2.5 2.5 0 1 0-5 0v1h5z"/>
+          </svg>
+          <span>{{ t("settings.tab.api") }}</span>
+        </button>
+        <button
+          class="sidebar-item"
+          :class="{ active: activeCategory === 'models' }"
+          @click="activeCategory = 'models'"
+        >
+          <svg viewBox="0 0 16 16" fill="currentColor" width="14" height="14">
+            <path d="M1 2.5A1.5 1.5 0 0 1 2.5 1h3A1.5 1.5 0 0 1 7 2.5v3A1.5 1.5 0 0 1 5.5 7h-3A1.5 1.5 0 0 1 1 5.5v-3zm8 0A1.5 1.5 0 0 1 10.5 1h3A1.5 1.5 0 0 1 15 2.5v3A1.5 1.5 0 0 1 13.5 7h-3A1.5 1.5 0 0 1 9 5.5v-3zm-8 8A1.5 1.5 0 0 1 2.5 9h3A1.5 1.5 0 0 1 7 10.5v3A1.5 1.5 0 0 1 5.5 15h-3A1.5 1.5 0 0 1 1 13.5v-3zm8 0A1.5 1.5 0 0 1 10.5 9h3a1.5 1.5 0 0 1 1.5 1.5v3a1.5 1.5 0 0 1-1.5 1.5h-3A1.5 1.5 0 0 1 9 13.5v-3z"/>
+          </svg>
+          <span>{{ t("settings.tab.models") }}</span>
+        </button>
+        <div class="sidebar-group-label">{{ t("settings.group.codeUnity") }}</div>
+        <button
+          class="sidebar-item"
+          :class="{ active: activeCategory === 'codeAnalysis' }"
+          @click="activeCategory = 'codeAnalysis'"
+        >
+          <svg viewBox="0 0 16 16" fill="currentColor" width="14" height="14">
+            <path d="M5.72 4.22a.75.75 0 0 1 0 1.06L2.999 8l2.72 2.72a.75.75 0 1 1-1.06 1.06l-3.25-3.25a.75.75 0 0 1 0-1.06l3.25-3.25a.75.75 0 0 1 1.06 0zm4.56 0a.75.75 0 0 1 1.06 0l3.25 3.25a.75.75 0 0 1 0 1.06l-3.25 3.25a.75.75 0 1 1-1.06-1.06L13.001 8l-2.72-2.72a.75.75 0 0 1 0-1.06zM9.262 2.07a.75.75 0 0 1 .545.91l-2.5 10a.75.75 0 0 1-1.455-.364l2.5-10a.75.75 0 0 1 .91-.546z"/>
+          </svg>
+          <span>{{ t("settings.tab.codeAnalysis") }}</span>
+        </button>
+        <button
+          class="sidebar-item"
+          :class="{ active: activeCategory === 'hotReload' }"
+          @click="activeCategory = 'hotReload'"
+        >
+          <svg viewBox="0 0 16 16" fill="currentColor" width="14" height="14">
+            <path d="M11.251.068a.5.5 0 0 1 .227.58L9.677 6.5H13a.5.5 0 0 1 .364.843l-8 8.5a.5.5 0 0 1-.842-.49L6.323 9.5H3a.5.5 0 0 1-.364-.843l8-8.5a.5.5 0 0 1 .615-.09z"/>
+          </svg>
+          <span>{{ t("settings.tab.hotReload") }}</span>
+        </button>
+        <button
+          class="sidebar-item"
+          :class="{ active: activeCategory === 'unityConnection' }"
+          @click="activeCategory = 'unityConnection'"
+        >
+          <svg viewBox="0 0 16 16" fill="currentColor" width="14" height="14">
+            <path d="M6 0a.5.5 0 0 1 .5.5V3h3V.5a.5.5 0 0 1 1 0V3h1a.5.5 0 0 1 .5.5v3A3.5 3.5 0 0 1 8.5 10c-.002.434-.01.845-.04 1.22-.041.514-.126 1.003-.317 1.424a2.083 2.083 0 0 1-.97 1.028C6.725 13.9 6.169 14 5.5 14c-.998 0-1.61.33-1.974.718A1.922 1.922 0 0 0 3 16H2c0-.616.232-1.34.797-1.94C3.323 13.484 4.169 13 5.5 13c.998 0 1.61-.33 1.974-.718.16-.21.26-.485.3-.79H4.5A3.5 3.5 0 0 1 1 7V3.5a.5.5 0 0 1 .5-.5h1V.5a.5.5 0 0 1 1 0V3h3V.5A.5.5 0 0 1 6 0z"/>
+          </svg>
+          <span>{{ t("settings.tab.unityConnection") }}</span>
+        </button>
+        <button
+          class="sidebar-item"
+          :class="{ active: activeCategory === 'testing' }"
+          @click="activeCategory = 'testing'"
+        >
+          <svg viewBox="0 0 16 16" fill="currentColor" width="14" height="14">
+            <path d="M12.78 2.72a.75.75 0 0 1 0 1.06l-5.5 5.5a.75.75 0 0 1-1.06 0l-2-2a.75.75 0 0 1 1.06-1.06l1.47 1.47 4.97-4.97a.75.75 0 0 1 1.06 0zM3 11.25A1.75 1.75 0 0 0 4.75 13h6.5A1.75 1.75 0 0 0 13 11.25V8.5a.75.75 0 0 1 1.5 0v2.75a3.25 3.25 0 0 1-3.25 3.25h-6.5A3.25 3.25 0 0 1 1.5 11.25v-6.5A3.25 3.25 0 0 1 4.75 1.5H8.5a.75.75 0 0 1 0 1.5H4.75A1.75 1.75 0 0 0 3 4.75v6.5z"/>
+          </svg>
+          <span>{{ t("settings.tab.testing") }}</span>
+        </button>
+        <div class="sidebar-group-label">{{ t("settings.group.tools") }}</div>
+        <button
+          class="sidebar-item"
+          :class="{ active: activeCategory === 'permissions' }"
+          @click="activeCategory = 'permissions'"
+        >
+          <svg viewBox="0 0 16 16" fill="currentColor" width="14" height="14">
+            <path d="M8 1a3.5 3.5 0 0 0-3.5 3.5v1H3.25A1.25 1.25 0 0 0 2 6.75v7A1.25 1.25 0 0 0 3.25 15h9.5A1.25 1.25 0 0 0 14 13.75v-7A1.25 1.25 0 0 0 12.75 5.5H11.5v-1A3.5 3.5 0 0 0 8 1zm-2 4.5v-1a2 2 0 1 1 4 0v1H6z"/>
+          </svg>
+          <span>{{ t("settings.tab.permissions") }}</span>
+        </button>
+        <button
+          class="sidebar-item"
+          :class="{ active: activeCategory === 'memory' }"
+          @click="activeCategory = 'memory'"
+        >
+          <svg viewBox="0 0 16 16" fill="currentColor" width="14" height="14">
+            <path d="M8 1.5a3.75 3.75 0 1 0 0 7.5 3.75 3.75 0 0 0 0-7.5zM4.25 4.25a3.75 3.75 0 1 1 7.5 0 3.75 3.75 0 0 1-7.5 0zM2.5 12.25c0-1.38 2.24-2.25 5.5-2.25s5.5.87 5.5 2.25V14a.75.75 0 0 1-.75.75h-9.5A.75.75 0 0 1 2.5 14v-1.75z"/>
+          </svg>
+          <span>{{ t("settings.tab.memory") }}</span>
+        </button>
+        <button
+          class="sidebar-item"
+          :class="{ active: activeCategory === 'knowledge' }"
+          @click="activeCategory = 'knowledge'"
+        >
+          <svg viewBox="0 0 16 16" fill="currentColor" width="14" height="14">
+            <path d="M3 2.25A1.25 1.25 0 0 1 4.25 1h8.25A1.5 1.5 0 0 1 14 2.5v10A1.5 1.5 0 0 1 12.5 14H4.25A1.25 1.25 0 0 1 3 12.75V2.25zM4.25 2a.25.25 0 0 0-.25.25v10.5c0 .138.112.25.25.25H12.5a.5.5 0 0 0 .5-.5v-10a.5.5 0 0 0-.5-.5H4.25zM5.5 4h5.75a.75.75 0 0 1 0 1.5H5.5A.75.75 0 0 1 5.5 4zm0 3h5.75a.75.75 0 0 1 0 1.5H5.5A.75.75 0 0 1 5.5 7z"/>
+          </svg>
+          <span>{{ t("settings.tab.knowledge") }}</span>
+        </button>
+        <div class="sidebar-group-label">{{ t("settings.group.general") }}</div>
         <button
           class="sidebar-item"
           :class="{ active: activeCategory === 'general' }"
@@ -132,66 +230,6 @@ watch(
         </button>
         <button
           class="sidebar-item"
-          :class="{ active: activeCategory === 'api' }"
-          @click="activeCategory = 'api'"
-        >
-          <svg viewBox="0 0 16 16" fill="currentColor" width="14" height="14">
-            <path d="M8 0a4 4 0 0 0-4 4v1H3a1 1 0 0 0-1 1v8a1 1 0 0 0 1 1h10a1 1 0 0 0 1-1V6a1 1 0 0 0-1-1h-1V4a4 4 0 0 0-4-4zm2.5 5V4a2.5 2.5 0 1 0-5 0v1h5z"/>
-          </svg>
-          <span>{{ t("settings.tab.api") }}</span>
-        </button>
-        <button
-          class="sidebar-item"
-          :class="{ active: activeCategory === 'models' }"
-          @click="activeCategory = 'models'"
-        >
-          <svg viewBox="0 0 16 16" fill="currentColor" width="14" height="14">
-            <path d="M1 2.5A1.5 1.5 0 0 1 2.5 1h3A1.5 1.5 0 0 1 7 2.5v3A1.5 1.5 0 0 1 5.5 7h-3A1.5 1.5 0 0 1 1 5.5v-3zm8 0A1.5 1.5 0 0 1 10.5 1h3A1.5 1.5 0 0 1 15 2.5v3A1.5 1.5 0 0 1 13.5 7h-3A1.5 1.5 0 0 1 9 5.5v-3zm-8 8A1.5 1.5 0 0 1 2.5 9h3A1.5 1.5 0 0 1 7 10.5v3A1.5 1.5 0 0 1 5.5 15h-3A1.5 1.5 0 0 1 1 13.5v-3zm8 0A1.5 1.5 0 0 1 10.5 9h3a1.5 1.5 0 0 1 1.5 1.5v3a1.5 1.5 0 0 1-1.5 1.5h-3A1.5 1.5 0 0 1 9 13.5v-3z"/>
-          </svg>
-          <span>{{ t("settings.tab.models") }}</span>
-        </button>
-        <button
-          class="sidebar-item"
-          :class="{ active: activeCategory === 'permissions' }"
-          @click="activeCategory = 'permissions'"
-        >
-          <svg viewBox="0 0 16 16" fill="currentColor" width="14" height="14">
-            <path d="M8 1a3.5 3.5 0 0 0-3.5 3.5v1H3.25A1.25 1.25 0 0 0 2 6.75v7A1.25 1.25 0 0 0 3.25 15h9.5A1.25 1.25 0 0 0 14 13.75v-7A1.25 1.25 0 0 0 12.75 5.5H11.5v-1A3.5 3.5 0 0 0 8 1zm-2 4.5v-1a2 2 0 1 1 4 0v1H6z"/>
-          </svg>
-          <span>{{ t("settings.tab.permissions") }}</span>
-        </button>
-        <button
-          class="sidebar-item"
-          :class="{ active: activeCategory === 'memory' }"
-          @click="activeCategory = 'memory'"
-        >
-          <svg viewBox="0 0 16 16" fill="currentColor" width="14" height="14">
-            <path d="M8 1.5a3.75 3.75 0 1 0 0 7.5 3.75 3.75 0 0 0 0-7.5zM4.25 4.25a3.75 3.75 0 1 1 7.5 0 3.75 3.75 0 0 1-7.5 0zM2.5 12.25c0-1.38 2.24-2.25 5.5-2.25s5.5.87 5.5 2.25V14a.75.75 0 0 1-.75.75h-9.5A.75.75 0 0 1 2.5 14v-1.75z"/>
-          </svg>
-          <span>{{ t("settings.tab.memory") }}</span>
-        </button>
-        <button
-          class="sidebar-item"
-          :class="{ active: activeCategory === 'codeAnalysis' }"
-          @click="activeCategory = 'codeAnalysis'"
-        >
-          <svg viewBox="0 0 16 16" fill="currentColor" width="14" height="14">
-            <path d="M5.72 4.22a.75.75 0 0 1 0 1.06L2.999 8l2.72 2.72a.75.75 0 1 1-1.06 1.06l-3.25-3.25a.75.75 0 0 1 0-1.06l3.25-3.25a.75.75 0 0 1 1.06 0zm4.56 0a.75.75 0 0 1 1.06 0l3.25 3.25a.75.75 0 0 1 0 1.06l-3.25 3.25a.75.75 0 1 1-1.06-1.06L13.001 8l-2.72-2.72a.75.75 0 0 1 0-1.06zM9.262 2.07a.75.75 0 0 1 .545.91l-2.5 10a.75.75 0 0 1-1.455-.364l2.5-10a.75.75 0 0 1 .91-.546z"/>
-          </svg>
-          <span>{{ t("settings.tab.codeAnalysis") }}</span>
-        </button>
-        <button
-          class="sidebar-item"
-          :class="{ active: activeCategory === 'knowledge' }"
-          @click="activeCategory = 'knowledge'"
-        >
-          <svg viewBox="0 0 16 16" fill="currentColor" width="14" height="14">
-            <path d="M3 2.25A1.25 1.25 0 0 1 4.25 1h8.25A1.5 1.5 0 0 1 14 2.5v10A1.5 1.5 0 0 1 12.5 14H4.25A1.25 1.25 0 0 1 3 12.75V2.25zM4.25 2a.25.25 0 0 0-.25.25v10.5c0 .138.112.25.25.25H12.5a.5.5 0 0 0 .5-.5v-10a.5.5 0 0 0-.5-.5H4.25zM5.5 4h5.75a.75.75 0 0 1 0 1.5H5.5A.75.75 0 0 1 5.5 4zm0 3h5.75a.75.75 0 0 1 0 1.5H5.5A.75.75 0 0 1 5.5 7z"/>
-          </svg>
-          <span>{{ t("settings.tab.knowledge") }}</span>
-        </button>
-        <button
-          class="sidebar-item"
           :class="{ active: activeCategory === 'proxy' }"
           @click="activeCategory = 'proxy'"
         >
@@ -212,16 +250,6 @@ watch(
         </button>
         <button
           class="sidebar-item"
-          :class="{ active: activeCategory === 'archived' }"
-          @click="activeCategory = 'archived'"
-        >
-          <svg viewBox="0 0 16 16" fill="currentColor" width="14" height="14">
-            <path d="M2.5 2h11A1.5 1.5 0 0 1 15 3.5v2A1.5 1.5 0 0 1 13.5 7H13v5.5A1.5 1.5 0 0 1 11.5 14h-7A1.5 1.5 0 0 1 3 12.5V7h-.5A1.5 1.5 0 0 1 1 5.5v-2A1.5 1.5 0 0 1 2.5 2zm0 1a.5.5 0 0 0-.5.5v2a.5.5 0 0 0 .5.5h11a.5.5 0 0 0 .5-.5v-2a.5.5 0 0 0-.5-.5h-11zM4 7v5.5a.5.5 0 0 0 .5.5h7a.5.5 0 0 0 .5-.5V7H4zm2 2h4v1H6V9z"/>
-          </svg>
-          <span>{{ t("settings.tab.archived") }}</span>
-        </button>
-        <button
-          class="sidebar-item"
           :class="{ active: activeCategory === 'console' }"
           @click="activeCategory = 'console'"
         >
@@ -229,6 +257,16 @@ watch(
             <path d="M2.75 2A1.75 1.75 0 0 0 1 3.75v8.5C1 13.216 1.784 14 2.75 14h10.5A1.75 1.75 0 0 0 15 12.25v-8.5A1.75 1.75 0 0 0 13.25 2H2.75zm0 1h10.5c.414 0 .75.336.75.75v1.643H2V3.75c0-.414.336-.75.75-.75zM2 6.393h12v5.857a.75.75 0 0 1-.75.75H2.75a.75.75 0 0 1-.75-.75V6.393zm2.22 1.327a.75.75 0 0 0-1.06 1.06L4.379 10 3.16 11.22a.75.75 0 0 0 1.06 1.06L6.5 10 4.22 7.72zM7.75 11a.75.75 0 0 0 0 1.5h4a.75.75 0 0 0 0-1.5h-4z"/>
           </svg>
           <span>{{ t("settings.tab.console") }}</span>
+        </button>
+        <button
+          class="sidebar-item"
+          :class="{ active: activeCategory === 'archived' }"
+          @click="activeCategory = 'archived'"
+        >
+          <svg viewBox="0 0 16 16" fill="currentColor" width="14" height="14">
+            <path d="M2.5 2h11A1.5 1.5 0 0 1 15 3.5v2A1.5 1.5 0 0 1 13.5 7H13v5.5A1.5 1.5 0 0 1 11.5 14h-7A1.5 1.5 0 0 1 3 12.5V7h-.5A1.5 1.5 0 0 1 1 5.5v-2A1.5 1.5 0 0 1 2.5 2zm0 1a.5.5 0 0 0-.5.5v2a.5.5 0 0 0 .5.5h11a.5.5 0 0 0 .5-.5v-2a.5.5 0 0 0-.5-.5h-11zM4 7v5.5a.5.5 0 0 0 .5.5h7a.5.5 0 0 0 .5-.5V7H4zm2 2h4v1H6V9z"/>
+          </svg>
+          <span>{{ t("settings.tab.archived") }}</span>
         </button>
         <button
           class="sidebar-item"
@@ -271,6 +309,9 @@ watch(
           :all-models="allModels"
           :custom-endpoints="customEndpoints"
           :custom-endpoint-saving="customEndpointSaving"
+          :claude-code-test-status="claudeCodeTestStatus"
+          :claude-code-test-result="claudeCodeTestResult"
+          @test-claude-code="testClaudeCode"
           @start-edit="startEdit"
           @cancel-edit="cancelEdit"
           @save-key="saveKey"
@@ -333,6 +374,18 @@ watch(
 
       <template v-if="activeCategory === 'codeAnalysis'">
         <CodeAnalysisSettings />
+      </template>
+
+      <template v-if="activeCategory === 'hotReload'">
+        <HotReloadSettings />
+      </template>
+
+      <template v-if="activeCategory === 'unityConnection'">
+        <UnityConnectionSettings />
+      </template>
+
+      <template v-if="activeCategory === 'testing'">
+        <TestingSettings />
       </template>
 
       <template v-if="activeCategory === 'knowledge'">
@@ -451,6 +504,20 @@ watch(
   flex-direction: column;
   gap: 2px;
   padding: 4px 8px 8px;
+}
+
+:deep(.sidebar-group-label) {
+  padding: 10px 10px 4px;
+  font-size: 10.5px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+  color: var(--text-tertiary, var(--text-secondary));
+  user-select: none;
+}
+
+:deep(.sidebar-group-label:first-child) {
+  padding-top: 2px;
 }
 
 :deep(.sidebar-item) {

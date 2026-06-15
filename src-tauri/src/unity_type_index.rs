@@ -192,6 +192,11 @@ pub async fn invalidate_cached_type_index(project_path: &str) {
     let key = normalize_project_key(project_path);
     type_index_cache().lock().await.remove(&key);
 
+    // The sidecar compile params and serialized schema go stale at the same
+    // moments as the type index: recompiles and domain reloads.
+    crate::csharp_compile::params::invalidate(project_path).await;
+    crate::unity_serialized_schema::invalidate(project_path).await;
+
     for path in [
         type_index_cache_path(project_path),
         legacy_type_index_cache_path(project_path),
@@ -339,6 +344,88 @@ pub async fn persist_skill_package_type_index_delta(
     let index = write_type_index_cache_file(project_path, cache).await?;
     set_cached_type_index(project_path, index.clone()).await;
     Ok(Some(index))
+}
+
+/// TI-B: persist a sidecar-built type index. The fingerprint is the
+/// Unity-side `export_type_index_fingerprint` value, so currency checks and
+/// the skill-package delta channel work identically for both sources.
+pub async fn persist_sidecar_type_index(
+    project_path: &str,
+    fingerprint: String,
+    types: Vec<UnityTypeIndexEntry>,
+) -> Result<Arc<UnityTypeIndex>, String> {
+    let fingerprint = fingerprint.trim().to_string();
+    if fingerprint.is_empty() {
+        return Err("sidecar type index is missing the Unity fingerprint".to_string());
+    }
+    let cache = UnityTypeIndexCacheFile {
+        version: CACHE_VERSION,
+        fingerprint,
+        exported_at_unix_ms: now_unix_ms(),
+        assemblies: BTreeMap::new(),
+        types,
+    };
+    let index = write_type_index_cache_file(project_path, cache).await?;
+    set_cached_type_index(project_path, index.clone()).await;
+    Ok(index)
+}
+
+/// TI-C: layer hot-patch new types into the cached index so auto-usings
+/// resolve them immediately. The cache fingerprint is untouched on purpose:
+/// Unity's own export fingerprint skips `__LocusHotPatch_` assemblies, so
+/// the cache stays "current" with these extra rows; any domain reload
+/// changes the Unity fingerprint and the next full refresh drops them.
+pub async fn append_hot_patch_types(
+    project_path: &str,
+    assembly_id: &str,
+    types: Vec<UnityTypeIndexEntry>,
+) -> Result<(), String> {
+    if types.is_empty() {
+        return Ok(());
+    }
+    let Some(mut cache) = read_type_index_cache_file(project_path)? else {
+        return Err("base Unity type index cache is missing".to_string());
+    };
+
+    // Re-patching the same new type supersedes the previous patch's row.
+    cache
+        .types
+        .retain(|entry| !types.iter().any(|t| t.full_name == entry.full_name));
+    for mut entry in types {
+        if entry.assembly.trim().is_empty() {
+            entry.assembly = assembly_id.to_string();
+        }
+        cache.types.push(entry);
+    }
+    cache.exported_at_unix_ms = now_unix_ms();
+
+    let index = write_type_index_cache_file(project_path, cache).await?;
+    set_cached_type_index(project_path, index).await;
+    Ok(())
+}
+
+/// Drop TI-C rows that came from transient hot-patch assemblies. Detours and
+/// hot-patch assemblies disappear on domain reload; the base Unity fingerprint
+/// may stay unchanged, so the cache needs an explicit cleanup path.
+pub async fn drop_hot_patch_types(project_path: &str) -> Result<usize, String> {
+    let Some(mut cache) = read_type_index_cache_file(project_path)? else {
+        return Ok(0);
+    };
+    let before = cache.types.len();
+    cache
+        .types
+        .retain(|entry| !entry.assembly.starts_with("__LocusHotPatch_"));
+    let removed = before.saturating_sub(cache.types.len());
+    if removed == 0 {
+        return Ok(0);
+    }
+    cache
+        .assemblies
+        .retain(|assembly, _| !assembly.starts_with("__LocusHotPatch_"));
+    cache.exported_at_unix_ms = now_unix_ms();
+    let index = write_type_index_cache_file(project_path, cache).await?;
+    set_cached_type_index(project_path, index).await;
+    Ok(removed)
 }
 
 fn read_type_index_cache_file(
@@ -601,6 +688,10 @@ pub fn append_auto_using_notes(error: String, prepared: &PreparedUnityCode) -> S
 impl UnityTypeIndex {
     fn from_cache(cache: UnityTypeIndexCacheFile) -> Self {
         Self::from_entries_with_assemblies(cache.fingerprint, cache.types, cache.assemblies)
+    }
+
+    pub fn entry_count(&self) -> usize {
+        self.entries.len()
     }
 
     #[cfg(test)]
@@ -1284,6 +1375,58 @@ mod tests {
 
             assert!(cached_type_index(&project_path).await.is_none());
             assert!(!cache_path.exists());
+        });
+    }
+
+    #[test]
+    fn sidecar_type_index_persists_and_hot_patch_types_layer_on_top() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let project = tempfile::tempdir().expect("project");
+            let project_path = project.path().to_string_lossy();
+
+            let index = persist_sidecar_type_index(
+                &project_path,
+                "unity-fp-1".to_string(),
+                vec![
+                    test_entry("ProjectType", "Game", "Assembly-CSharp"),
+                    test_entry("Widget", "Game.UI", "Assembly-CSharp"),
+                ],
+            )
+            .await
+            .expect("persist sidecar index");
+            assert_eq!(index.fingerprint, "unity-fp-1");
+            assert!(index.by_simple_name.contains_key("Widget"));
+            assert!(type_index_cache_path(&project_path).is_file());
+
+            // TI-C layering keeps the fingerprint (Unity's own fingerprint
+            // skips hot patch assemblies) and supersedes re-patched types.
+            append_hot_patch_types(
+                &project_path,
+                "__LocusHotPatch_00000000_00000001",
+                vec![test_entry("Spawner", "Game", "")],
+            )
+            .await
+            .expect("append hot patch types");
+
+            let layered = cached_type_index(&project_path).await.expect("cached");
+            assert_eq!(layered.fingerprint, "unity-fp-1");
+            assert!(layered.by_simple_name.contains_key("Spawner"));
+            let spawner = &layered.by_simple_name["Spawner"][0];
+            assert_eq!(spawner.assembly, "__LocusHotPatch_00000000_00000001");
+
+            append_hot_patch_types(
+                &project_path,
+                "__LocusHotPatch_00000000_00000002",
+                vec![test_entry("Spawner", "Game", "")],
+            )
+            .await
+            .expect("supersede hot patch types");
+
+            let layered = cached_type_index(&project_path).await.expect("cached");
+            let spawners = &layered.by_simple_name["Spawner"];
+            assert_eq!(spawners.len(), 1);
+            assert_eq!(spawners[0].assembly, "__LocusHotPatch_00000000_00000002");
         });
     }
 

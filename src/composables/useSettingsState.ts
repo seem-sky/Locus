@@ -3,6 +3,7 @@ import { clearWarmup, getWarmup, setWarmup } from "./warmupCache";
 import { resetAllConfig } from "../services/project";
 import {
   getProviders,
+  testClaudeCodeCli,
   saveProviderKey,
   deleteProviderKey,
   getAuthUrl,
@@ -298,7 +299,7 @@ export function useSettingsState(emit: SettingsEmit) {
   }
 
   // ── Navigation ───────────────────────────────────────────────────────
-  const activeCategory = ref<"api" | "models" | "permissions" | "codeAnalysis" | "proxy" | "headroom" | "general" | "display" | "notifications" | "shortcuts" | "knowledge" | "memory" | "archived" | "console" | "about">("general");
+  const activeCategory = ref<"api" | "models" | "permissions" | "codeAnalysis" | "hotReload" | "unityConnection" | "testing" | "proxy" | "headroom" | "general" | "display" | "notifications" | "shortcuts" | "knowledge" | "memory" | "archived" | "console" | "about">("general");
 
   // ── Provider / API key state ─────────────────────────────────────────
   const providers = ref<ProviderStatus[]>([]);
@@ -307,6 +308,23 @@ export function useSettingsState(emit: SettingsEmit) {
   const errorMsg = ref("");
   const successMsg = ref("");
   const isLoading = ref(false);
+  const claudeCodeTestStatus = ref<"idle" | "testing" | "success" | "error">("idle");
+  const claudeCodeTestResult = ref("");
+
+  async function testClaudeCode() {
+    claudeCodeTestStatus.value = "testing";
+    claudeCodeTestResult.value = "";
+    try {
+      const reply = await testClaudeCodeCli();
+      claudeCodeTestStatus.value = "success";
+      claudeCodeTestResult.value = reply;
+      // The live test is authoritative — refresh the heuristic status badge.
+      await loadProviders();
+    } catch (e) {
+      claudeCodeTestStatus.value = "error";
+      claudeCodeTestResult.value = normalizeCustomEndpointTestErrorMessage(e);
+    }
+  }
 
   async function loadProviders() {
     try {
@@ -791,6 +809,7 @@ export function useSettingsState(emit: SettingsEmit) {
     { name: "unity_execute",      label: "unity_execute",      desc: t("tool.desc.unity_execute"),      defaultMode: "ask"  as const },
     { name: "unity_run_states",   label: "unity_run_states",   desc: t("tool.desc.unity_run_states"),   defaultMode: "ask"  as const },
     { name: "unity_recompile",    label: "unity_recompile",    desc: t("tool.desc.unity_recompile"),    defaultMode: "auto" as const },
+    { name: "unity_hot_reload",   label: "unity_hot_reload",   desc: t("tool.desc.unity_hot_reload"),   defaultMode: "auto" as const },
     { name: "unity_ref_search",   label: "unity_ref_search",   desc: t("tool.desc.unity_ref_search"),   defaultMode: "auto" as const },
     { name: "code_find_references", label: "code_find_references", desc: t("tool.desc.code_find_references"), defaultMode: "auto" as const },
     { name: "code_goto_definition", label: "code_goto_definition", desc: t("tool.desc.code_goto_definition"), defaultMode: "auto" as const },
@@ -819,13 +838,13 @@ export function useSettingsState(emit: SettingsEmit) {
       name: "behavior.unity_editor_status_change",
       label: t("settings.perms.behavior.unityEditorStatusChange"),
       desc: t("settings.perms.behavior.unityEditorStatusChangeDesc"),
-      defaultMode: "ask" as const,
+      defaultMode: "auto" as const,
     },
     {
       name: "behavior.knowledge_governance",
       label: t("settings.perms.behavior.knowledgeGovernance"),
       desc: t("settings.perms.behavior.knowledgeGovernanceDesc"),
-      defaultMode: "ask" as const,
+      defaultMode: "auto" as const,
     },
   ]);
 
@@ -1340,6 +1359,9 @@ export function useSettingsState(emit: SettingsEmit) {
     successMsg,
     isLoading,
     loadProviders,
+    claudeCodeTestStatus,
+    claudeCodeTestResult,
+    testClaudeCode,
     startEdit,
     cancelEdit,
     saveKey,

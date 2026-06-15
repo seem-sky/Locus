@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref } from "vue";
 import { t } from "../../i18n";
+import BaseButton from "../ui/BaseButton.vue";
 import BaseSwitch from "../ui/BaseSwitch.vue";
 import {
   codeAnalysisToolsGetConfig,
@@ -41,6 +42,8 @@ const lspStatusLabel = computed(() => {
       return t("chat.status.code.preparing");
     case "downloading":
       return t("chat.status.code.downloading", status.downloadComponent ?? "");
+    case "generating":
+      return t("chat.status.code.generating");
     case "starting":
       return t("chat.status.code.starting");
     case "loading":
@@ -73,6 +76,7 @@ const lspToolItems = computed<CodeToolItem[]>(() => [
   { key: "codeSymbolSearch", label: "code_symbol_search", desc: t("settings.codeAnalysis.tool.codeSymbolSearch") },
   { key: "codeGotoDefinition", label: "code_goto_definition", desc: t("settings.codeAnalysis.tool.codeGotoDefinition") },
   { key: "codeFindReferences", label: "code_find_references", desc: t("settings.codeAnalysis.tool.codeFindReferences") },
+  { key: "editWriteDiagnostics", label: t("settings.codeAnalysis.tool.editWriteDiagnosticsLabel"), desc: t("settings.codeAnalysis.tool.editWriteDiagnostics") },
   { key: "codeDiagnostics", label: "code_diagnostics", desc: t("settings.codeAnalysis.tool.codeDiagnostics") },
   { key: "codeHover", label: "code_hover", desc: t("settings.codeAnalysis.tool.codeHover") },
   { key: "unityAnalyzers", label: t("settings.codeAnalysis.tool.unityAnalyzersLabel"), desc: t("settings.codeAnalysis.tool.unityAnalyzers") },
@@ -194,15 +198,14 @@ onUnmounted(() => {
           </span>
         </div>
         <div class="master-actions">
-          <button
+          <BaseButton
             v-if="lspEnabled"
-            class="action-btn"
             :disabled="restartBusy"
             :title="t('chat.status.code.restartTitle')"
             @click="restartLsp"
           >
             {{ t("chat.status.code.restart") }}
-          </button>
+          </BaseButton>
           <BaseSwitch
             v-if="lspReady"
             :model-value="lspEnabled"

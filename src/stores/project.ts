@@ -1,11 +1,13 @@
 import { ref, computed } from "vue";
 import { defineStore } from "pinia";
+import { confirm } from "@tauri-apps/plugin-dialog";
 import * as projectService from "../services/project";
 import * as unityService from "../services/unity";
 import { assetDbLightStatus, assetDbScanStart } from "../services/asset";
 import { normalizeAppError } from "../services/errors";
 import { useNotificationStore } from "./notification";
 import { t } from "../i18n";
+import type { UnityLaunchResult } from "../services/unity";
 import type {
   AssetDbLightStatus,
   AssetDbScanEvent,
@@ -36,6 +38,7 @@ export const useProjectStore = defineStore("project", () => {
   let scanInFlight = false;
   let unityLaunchPollTimer: ReturnType<typeof globalThis.setTimeout> | null = null;
   let unityLaunchWaitStartedAt = 0;
+  let unityConnectionCheckInFlight: Promise<void> | null = null;
 
   const isUnityProject = computed(() => workingDir.value.length > 0);
 
@@ -98,6 +101,37 @@ export const useProjectStore = defineStore("project", () => {
     } else if (hook?.state === "patched" || hook?.state === "disabled") {
       notificationStore.clearByOperation(UNITY_BACKGROUND_HOOK_NOTICE_OPERATION);
     }
+  }
+
+  function connectionStatusFromLaunchResult(result: UnityLaunchResult): UnityConnectionStatus {
+    const now = Date.now();
+    return {
+      connected: false,
+      editorStatus: "disconnected",
+      controlChannelState: "starting",
+      editorProcessState: "running",
+      editorProcessId: result.processId,
+      editorProcessPath: result.editorPath,
+      editorProjectPath: result.projectPath,
+      processCheckedAtMs: now,
+      processLastError: null,
+      pipeName: unityConnectionStatus.value?.pipeName ?? "",
+      latencyMs: null,
+      reconnectAttempts: 0,
+      lastError: null,
+      backgroundHook: unityConnectionStatus.value?.backgroundHook ?? {
+        enabled: false,
+        supported: false,
+        state: "inactive",
+        patched: false,
+        processId: null,
+        editorProcessPath: null,
+        symbolCount: 0,
+        error: null,
+        updatedAtMs: now,
+      },
+      checkedAtMs: now,
+    };
   }
 
   function scheduleUnityLaunchConnectionCheck(delayMs = UNITY_LAUNCH_CONNECTION_POLL_MS) {
@@ -214,11 +248,17 @@ export const useProjectStore = defineStore("project", () => {
   }
 
   async function checkUnityConnection() {
-    try {
-      setUnityConnectionStatus(await unityService.checkUnityConnectionStatus());
-    } catch {
-      setUnityConnected(false);
-    }
+    if (unityConnectionCheckInFlight) return unityConnectionCheckInFlight;
+    unityConnectionCheckInFlight = (async () => {
+      try {
+        setUnityConnectionStatus(await unityService.checkUnityConnectionStatus());
+      } catch {
+        setUnityConnected(false);
+      } finally {
+        unityConnectionCheckInFlight = null;
+      }
+    })();
+    return unityConnectionCheckInFlight;
   }
 
   async function checkUnityPlugin() {
@@ -231,9 +271,28 @@ export const useProjectStore = defineStore("project", () => {
   }
 
   async function installPlugin() {
+    if (pluginInstalling.value) return;
+
+    let forceCloseUnity = false;
+    try {
+      const plan = await unityService.checkUnityPluginInstallPlan();
+      if (plan.dllUpdateRequired && plan.unityRunning) {
+        const confirmed = await confirm(t("app.plugin.closeUnityConfirmMessage"), {
+          title: t("app.plugin.closeUnityConfirmTitle"),
+          kind: "warning",
+          okLabel: t("app.plugin.closeUnityConfirmAction"),
+          cancelLabel: t("common.cancel"),
+        });
+        if (!confirmed) return;
+        forceCloseUnity = true;
+      }
+    } catch (e) {
+      console.warn("check_unity_plugin_install_plan failed:", e);
+    }
+
     pluginInstalling.value = true;
     try {
-      await unityService.installUnityPlugin();
+      await unityService.installUnityPlugin({ forceCloseUnity });
     } catch (e) {
       console.error("install_unity_plugin failed:", e);
     } finally {
@@ -246,7 +305,8 @@ export const useProjectStore = defineStore("project", () => {
     clearUnityLaunchPoll();
     unityLaunchState.value = "starting";
     try {
-      await unityService.launchUnityProject();
+      const launch = await unityService.launchUnityProject();
+      setUnityConnectionStatus(connectionStatusFromLaunchResult(launch));
       if (unityConnected.value) {
         resetUnityLaunchState();
         return;
@@ -313,6 +373,7 @@ export const useProjectStore = defineStore("project", () => {
     scanPhase.value = null;
     lastScanStats.value = null;
     scanInFlight = false;
+    unityConnectionCheckInFlight = null;
     setPluginToast(null);
     pluginInstalling.value = false;
     resetUnityLaunchState();

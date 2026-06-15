@@ -523,6 +523,7 @@ fn collect_permissions(app_handle: &tauri::AppHandle, out: &mut Vec<ConfigEntry>
         ("unity_run_states", "Run Unity state-machine debugging flow"),
         ("lua_gc_analyze", "Analyze Lua GC monitor session"),
         ("unity_recompile", "Trigger Unity recompilation"),
+        ("unity_hot_reload", "Hot-patch C# method edits into Unity"),
         ("unity_ref_search", "Unity reference graph search"),
         ("code_find_references", "C# find references (Roslyn)"),
         ("code_goto_definition", "C# go to definition (Roslyn)"),
@@ -577,7 +578,7 @@ fn collect_permissions(app_handle: &tauri::AppHandle, out: &mut Vec<ConfigEntry>
     ];
 
     for (name, label, desc) in behavior_list {
-        let current = perms.get(name).map(|s| s.as_str()).unwrap_or("ask");
+        let current = perms.get(name).map(|s| s.as_str()).unwrap_or("auto");
 
         out.push(ConfigEntry {
             key: format!("permissions.{}", name),

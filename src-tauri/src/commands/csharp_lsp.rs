@@ -25,6 +25,133 @@ pub async fn csharp_lsp_set_enabled(
 }
 
 #[tauri::command]
+pub async fn unity_sidecar_compiler_get_status(
+) -> Result<crate::csharp_compile::CsharpCompileStatusPayload, AppError> {
+    Ok(crate::csharp_compile::refresh_status().await)
+}
+
+#[tauri::command]
+pub async fn unity_sidecar_compiler_set_enabled(
+    value: bool,
+    config: State<'_, std::sync::Arc<crate::config::AppConfig>>,
+) -> Result<crate::csharp_compile::CsharpCompileStatusPayload, AppError> {
+    config
+        .set_unity_sidecar_compiler_enabled(value)
+        .map_err(|error| AppError::new("csharp_compile.persist_failed", error))?;
+
+    crate::csharp_compile::set_enabled(value).await;
+    if value {
+        crate::csharp_compile::warm_up_in_background();
+    }
+    Ok(crate::csharp_compile::status().await)
+}
+
+#[tauri::command]
+pub async fn unity_hot_reload_set_enabled(
+    value: bool,
+    config: State<'_, std::sync::Arc<crate::config::AppConfig>>,
+) -> Result<crate::csharp_compile::CsharpCompileStatusPayload, AppError> {
+    config
+        .set_unity_hot_reload_enabled(value)
+        .map_err(|error| AppError::new("unity_hotreload.persist_failed", error))?;
+
+    crate::unity_hotreload::set_enabled(value);
+    Ok(crate::csharp_compile::status().await)
+}
+
+#[tauri::command]
+pub async fn unity_hot_reload_selftest_run(
+    app: tauri::AppHandle,
+    workspace: State<'_, std::sync::Arc<crate::workspace::Workspace>>,
+) -> Result<(), AppError> {
+    let cwd = workspace.path.read().await.clone();
+    crate::unity_hotreload::selftest::run(app, cwd)
+        .await
+        .map_err(|error| AppError::new("unity_hotreload.selftest_failed", error))
+}
+
+/// C0 diagnostic: run (or return the cached) runtime access-capability probe
+/// against the connected Unity editor and return the full matrix JSON
+/// (`{cached, domainGeneration, caps, matrix}`). Needs the sidecar compiler
+/// and a connected editor with a current plugin; independent of the
+/// `unity_hot_reload` feature flag so it can be used to qualify an editor
+/// before enabling hot reload.
+#[tauri::command]
+pub async fn unity_hot_reload_access_probe_run(
+    workspace: State<'_, std::sync::Arc<crate::workspace::Workspace>>,
+) -> Result<serde_json::Value, AppError> {
+    let cwd = workspace.path.read().await.clone();
+    if cwd.trim().is_empty() {
+        return Err(AppError::new(
+            "unity_hotreload.no_workspace",
+            "No workspace selected",
+        ));
+    }
+    crate::unity_hotreload::coordinator::access_probe_run(&cwd)
+        .await
+        .map_err(|error| AppError::new("unity_hotreload.access_probe_failed", error))
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HotReloadPreflight {
+    /// Whether a Unity editor answered the probe.
+    pub connected: bool,
+    /// "debug" | "release" when readable; `None` when the editor is
+    /// unreachable or the value could not be parsed.
+    pub code_optimization: Option<String>,
+}
+
+/// Enable-time check the toggle UI runs before turning hot reload on: report
+/// the connected editor's Code Optimization so the UI can warn (and offer to
+/// auto-switch) when it is Release. Independent of the `unity_hot_reload`
+/// feature flag. Never errors on a missing editor — the UI treats "can't tell"
+/// as "go ahead", and the execution-time probe still gates real hot reloads.
+#[tauri::command]
+pub async fn unity_hot_reload_preflight(
+    workspace: State<'_, std::sync::Arc<crate::workspace::Workspace>>,
+) -> Result<HotReloadPreflight, AppError> {
+    let cwd = workspace.path.read().await.clone();
+    if cwd.trim().is_empty() {
+        return Ok(HotReloadPreflight {
+            connected: false,
+            code_optimization: None,
+        });
+    }
+    let (connected, code_optimization) =
+        crate::unity_hotreload::coordinator::detect_code_optimization(&cwd).await;
+    Ok(HotReloadPreflight {
+        connected,
+        code_optimization,
+    })
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodeOptimizationResult {
+    pub code_optimization: String,
+}
+
+/// Switch the connected editor's Code Optimization to Debug (the auto-fix the
+/// user confirms in the enable-time prompt). Triggers a Unity script recompile.
+#[tauri::command]
+pub async fn unity_hot_reload_set_code_optimization_debug(
+    workspace: State<'_, std::sync::Arc<crate::workspace::Workspace>>,
+) -> Result<CodeOptimizationResult, AppError> {
+    let cwd = workspace.path.read().await.clone();
+    if cwd.trim().is_empty() {
+        return Err(AppError::new(
+            "unity_hotreload.no_workspace",
+            "No workspace selected",
+        ));
+    }
+    let code_optimization = crate::unity_hotreload::coordinator::set_code_optimization_debug(&cwd)
+        .await
+        .map_err(|error| AppError::new("unity_hotreload.set_code_optimization_failed", error))?;
+    Ok(CodeOptimizationResult { code_optimization })
+}
+
+#[tauri::command]
 pub async fn code_analysis_tools_get_config(
     config: State<'_, std::sync::Arc<crate::config::AppConfig>>,
 ) -> Result<crate::config::CodeAnalysisToolsConfig, AppError> {

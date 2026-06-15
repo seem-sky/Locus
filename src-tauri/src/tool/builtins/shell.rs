@@ -522,7 +522,10 @@ async fn wait_for_interactive_exit(
             };
         }
 
-        tokio::time::sleep(std::time::Duration::from_millis(INTERACTIVE_POLL_INTERVAL_MS)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(
+            INTERACTIVE_POLL_INTERVAL_MS,
+        ))
+        .await;
     }
 }
 
