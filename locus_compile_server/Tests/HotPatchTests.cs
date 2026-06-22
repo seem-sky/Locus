@@ -101,6 +101,45 @@ public class HotPatchTests : IDisposable
         return service.HandleCompileHotPatch(request);
     }
 
+    private static JsonNode HotPatchWithForceDetours(
+        CompileService service,
+        JsonObject @params,
+        (string Path, string Old, string New) file,
+        params string[] methodKeys)
+        => HotPatchWithForceDetours(
+            service,
+            @params,
+            new[] { file },
+            (file.Path, methodKeys));
+
+    private static JsonNode HotPatchWithForceDetours(
+        CompileService service,
+        JsonObject @params,
+        (string Path, string Old, string New)[] files,
+        params (string Path, string[] MethodKeys)[] forceDetours)
+    {
+        var request = new JsonObject
+        {
+            ["files"] = new JsonArray(files
+                .Select(f => (JsonNode)new JsonObject
+                {
+                    ["path"] = f.Path,
+                    ["oldText"] = f.Old,
+                    ["newText"] = f.New,
+                })
+                .ToArray()),
+            ["params"] = @params,
+            ["forceDetours"] = new JsonArray(forceDetours
+                .Select(force => (JsonNode)new JsonObject
+                {
+                    ["path"] = force.Path,
+                    ["methodKeys"] = new JsonArray(force.MethodKeys.Select(key => (JsonNode)key).ToArray()),
+                })
+                .ToArray()),
+        };
+        return service.HandleCompileHotPatch(request);
+    }
+
     private const string OriginalSource = @"
 namespace HotPatchE2E
 {
@@ -197,6 +236,370 @@ namespace HotPatchE2E
         Assert.True(newType["isTopLevel"]!.GetValue<bool>());
     }
 
+    private const string InlineCallerRefreshSource = @"
+namespace InlineRefresh
+{
+    public static class Lib
+    {
+        public static int Value() { return 1; }
+    }
+
+    public static class Caller
+    {
+        public static int Call() { return Lib.Value(); }
+    }
+}";
+
+    [Fact]
+    public void Force_detours_compile_unchanged_caller_method_with_source_path()
+    {
+        var service = new CompileService();
+        string originalPath = CompileOriginal(service, "InlineRefreshOriginal", InlineCallerRefreshSource);
+        JsonObject compileParams = ParamsFor(originalPath);
+
+        JsonNode result = HotPatchWithForceDetours(
+            service,
+            compileParams,
+            ("Assets/Caller.cs", InlineCallerRefreshSource, InlineCallerRefreshSource),
+            "InlineRefresh.Caller|Call|0|s");
+
+        Assert.True(result["hot"]!.GetValue<bool>());
+        Assert.True(result["success"]!.GetValue<bool>(), result["error"]?.GetValue<string>());
+        var method = Assert.Single(result["methods"]!.AsArray())!;
+        Assert.Equal("InlineRefresh.Caller", method["declaringType"]!.GetValue<string>());
+        Assert.Equal("Call", method["name"]!.GetValue<string>());
+        Assert.True(method["isStatic"]!.GetValue<bool>());
+        Assert.Equal("Assets/Caller.cs", method["sourcePath"]!.GetValue<string>());
+    }
+
+    [Fact]
+    public void Force_detoured_interface_default_method_fails_closed()
+    {
+        const string source = @"
+namespace InlineRefresh
+{
+    public interface I
+    {
+        int M() { return 1; }
+    }
+}";
+        var service = new CompileService();
+        JsonObject compileParams = ParamsFor();
+
+        JsonNode result = HotPatchWithForceDetours(
+            service,
+            compileParams,
+            ("Assets/I.cs", source, source),
+            "InlineRefresh.I|M|0|i");
+
+        Assert.False(result["hot"]!.GetValue<bool>());
+        var file = Assert.Single(result["files"]!.AsArray())!;
+        Assert.Equal("Assets/I.cs", file["path"]!.GetValue<string>());
+        string reason = Assert.Single(file["reasons"]!.AsArray())!.GetValue<string>();
+        Assert.Contains("InlineRefresh.I.M", reason);
+        Assert.Contains("interface members are not supported", reason);
+    }
+
+    private const string InlineRefreshLibSource = @"
+namespace InlineRefresh
+{
+    public static class SplitLib
+    {
+        public static int Value() { return 1; }
+    }
+}";
+
+    private const string InlineRefreshCallerSource = @"
+namespace InlineRefresh
+{
+    public static class SplitCaller
+    {
+        public static int Call() { return SplitLib.Value() + 1; }
+    }
+}";
+
+    [Fact]
+    public void Force_detoured_cross_file_caller_invokes_current_callee_patch_copy()
+    {
+        var service = new CompileService();
+        string asmPath = CompileProjectAssembly(
+            service,
+            "InlineRefreshSplitOriginal",
+            ("Assets/Lib.cs", InlineRefreshLibSource),
+            ("Assets/Caller.cs", InlineRefreshCallerSource));
+        JsonObject compileParams = ParamsFor(asmPath);
+
+        string newLib = InlineRefreshLibSource.Replace("return 1;", "return 41;");
+        JsonNode result = HotPatchWithForceDetours(
+            service,
+            compileParams,
+            new[]
+            {
+                ("Assets/Lib.cs", InlineRefreshLibSource, newLib),
+                ("Assets/Caller.cs", InlineRefreshCallerSource, InlineRefreshCallerSource),
+            },
+            ("Assets/Caller.cs", new[] { "InlineRefresh.SplitCaller|Call|0|s" }));
+
+        Assert.True(result["hot"]!.GetValue<bool>(), result["files"]?.ToJsonString());
+        Assert.True(result["success"]!.GetValue<bool>(), result["error"]?.GetValue<string>());
+
+        var methodNames = result["methods"]!.AsArray()
+            .Select(m => m!["declaringType"]!.GetValue<string>() + "." + m["name"]!.GetValue<string>())
+            .OrderBy(n => n)
+            .ToArray();
+        Assert.Equal(new[] { "InlineRefresh.SplitCaller.Call", "InlineRefresh.SplitLib.Value" }, methodNames);
+
+        byte[] originalBytes = File.ReadAllBytes(asmPath);
+        byte[] patchBytes = Convert.FromBase64String(result["assemblyB64"]!.GetValue<string>());
+        var context = new AssemblyLoadContext("inline-refresh-split", isCollectible: true);
+        try
+        {
+            Assembly original = context.LoadFromStream(new MemoryStream(originalBytes));
+            context.Resolving += (_, name) => name.Name == "InlineRefreshSplitOriginal" ? original : null;
+            Assembly patch = context.LoadFromStream(new MemoryStream(patchBytes));
+
+            Type patchCaller = patch.GetType("InlineRefresh.SplitCaller__LocusPatch", throwOnError: true)!;
+            Assert.Equal(42, patchCaller.GetMethod("Call")!.Invoke(null, null));
+        }
+        finally
+        {
+            context.Unload();
+        }
+    }
+
+    // ── Release inline caller refresh: INSTANCE callee (Option A self-shim) ──
+    // An instance callee cannot bind to a patch-copy method on the original
+    // receiver, so the refreshed caller binds to a static self-shim carrying the
+    // CHANGED body. The original method keeps its normal detour for non-inlined
+    // call sites.
+
+    private const string InstRefreshLibSource = @"
+namespace InlineRefresh
+{
+    public class InstLib
+    {
+        public int Value() { return 1; }
+    }
+}";
+
+    private const string InstRefreshCallerSource = @"
+namespace InlineRefresh
+{
+    public static class InstCaller
+    {
+        public static int Call() { return new InstLib().Value() + 1; }
+    }
+}";
+
+    [Fact]
+    public void Force_detoured_caller_redirects_inlined_instance_callee_to_self_shim()
+    {
+        var service = new CompileService();
+        string asmPath = CompileProjectAssembly(
+            service,
+            "InstInlineRefreshOriginal",
+            ("Assets/InstLib.cs", InstRefreshLibSource),
+            ("Assets/InstCaller.cs", InstRefreshCallerSource));
+        JsonObject compileParams = ParamsFor(asmPath);
+
+        string newLib = InstRefreshLibSource.Replace("return 1;", "return 41;");
+        JsonNode result = HotPatchWithForceDetours(
+            service,
+            compileParams,
+            new[]
+            {
+                ("Assets/InstLib.cs", InstRefreshLibSource, newLib),
+                ("Assets/InstCaller.cs", InstRefreshCallerSource, InstRefreshCallerSource),
+            },
+            ("Assets/InstCaller.cs", new[] { "InlineRefresh.InstCaller|Call|0|s" }));
+
+        Assert.True(result["hot"]!.GetValue<bool>(), result["files"]?.ToJsonString());
+        Assert.True(result["success"]!.GetValue<bool>(), result["error"]?.GetValue<string>());
+
+        // The synthetic self-shim clone is an internal direct-call target — it
+        // must NOT surface as a redirected method (only the real callee + caller).
+        var methodNames = result["methods"]!.AsArray()
+            .Select(m => m!["declaringType"]!.GetValue<string>() + "." + m["name"]!.GetValue<string>())
+            .OrderBy(n => n)
+            .ToArray();
+        Assert.Equal(new[] { "InlineRefresh.InstCaller.Call", "InlineRefresh.InstLib.Value" }, methodNames);
+
+        byte[] originalBytes = File.ReadAllBytes(asmPath);
+        byte[] patchBytes = Convert.FromBase64String(result["assemblyB64"]!.GetValue<string>());
+        var context = new AssemblyLoadContext("inst-inline-refresh", isCollectible: true);
+        try
+        {
+            Assembly original = context.LoadFromStream(new MemoryStream(originalBytes));
+            context.Resolving += (_, name) => name.Name == "InstInlineRefreshOriginal" ? original : null;
+            Assembly patch = context.LoadFromStream(new MemoryStream(patchBytes));
+
+            // The refreshed caller binds `new InstLib().Value()` to the self-shim
+            // carrying the NEW body (41), so Call() == 41 + 1 — not the stale 2.
+            Type patchCaller = patch.GetType("InlineRefresh.InstCaller__LocusPatch", throwOnError: true)!;
+            Assert.Equal(42, patchCaller.GetMethod("Call")!.Invoke(null, null));
+        }
+        finally
+        {
+            context.Unload();
+        }
+    }
+
+    [Fact]
+    public void Force_detoured_caller_redirects_inlined_cross_asmdef_instance_callee_to_self_shim()
+    {
+        var service = new CompileService();
+        // Callee lives in its OWN assembly (the "lib"), like R05's
+        // LocusSelfTestLibType.LibBody, and the caller lives in the MAIN assembly
+        // that references it. The refresh patch then references the lib assembly
+        // AND recompiles the lib's source — the cross-asmdef duplicate-type case
+        // the same-assembly test above does not exercise.
+        string libPath = CompileProjectAssembly(
+            service,
+            "InstXLib",
+            ("Assets/InstLib.cs", InstRefreshLibSource));
+        string mainPath = CompileProjectAssembly(
+            service,
+            "InstXMain",
+            new[] { libPath },
+            ("Assets/InstCaller.cs", InstRefreshCallerSource));
+        JsonObject compileParams = ParamsFor(libPath, mainPath);
+
+        string newLib = InstRefreshLibSource.Replace("return 1;", "return 41;");
+        JsonNode result = HotPatchWithForceDetours(
+            service,
+            compileParams,
+            new[]
+            {
+                ("Assets/InstLib.cs", InstRefreshLibSource, newLib),
+                ("Assets/InstCaller.cs", InstRefreshCallerSource, InstRefreshCallerSource),
+            },
+            ("Assets/InstCaller.cs", new[] { "InlineRefresh.InstCaller|Call|0|s" }));
+
+        Assert.True(result["hot"]!.GetValue<bool>(), result["files"]?.ToJsonString());
+        Assert.True(result["success"]!.GetValue<bool>(), result["error"]?.GetValue<string>());
+
+        byte[] libBytes = File.ReadAllBytes(libPath);
+        byte[] mainBytes = File.ReadAllBytes(mainPath);
+        byte[] patchBytes = Convert.FromBase64String(result["assemblyB64"]!.GetValue<string>());
+        var context = new AssemblyLoadContext("inst-xasm-inline-refresh", isCollectible: true);
+        try
+        {
+            Assembly lib = context.LoadFromStream(new MemoryStream(libBytes));
+            Assembly main = context.LoadFromStream(new MemoryStream(mainBytes));
+            context.Resolving += (_, name) =>
+                name.Name == "InstXLib" ? lib :
+                name.Name == "InstXMain" ? main : null;
+            Assembly patch = context.LoadFromStream(new MemoryStream(patchBytes));
+
+            // The refreshed caller must bind `new InstLib().Value()` to the self-shim
+            // carrying the NEW body (41), so Call() == 42 — NOT the stale 2 that a
+            // missed redirect leaves (caller re-inlines the original lib's old body).
+            Type patchCaller = patch.GetType("InlineRefresh.InstCaller__LocusPatch", throwOnError: true)!;
+            Assert.Equal(42, patchCaller.GetMethod("Call")!.Invoke(null, null));
+        }
+        finally
+        {
+            context.Unload();
+        }
+    }
+
+    private const string InstPrivLibSource = @"
+namespace InlineRefresh
+{
+    public class InstPrivLib
+    {
+        private int _secret = 41;
+        public int Value() { return 1; }
+    }
+}";
+
+    [Fact]
+    public void Inline_instance_redirect_skips_private_body_without_caps_but_stays_hot()
+    {
+        var service = new CompileService();
+        string callerSource = InstRefreshCallerSource.Replace("InstLib", "InstPrivLib");
+        string asmPath = CompileProjectAssembly(
+            service,
+            "InstPrivInlineOriginal",
+            ("Assets/InstPrivLib.cs", InstPrivLibSource),
+            ("Assets/InstCaller.cs", callerSource));
+        JsonObject compileParams = ParamsFor(asmPath);
+
+        // The new body reaches the original type's PRIVATE field. Without
+        // measured caps the static self-shim cannot legally do so, so the
+        // redirect is SKIPPED — but the method is still hot via its normal
+        // detour, so the patch must stay HOT (never cold: that would regress).
+        string newLib = InstPrivLibSource.Replace(
+            "public int Value() { return 1; }",
+            "public int Value() { return _secret; }");
+        JsonNode result = HotPatchWithForceDetours(
+            service,
+            compileParams,
+            new[]
+            {
+                ("Assets/InstPrivLib.cs", InstPrivLibSource, newLib),
+                ("Assets/InstCaller.cs", callerSource, callerSource),
+            },
+            ("Assets/InstCaller.cs", new[] { "InlineRefresh.InstCaller|Call|0|s" }));
+
+        Assert.True(result["hot"]!.GetValue<bool>(), result["files"]?.ToJsonString());
+        Assert.True(result["success"]!.GetValue<bool>(), result["error"]?.GetValue<string>());
+
+        byte[] originalBytes = File.ReadAllBytes(asmPath);
+        byte[] patchBytes = Convert.FromBase64String(result["assemblyB64"]!.GetValue<string>());
+        var context = new AssemblyLoadContext("inst-priv-inline", isCollectible: true);
+        try
+        {
+            Assembly original = context.LoadFromStream(new MemoryStream(originalBytes));
+            context.Resolving += (_, name) => name.Name == "InstPrivInlineOriginal" ? original : null;
+            Assembly patch = context.LoadFromStream(new MemoryStream(patchBytes));
+
+            // No redirect was emitted: the caller still binds to the ORIGINAL
+            // Value (1), so Call() == 1 + 1. The edit converges at recompile.
+            Type patchCaller = patch.GetType("InlineRefresh.InstCaller__LocusPatch", throwOnError: true)!;
+            Assert.Equal(2, patchCaller.GetMethod("Call")!.Invoke(null, null));
+        }
+        finally
+        {
+            context.Unload();
+        }
+    }
+
+    private const string InstSelfSource = @"
+namespace InlineRefresh
+{
+    public class InstSelf
+    {
+        public int Value() { return 1; }
+        public int Read() { return Value() + 1; }
+    }
+}";
+
+    [Fact]
+    public void Inline_instance_redirect_rewrites_implicit_this_call_hot()
+    {
+        var service = new CompileService();
+        string asmPath = CompileProjectAssembly(
+            service, "InstSelfInlineOriginal", ("Assets/InstSelf.cs", InstSelfSource));
+        JsonObject compileParams = ParamsFor(asmPath);
+
+        string newSource = InstSelfSource.Replace(
+            "public int Value() { return 1; }",
+            "public int Value() { return 41; }");
+        JsonNode result = HotPatchWithForceDetours(
+            service,
+            compileParams,
+            ("Assets/InstSelf.cs", InstSelfSource, newSource),
+            "InlineRefresh.InstSelf|Read|0|i");
+
+        // The bare this-call `Value()` inside the force-detoured INSTANCE method
+        // Read rewrites to the self-shim with `((InstSelf)(object)this)` — the
+        // patch must compile hot (the cast's runtime layout identity is honored
+        // on Mono; this asserts the rewrite is well-formed C#).
+        Assert.True(result["hot"]!.GetValue<bool>(), result["files"]?.ToJsonString());
+        Assert.True(result["success"]!.GetValue<bool>(), result["error"]?.GetValue<string>());
+    }
+
     // Public state only: without measured runtime caps, added members may
     // not touch non-public surface (cold otherwise — see
     // Added_member_touching_private_state_is_cold; green C0 caps relax the
@@ -279,6 +682,66 @@ namespace ShimE2E
             object original = Activator.CreateInstance(calcAssembly.GetType("ShimE2E.Calc")!)!;
             object? boosted = shims.GetMethod("Boost")!.Invoke(null, new[] { original, (object)1 });
             Assert.Equal(10 + 5 + 1, boosted);
+        }
+        finally
+        {
+            context.Unload();
+        }
+    }
+
+    [Fact]
+    public void Added_member_with_anonymous_object_member_name_compiles_hot()
+    {
+        // Regression (R05 root cause): the added-member requalification pass
+        // rewrote the anonymous-object member NAME `Tag`/`Bump` (a NameEquals.Name,
+        // syntactically required to be an IdentifierName) into `self.Tag` — an
+        // invalid tree Roslyn's rewriter rejects with an InvalidCastException,
+        // aborting the whole inline caller-refresh compile. The member NAME must be
+        // left untouched; only the value expressions (`Seed`, `Bias`) are
+        // requalified to `self.Seed` / the static type.
+        var service = new CompileService();
+        string calcPath = CompileOriginal(service, "AnonE2ECalc", ShimCalcSource);
+        string callerPath = CompileOriginal(service, "AnonE2ECaller", ShimCallerSource);
+        JsonObject compileParams = ParamsFor(calcPath, callerPath);
+
+        string newCalc = ShimCalcSource.Replace(
+            "public int Value() { return Seed; }",
+            "public int Value() { return Seed; }\n" +
+            "        public int Boost(int extra) { var t = new { Tag = Seed, Bump = Bias }; return t.Tag + t.Bump + extra; }");
+        string newCaller = ShimCallerSource.Replace(
+            "public static int Run() { return 1; }",
+            "public static int Run() { var c = new Calc(); return c.Boost(7); }");
+
+        JsonNode result = HotPatch(
+            service, compileParams,
+            ("Calc.cs", ShimCalcSource, newCalc),
+            ("Caller.cs", ShimCallerSource, newCaller));
+
+        Assert.True(result["success"]!.GetValue<bool>(), result["error"]?.GetValue<string>());
+        Assert.True(result["hot"]!.GetValue<bool>(), result["files"]?.ToJsonString());
+
+        // Execute through the shim: the anon member names survived and the value
+        // expressions were correctly requalified (self.Seed + the static Bias).
+        byte[] calcBytes = File.ReadAllBytes(calcPath);
+        byte[] callerBytes = File.ReadAllBytes(callerPath);
+        byte[] patchBytes = Convert.FromBase64String(result["assemblyB64"]!.GetValue<string>());
+
+        var context = new AssemblyLoadContext("anon-e2e", isCollectible: true);
+        try
+        {
+            Assembly calcAssembly = context.LoadFromStream(new MemoryStream(calcBytes));
+            Assembly callerAssembly = context.LoadFromStream(new MemoryStream(callerBytes));
+            context.Resolving += (_, name) => name.Name switch
+            {
+                "AnonE2ECalc" => calcAssembly,
+                "AnonE2ECaller" => callerAssembly,
+                _ => null,
+            };
+            Assembly patch = context.LoadFromStream(new MemoryStream(patchBytes));
+
+            Type patchCaller = patch.GetType("ShimE2E.Caller__LocusPatch", throwOnError: true)!;
+            object? value = patchCaller.GetMethod("Run")!.Invoke(null, null);
+            Assert.Equal(10 + 5 + 7, value); // self.Seed(10) + Calc.Bias(5) + extra(7)
         }
         finally
         {
@@ -1706,6 +2169,155 @@ namespace StubE2E
         {
             context.Unload();
         }
+    }
+
+    [Fact]
+    public void Added_playerloop_message_emits_pump_and_drives_via_shim()
+    {
+        var service = new CompileService();
+        const string playerSource = @"
+namespace PumpE2E
+{
+    public class Player
+    {
+        public int Ticks;
+    }
+}";
+        string asmPath = CompileProjectAssembly(service, "PumpE2EPlayer", ("Assets/Player.cs", playerSource));
+        JsonObject compileParams = ParamsFor(asmPath);
+
+        string withUpdate = playerSource.Replace(
+            "public int Ticks;",
+            "public int Ticks;\n        public void Update() { Ticks += 1; }");
+        JsonNode result = HotPatch(service, compileParams, ("Assets/Player.cs", playerSource, withUpdate));
+
+        Assert.True(result["hot"]!.GetValue<bool>(), result["files"]?.ToJsonString());
+        Assert.True(result["success"]!.GetValue<bool>(), result["error"]?.GetValue<string>());
+
+        // The driver registration carries the coordinates the runtime drives each
+        // frame: the original type (to enumerate live instances) and the static
+        // shim that holds the new body.
+        var pump = Assert.Single(result["messageDrivers"]!.AsArray())!;
+        Assert.Equal("player_loop", pump["kind"]!.GetValue<string>());
+        Assert.Equal("PumpE2E.Player", pump["declaringType"]!.GetValue<string>());
+        Assert.Equal("PumpE2E.Player__LocusShims", pump["shimType"]!.GetValue<string>());
+        Assert.Equal("Update", pump["shimMethod"]!.GetValue<string>());
+        Assert.Equal("Update", pump["message"]!.GetValue<string>());
+        Assert.Equal("", pump["paramType"]!.GetValue<string>());
+
+        // Adding a message detours nothing — the engine never called it, so
+        // there is no original method to redirect, only the new shim.
+        Assert.Empty(result["methods"]!.AsArray());
+
+        // The shim genuinely runs the new body against an instance the pump
+        // would hand it (the leading `self` parameter is the original type).
+        byte[] originalBytes = File.ReadAllBytes(asmPath);
+        byte[] patchBytes = Convert.FromBase64String(result["assemblyB64"]!.GetValue<string>());
+        var context = new AssemblyLoadContext("pump-e2e", isCollectible: true);
+        try
+        {
+            Assembly original = context.LoadFromStream(new MemoryStream(originalBytes));
+            context.Resolving += (_, name) => name.Name == "PumpE2EPlayer" ? original : null;
+            Assembly patch = context.LoadFromStream(new MemoryStream(patchBytes));
+
+            Type player = original.GetType("PumpE2E.Player", throwOnError: true)!;
+            object instance = Activator.CreateInstance(player)!;
+
+            Type shimType = patch.GetType("PumpE2E.Player__LocusShims", throwOnError: true)!;
+            MethodInfo shim = shimType.GetMethod("Update", BindingFlags.Public | BindingFlags.Static)!;
+            shim.Invoke(null, new[] { instance });
+            shim.Invoke(null, new[] { instance });
+
+            Assert.Equal(2, player.GetField("Ticks")!.GetValue(instance));
+        }
+        finally
+        {
+            context.Unload();
+        }
+    }
+
+    [Fact]
+    public void Added_proxy_message_emits_driver_and_two_arg_shim_forwards()
+    {
+        var service = new CompileService();
+        // OnAnimatorIK(int) exercises the two-argument proxy shim with a REAL,
+        // unambiguous engine parameter type (int) and no UnityEngine reference.
+        // (The sidecar classifies by syntactic name and does not verify
+        // MonoBehaviour-derivation or that a same-named custom type is the real
+        // UnityEngine type — the Unity runtime is the authority and validates both
+        // before forwarding. See Proxy_param_matched_by_simple_name... below.)
+        const string source = @"
+namespace ProxyE2E
+{
+    public class Mob
+    {
+        public int LastLayer;
+    }
+}";
+        string asmPath = CompileProjectAssembly(service, "ProxyE2EMob", ("Assets/Mob.cs", source));
+        JsonObject compileParams = ParamsFor(asmPath);
+
+        string withIk = source.Replace(
+            "public int LastLayer;",
+            "public int LastLayer;\n        public void OnAnimatorIK(int layer) { LastLayer = layer; }");
+        JsonNode result = HotPatch(service, compileParams, ("Assets/Mob.cs", source, withIk));
+
+        Assert.True(result["hot"]!.GetValue<bool>(), result["files"]?.ToJsonString());
+        Assert.True(result["success"]!.GetValue<bool>(), result["error"]?.GetValue<string>());
+
+        var driver = Assert.Single(result["messageDrivers"]!.AsArray())!;
+        Assert.Equal("component_proxy", driver["kind"]!.GetValue<string>());
+        Assert.Equal("ProxyE2E.Mob", driver["declaringType"]!.GetValue<string>());
+        Assert.Equal("ProxyE2E.Mob__LocusShims", driver["shimType"]!.GetValue<string>());
+        Assert.Equal("OnAnimatorIK", driver["shimMethod"]!.GetValue<string>());
+        Assert.Equal("OnAnimatorIK", driver["message"]!.GetValue<string>());
+        Assert.Equal("Int32", driver["paramType"]!.GetValue<string>());
+
+        // The shim is `static void OnAnimatorIK(Mob self, int layer)` — the proxy
+        // forwards (instance, engine arg) to it.
+        byte[] originalBytes = File.ReadAllBytes(asmPath);
+        byte[] patchBytes = Convert.FromBase64String(result["assemblyB64"]!.GetValue<string>());
+        var context = new AssemblyLoadContext("proxy-e2e", isCollectible: true);
+        try
+        {
+            Assembly original = context.LoadFromStream(new MemoryStream(originalBytes));
+            context.Resolving += (_, name) => name.Name == "ProxyE2EMob" ? original : null;
+            Assembly patch = context.LoadFromStream(new MemoryStream(patchBytes));
+
+            Type mob = original.GetType("ProxyE2E.Mob", throwOnError: true)!;
+            object instance = Activator.CreateInstance(mob)!;
+
+            Type shimType = patch.GetType("ProxyE2E.Mob__LocusShims", throwOnError: true)!;
+            MethodInfo shim = shimType.GetMethod("OnAnimatorIK", BindingFlags.Public | BindingFlags.Static)!;
+            Assert.Equal(2, shim.GetParameters().Length);
+            shim.Invoke(null, new object[] { instance, 3 });
+
+            Assert.Equal(3, mob.GetField("LastLayer")!.GetValue(instance));
+        }
+        finally
+        {
+            context.Unload();
+        }
+    }
+
+    [Fact]
+    public void Proxy_param_matched_by_simple_name_sidecar_lenient_runtime_validates()
+    {
+        // The sidecar has no semantic model, so it classifies OnTriggerEnter(Collider)
+        // as a component_proxy by the SIMPLE NAME alone — even when `Collider` is a
+        // custom/aliased type, not UnityEngine.Collider. This is intentional: the
+        // Unity runtime (LocusBridge.WireComponentProxy) is the authority and rejects
+        // a same-named non-engine type, leaving it a plain method. This test pins the
+        // documented split so the leniency is deliberate, not an accident.
+        const string baseline = "namespace G { public class Collider { } public class P { } }";
+        const string added = "namespace G { public class Collider { } public class P { void OnTriggerEnter(Collider other) { } } }";
+        var result = HotDiff.Analyze(baseline, added,
+            new CSharpParseOptions(LanguageVersion.CSharp9));
+
+        Assert.True(result.Hot, string.Join("; ", result.Reasons));
+        var m = Assert.Single(result.ChangedMethods);
+        Assert.Equal("component_proxy", m.MessageDriverKind);
+        Assert.Equal(new[] { "Collider" }, m.ParamTypeNames);
     }
 
     [Fact]
@@ -3716,5 +4328,1060 @@ public static partial class Player__LocusShims
         Assert.Equal(2, result.ShimRegistrations.Count);
         Assert.Contains(result.ShimRegistrations, r => r.Entry.ShimMethod == "add_Pump");
         Assert.Contains(result.ShimRegistrations, r => r.Entry.ShimMethod == "remove_Pump");
+    }
+}
+
+/// <summary>Phenomenon 3 fix: a type authored entirely in Play Mode (empty
+/// coordinator baseline) re-edited without a recompile. Body edits redirect
+/// onto the first loaded assembly (existing instances update); structural or
+/// revert-to-original re-edits steer cold instead of a false-positive
+/// load_only that would leave live instances on a stale redirected body.</summary>
+public class PlayModeBornReeditTests
+{
+    private static string[] HostBclPaths() =>
+        ((string)AppContext.GetData("TRUSTED_PLATFORM_ASSEMBLIES")!)
+            .Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries)
+            .Where(File.Exists)
+            .ToArray();
+
+    private static JsonObject ParamsFor() => new JsonObject
+    {
+        ["fingerprint"] = "born-test-" + Guid.NewGuid().ToString("N"),
+        ["domainGeneration"] = Guid.NewGuid().ToString("N"),
+        ["langVersion"] = "9",
+        ["referencePaths"] = new JsonArray(HostBclPaths().Select(p => (JsonNode)p).ToArray()),
+        ["defines"] = new JsonArray(),
+    };
+
+    // ── source fixtures ──────────────────────────────────────────────────
+
+    private const string BornV1 =
+@"namespace Born
+{
+    public sealed class Widget
+    {
+        public int Tick;
+        public int Value() { return Tick + 1; }
+    }
+}";
+
+    // Body-only change to BornV1 (Value's return).
+    private const string BornV2 =
+@"namespace Born
+{
+    public sealed class Widget
+    {
+        public int Tick;
+        public int Value() { return Tick + 2; }
+    }
+}";
+
+    // Non-additive structural change to BornV1: a type-declaration (header)
+    // change — here the type's accessibility (public → internal). Not an
+    // addition; no shim/store can express it, so it stays cold.
+    private const string BornV1WithBase =
+@"namespace Born
+{
+    internal sealed class Widget
+    {
+        public int Tick;
+        public int Value() { return Tick + 1; }
+    }
+}";
+
+    /// <summary>One hotPatch of a play-mode-born file: empty coordinator
+    /// baseline, image+registry committed inline (registerImage) and session
+    /// images referenced so a re-edit can resolve the first assembly's type.
+    /// <paramref name="runtimePath"/> threads the field-store runtime DLL (M4)
+    /// for re-edits that add fields; null for the body/method/message cases.</summary>
+    private static JsonNode HotPatchBorn(
+        CompileService service, JsonObject @params, string newText, string? runtimePath = null)
+    {
+        var request = new JsonObject
+        {
+            ["files"] = new JsonArray(new JsonObject
+            {
+                ["path"] = "Widget.cs",
+                ["oldText"] = "",
+                ["newText"] = newText,
+            }),
+            ["params"] = @params.DeepClone(),
+            ["registerImage"] = true,
+            ["referenceSessionImages"] = true,
+        };
+        if (runtimePath != null)
+            request["extraReferencePaths"] = new JsonArray(runtimePath);
+        return service.HandleCompileHotPatch(request);
+    }
+
+    /// <summary>Compile the REAL field-store runtime source into a referenceable
+    /// DLL (parity with the shipped Locus.HotReload.Runtime.dll), for the added-
+    /// field (M4) re-edit case whose store body names global::Locus.HotReload.*.</summary>
+    private static string CompileFieldStoreRuntime(CompileService service, string outDir)
+    {
+        string? dir = AppContext.BaseDirectory;
+        string? sourcePath = null;
+        for (int i = 0; i < 8 && dir != null; i++)
+        {
+            string candidate = Path.Combine(dir, "locus_hotreload_runtime", "LocusFieldStore.cs");
+            if (File.Exists(candidate))
+            {
+                sourcePath = candidate;
+                break;
+            }
+            dir = Path.GetDirectoryName(dir);
+        }
+        Assert.NotNull(sourcePath);
+
+        var request = new JsonObject
+        {
+            ["assemblyName"] = "Locus.HotReload.Runtime",
+            ["sources"] = new JsonArray(new JsonObject
+            {
+                ["path"] = "LocusFieldStore.cs",
+                ["text"] = File.ReadAllText(sourcePath!),
+            }),
+            ["useHostBcl"] = true,
+        };
+        JsonNode result = service.HandleCompileRaw(request);
+        Assert.True(result["success"]!.GetValue<bool>(), result["error"]?.GetValue<string>());
+        Directory.CreateDirectory(outDir);
+        string path = Path.Combine(outDir, "Locus.HotReload.Runtime.dll");
+        File.WriteAllBytes(path, Convert.FromBase64String(result["assemblyB64"]!.GetValue<string>()));
+        return path;
+    }
+
+    [Fact]
+    public void PlayModeBornType_first_load_is_load_only_then_body_reedit_redirects_onto_first_assembly()
+    {
+        var service = new CompileService();
+        JsonObject p = ParamsFor();
+        p["domainGeneration"] = "born-body-gen";
+
+        // First load: brand-new type, load_only (no detours), registered.
+        JsonNode v1 = HotPatchBorn(service, p, BornV1);
+        Assert.True(v1["success"]!.GetValue<bool>(), v1["error"]?.GetValue<string>());
+        Assert.Empty(v1["methods"]!.AsArray());
+        var born = Assert.Single(v1["newTypes"]!.AsArray())!;
+        Assert.Equal("Born.Widget", born["metadataName"]!.GetValue<string>());
+        string asm1 = v1["assemblyName"]!.GetValue<string>();
+
+        // Body re-edit: redirected onto the FIRST assembly's type (so existing
+        // instances update), NOT re-loaded as a fresh new type.
+        JsonNode v2 = HotPatchBorn(service, p, BornV2);
+        Assert.True(v2["success"]!.GetValue<bool>(), v2["error"]?.GetValue<string>());
+        Assert.Empty(v2["newTypes"]!.AsArray());
+        var detour = Assert.Single(v2["methods"]!.AsArray())!;
+        Assert.Equal("Born.Widget", detour["declaringType"]!.GetValue<string>());
+        Assert.Equal("Value", detour["name"]!.GetValue<string>());
+        Assert.False(detour["isStatic"]!.GetValue<bool>());
+        Assert.Contains("__LocusPatch", detour["patchDeclaringType"]!.GetValue<string>());
+        // The detour ORIGINAL side is pinned to the first assembly — this is the
+        // whole fix: Unity resolves the first (live) type, not a default scan.
+        Assert.Equal(asm1, detour["originalAssembly"]!.GetValue<string>());
+    }
+
+    [Fact]
+    public void PlayModeBornType_revert_to_original_goes_cold_not_false_positive_load_only()
+    {
+        var service = new CompileService();
+        JsonObject p = ParamsFor();
+        p["domainGeneration"] = "born-revert-gen";
+
+        HotPatchBorn(service, p, BornV1);          // load
+        HotPatchBorn(service, p, BornV2);          // body redirect (installs a detour)
+
+        // Reverting to the original text leaves no changed methods, so the
+        // redirect cannot replace the prior detour. Load_only would report a
+        // false-positive "applied" while live instances keep the redirected
+        // body; the fix returns COLD so a recompile converges instead.
+        JsonNode v3 = HotPatchBorn(service, p, BornV1);
+        Assert.False(v3["hot"]!.GetValue<bool>());
+    }
+
+    [Fact]
+    public void PlayModeBornType_base_type_change_reedit_goes_cold()
+    {
+        var service = new CompileService();
+        JsonObject p = ParamsFor();
+        p["domainGeneration"] = "born-struct-gen";
+
+        HotPatchBorn(service, p, BornV1);          // load
+
+        // A base-list / type-declaration change is NOT an addition (it re-shapes
+        // the type itself, which no shim or store can express) and stays COLD —
+        // the fail-closed boundary Tier-2 keeps. (Tier-2 made added fields HOT;
+        // see PlayModeBornType_added_field_is_hot_store_binds_first_assembly.)
+        JsonNode v2 = HotPatchBorn(service, p, BornV1WithBase);
+        Assert.False(v2["hot"]!.GetValue<bool>());
+    }
+
+    [Fact]
+    public void PlayModeBornType_unchanged_resend_is_hot_noop_not_cold()
+    {
+        var service = new CompileService();
+        JsonObject p = ParamsFor();
+        p["domainGeneration"] = "born-noop-gen";
+
+        HotPatchBorn(service, p, BornV1);          // load
+
+        // The live coordinator re-ships every dirty file (against its empty
+        // baseline) each convergence batch, so a load_only'd file recurs
+        // UNCHANGED. A never-redirected file must stay a clean no-op — not cold,
+        // which would drag the whole batch cold (this is what the self-test
+        // replay exercises across ~30 batches).
+        JsonNode again = HotPatchBorn(service, p, BornV1);
+        Assert.True(again["hot"]!.GetValue<bool>(), again["files"]?.ToJsonString());
+    }
+
+    [Fact]
+    public void NewTypeRegistry_records_once_skips_empty_origin_and_clears_on_generation_change()
+    {
+        var reg = new NewTypeRegistry();
+        Assert.Empty(reg.SnapshotFor("g1"));
+        Assert.Empty(reg.SnapshotFor(null));
+
+        reg.Commit("g1", new[]
+        {
+            new KeyValuePair<string, NewTypeRegistry.FileEntry>(
+                "a.cs", new NewTypeRegistry.FileEntry { OriginalText = "x", OriginalAssembly = "A1" }),
+            // An unresolved origin is never pinned (would fail the next resolution).
+            new KeyValuePair<string, NewTypeRegistry.FileEntry>(
+                "b.cs", new NewTypeRegistry.FileEntry { OriginalText = "y", OriginalAssembly = "" }),
+        });
+
+        var snap = reg.SnapshotFor("g1");
+        Assert.True(snap.ContainsKey("a.cs"));
+        Assert.Equal("A1", snap["a.cs"].OriginalAssembly);
+        Assert.False(snap.ContainsKey("b.cs"));
+        Assert.Empty(reg.SnapshotFor("g2"));   // wrong generation
+        Assert.Empty(reg.SnapshotFor(null));
+
+        // A new generation discards older entries (the domain reload that bumped
+        // it unloaded those assemblies).
+        reg.Commit("g2", new[]
+        {
+            new KeyValuePair<string, NewTypeRegistry.FileEntry>(
+                "c.cs", new NewTypeRegistry.FileEntry { OriginalText = "z", OriginalAssembly = "C1" }),
+        });
+        Assert.False(reg.SnapshotFor("g2").ContainsKey("a.cs"));
+        Assert.True(reg.SnapshotFor("g2").ContainsKey("c.cs"));
+        Assert.Empty(reg.SnapshotFor("g1"));
+    }
+
+    [Fact]
+    public void NewTypeRegistry_last_write_updates_redirected_flag_keeping_first_assembly()
+    {
+        var reg = new NewTypeRegistry();
+        reg.Commit("g", new[]
+        {
+            new KeyValuePair<string, NewTypeRegistry.FileEntry>(
+                "a.cs", new NewTypeRegistry.FileEntry { OriginalText = "x", OriginalAssembly = "A1" }),
+        });
+        Assert.False(reg.SnapshotFor("g")["a.cs"].Redirected);
+
+        // A body redirect re-commits the entry with Redirected=true, preserving
+        // the FIRST assembly (the detour origin), so a later revert is steered
+        // cold instead of a stranding no-op.
+        reg.Commit("g", new[]
+        {
+            new KeyValuePair<string, NewTypeRegistry.FileEntry>(
+                "a.cs", new NewTypeRegistry.FileEntry
+                {
+                    OriginalText = "x",
+                    OriginalAssembly = "A1",
+                    Redirected = true,
+                }),
+        });
+        var entry = reg.SnapshotFor("g")["a.cs"];
+        Assert.True(entry.Redirected);
+        Assert.Equal("A1", entry.OriginalAssembly);
+    }
+
+    // ── Tier-2: additions to a play-mode-born type are hot ────────────────
+
+    // BornV1 is `sealed`; a sealed class still admits non-virtual added
+    // methods/fields and an added (non-virtual) Unity message. A non-sealed
+    // base for the cases that read clearer without `sealed`.
+    private const string BornBase =
+@"namespace Born
+{
+    public class Gadget
+    {
+        public int Tick;
+        public int Value() { return Tick + 1; }
+    }
+}";
+
+    [Fact]
+    public void PlayModeBornType_added_unity_message_is_hot_with_messageDriver_pinned_to_first_assembly()
+    {
+        var service = new CompileService();
+        JsonObject p = ParamsFor();
+        p["domainGeneration"] = "born-add-msg-gen";
+
+        // First load: brand-new play-mode-born type, load_only, registered.
+        JsonNode v1 = HotPatchBorn(service, p, BornBase);
+        Assert.True(v1["success"]!.GetValue<bool>(), v1["error"]?.GetValue<string>());
+        string asm1 = v1["assemblyName"]!.GetValue<string>();
+        byte[] firstBytes = Convert.FromBase64String(v1["assemblyB64"]!.GetValue<string>());
+
+        // Re-edit ADDS a Unity message (Update). Tier-1 would steer this cold
+        // (an addition is structural); Tier-2 keeps it HOT and materializes a
+        // player_loop driver pinned to the FIRST assembly.
+        string withUpdate = BornBase.Replace(
+            "public int Value() { return Tick + 1; }",
+            "public int Value() { return Tick + 1; }\n        public void Update() { Tick += 5; }");
+        JsonNode v2 = HotPatchBorn(service, p, withUpdate);
+
+        Assert.True(v2["hot"]!.GetValue<bool>(), v2["files"]?.ToJsonString());
+        Assert.True(v2["success"]!.GetValue<bool>(), v2["error"]?.GetValue<string>());
+        // An added message detours nothing (the engine never called it) and
+        // declares no new type — only the driver + shim.
+        Assert.Empty(v2["methods"]!.AsArray());
+        Assert.Empty(v2["newTypes"]!.AsArray());
+
+        var driver = Assert.Single(v2["messageDrivers"]!.AsArray())!;
+        Assert.Equal("player_loop", driver["kind"]!.GetValue<string>());
+        Assert.Equal("Born.Gadget", driver["declaringType"]!.GetValue<string>());
+        Assert.Equal("Update", driver["message"]!.GetValue<string>());
+        Assert.Equal("Born.Gadget__LocusShims", driver["shimType"]!.GetValue<string>());
+        Assert.Equal("Update", driver["shimMethod"]!.GetValue<string>());
+        Assert.Equal("", driver["paramType"]!.GetValue<string>());
+        // THE Tier-2 hinge: the driver is pinned to the first assembly so the
+        // runtime resolves the play-mode-born type THERE (its default resolver
+        // skips __LocusHotPatch_ assemblies) to enumerate the live instances.
+        Assert.Equal(asm1, driver["originalAssembly"]!.GetValue<string>());
+
+        // The shim genuinely runs the new body against an instance of the FIRST
+        // assembly's type — the same instance the pump would hand it. This also
+        // proves `global::Born.Gadget` bound to the first (session-image) type.
+        byte[] patchBytes = Convert.FromBase64String(v2["assemblyB64"]!.GetValue<string>());
+        var context = new AssemblyLoadContext("born-add-msg", isCollectible: true);
+        try
+        {
+            Assembly first = context.LoadFromStream(new MemoryStream(firstBytes));
+            context.Resolving += (_, name) => name.Name == asm1 ? first : null;
+            Assembly patch = context.LoadFromStream(new MemoryStream(patchBytes));
+
+            Type gadget = first.GetType("Born.Gadget", throwOnError: true)!;
+            object instance = Activator.CreateInstance(gadget)!;
+
+            Type shimType = patch.GetType("Born.Gadget__LocusShims", throwOnError: true)!;
+            MethodInfo shim = shimType.GetMethod("Update", BindingFlags.Public | BindingFlags.Static)!;
+            // Leading parameter is the original (first-assembly) type.
+            Assert.Same(gadget, shim.GetParameters()[0].ParameterType);
+            shim.Invoke(null, new[] { instance });
+            shim.Invoke(null, new[] { instance });
+
+            Assert.Equal(10, gadget.GetField("Tick")!.GetValue(instance)); // 2 × (Tick += 5)
+        }
+        finally
+        {
+            context.Unload();
+        }
+    }
+
+    [Fact]
+    public void PlayModeBornType_added_plain_method_is_hot_shim_binds_first_assembly()
+    {
+        var service = new CompileService();
+        JsonObject p = ParamsFor();
+        p["domainGeneration"] = "born-add-method-gen";
+
+        JsonNode v1 = HotPatchBorn(service, p, BornBase);
+        Assert.True(v1["success"]!.GetValue<bool>(), v1["error"]?.GetValue<string>());
+        string asm1 = v1["assemblyName"]!.GetValue<string>();
+        byte[] firstBytes = Convert.FromBase64String(v1["assemblyB64"]!.GetValue<string>());
+
+        // Add a plain (non-message) instance method. It is compiled into the
+        // shim class as `static int Doubled(global::Born.Gadget self)`; the
+        // method materializes no detour and no message driver. A successful HOT
+        // compile is itself the proof that the shim's `global::Born.Gadget`
+        // bound to the FIRST (session-image) assembly's type — otherwise the
+        // self-cast would not compile.
+        string withMethod = BornBase.Replace(
+            "public int Value() { return Tick + 1; }",
+            "public int Value() { return Tick + 1; }\n        public int Doubled() { return Tick * 2; }");
+        JsonNode v2 = HotPatchBorn(service, p, withMethod);
+
+        Assert.True(v2["hot"]!.GetValue<bool>(), v2["files"]?.ToJsonString());
+        Assert.True(v2["success"]!.GetValue<bool>(), v2["error"]?.GetValue<string>());
+        Assert.Empty(v2["methods"]!.AsArray());
+        Assert.Empty(v2["newTypes"]!.AsArray());
+        Assert.Null(v2["messageDrivers"]);
+
+        // Load and run the shim against a first-assembly instance to prove the
+        // store-free added member executes against the original type.
+        byte[] patchBytes = Convert.FromBase64String(v2["assemblyB64"]!.GetValue<string>());
+        var context = new AssemblyLoadContext("born-add-method", isCollectible: true);
+        try
+        {
+            Assembly first = context.LoadFromStream(new MemoryStream(firstBytes));
+            context.Resolving += (_, name) => name.Name == asm1 ? first : null;
+            Assembly patch = context.LoadFromStream(new MemoryStream(patchBytes));
+
+            Type gadget = first.GetType("Born.Gadget", throwOnError: true)!;
+            object instance = Activator.CreateInstance(gadget)!;
+            gadget.GetField("Tick")!.SetValue(instance, 21);
+
+            Type shimType = patch.GetType("Born.Gadget__LocusShims", throwOnError: true)!;
+            MethodInfo shim = shimType.GetMethod("Doubled", BindingFlags.Public | BindingFlags.Static)!;
+            Assert.Same(gadget, shim.GetParameters()[0].ParameterType);
+            Assert.Equal(42, shim.Invoke(null, new[] { instance }));
+        }
+        finally
+        {
+            context.Unload();
+        }
+    }
+
+    [Fact]
+    public void PlayModeBornType_added_field_is_hot_store_binds_first_assembly()
+    {
+        var service = new CompileService();
+        string outDir = Path.Combine(Path.GetTempPath(), "locus-born-field-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            string runtimePath = CompileFieldStoreRuntime(service, outDir);
+            JsonObject p = ParamsFor();
+            p["domainGeneration"] = "born-add-field-gen";
+
+            JsonNode v1 = HotPatchBorn(service, p, BornBase);
+            Assert.True(v1["success"]!.GetValue<bool>(), v1["error"]?.GetValue<string>());
+
+            // Add a plain instance field AND a method that reads it, so the M4
+            // field-store path is exercised (an added field with no reader would
+            // be dead). Existing instances read default(T) via the store; the
+            // store holder lives in the patch assembly and only NAMES the first-
+            // assembly type, so a successful HOT compile proves the binding.
+            string withField = BornBase.Replace(
+                "public int Tick;",
+                "public int Tick;\n        public int Extra;")
+                .Replace(
+                "public int Value() { return Tick + 1; }",
+                "public int Value() { return Tick + 1; }\n        public int ReadExtra() { return Extra; }");
+            JsonNode v2 = HotPatchBorn(service, p, withField, runtimePath);
+
+            Assert.True(v2["hot"]!.GetValue<bool>(), v2["files"]?.ToJsonString());
+            Assert.True(v2["success"]!.GetValue<bool>(), v2["error"]?.GetValue<string>());
+            Assert.Empty(v2["newTypes"]!.AsArray());
+        }
+        finally
+        {
+            try { Directory.Delete(outDir, recursive: true); } catch { /* best effort */ }
+        }
+    }
+
+    [Fact]
+    public void PlayModeBornType_removed_member_reedit_is_hot_tombstone()
+    {
+        var service = new CompileService();
+        JsonObject p = ParamsFor();
+        p["domainGeneration"] = "born-remove-gen";
+
+        HotPatchBorn(service, p, BornBase);   // load
+
+        // Removing Value() (feature #1): a play-mode-born type has NO compiled
+        // call sites, so the removal is safe — by construction no compiled caller
+        // can exist to break. The loaded body is already unreachable, so a
+        // non-magic removal carries no detour and the batch is a HOT no-op that
+        // records the deletion (later references then fail deterministically).
+        string removed =
+@"namespace Born
+{
+    public class Gadget
+    {
+        public int Tick;
+    }
+}";
+        JsonNode v2 = HotPatchBorn(service, p, removed);
+        Assert.True(v2["hot"]!.GetValue<bool>(), v2["files"]?.ToJsonString());
+        Assert.True(v2["success"]!.GetValue<bool>(), v2["error"]?.GetValue<string>());
+        Assert.True(v2["noop"]?.GetValue<bool>() ?? false, v2.ToJsonString());
+        Assert.Equal(1, v2["deletionsNoted"]!.GetValue<int>());
+    }
+
+    [Fact]
+    public void PlayModeBornType_signature_change_reedit_is_hot()
+    {
+        var service = new CompileService();
+        JsonObject p = ParamsFor();
+        p["domainGeneration"] = "born-sig-gen";
+
+        HotPatchBorn(service, p, BornBase);   // load
+
+        // Changing Value()'s parameters (feature #2) is a signature change: the
+        // old surface tombstones and the new Value(int) materializes as a shim. A
+        // play-mode-born type has no compiled call sites, so the M3 caller scan is
+        // vacuous (it would otherwise cold on "no project assemblies") — HOT.
+        string signatureChanged = BornBase.Replace(
+            "public int Value() { return Tick + 1; }",
+            "public int Value(int n) { return Tick + n; }");
+        JsonNode v2 = HotPatchBorn(service, p, signatureChanged);
+        Assert.True(v2["hot"]!.GetValue<bool>(), v2["files"]?.ToJsonString());
+        Assert.True(v2["success"]!.GetValue<bool>(), v2["error"]?.GetValue<string>());
+    }
+
+    // ── Feature #1 / [P1] fix: removing a post-birth-added member ─────────
+
+    [Fact]
+    public void PlayModeBornType_removed_added_unity_message_clears_the_driver()
+    {
+        var service = new CompileService();
+        JsonObject p = ParamsFor();
+        p["domainGeneration"] = "born-remove-msg-gen";
+
+        // Birth, then ADD Update() (Tier-2 → a player_loop driver, live on the pump).
+        JsonNode v1 = HotPatchBorn(service, p, BornBase);
+        string asm1 = v1["assemblyName"]!.GetValue<string>();
+        string withUpdate = BornBase.Replace(
+            "public int Value() { return Tick + 1; }",
+            "public int Value() { return Tick + 1; }\n        public void Update() { Tick += 5; }");
+        JsonNode v2 = HotPatchBorn(service, p, withUpdate);
+        Assert.Single(v2["messageDrivers"]!.AsArray());   // Update wired
+
+        // Now REMOVE Update(), reverting to the exact birth text. The birth-text
+        // diff is EMPTY — it never saw Update (added after birth) — so without the
+        // live-text diff the stale pump would keep driving instances while the
+        // desktop reports "nothing to apply" ([P1]). The fix: the live-text diff
+        // sees Update removed and emits a clear-marker, which (a) makes the plugin
+        // clear the stale driver (replace-by-source) and (b) keeps messageDrivers
+        // non-empty so this is NOT collapsed to a no-op that would drop the clear.
+        JsonNode v3 = HotPatchBorn(service, p, BornBase);
+
+        Assert.True(v3["hot"]!.GetValue<bool>(), v3["files"]?.ToJsonString());
+        Assert.True(v3["success"]!.GetValue<bool>(), v3["error"]?.GetValue<string>());
+        Assert.Null(v3["noop"]);   // the clear-marker prevents a no-op verdict
+        JsonArray drivers = v3["messageDrivers"]!.AsArray();
+        JsonNode clear = Assert.Single(drivers)!;
+        Assert.Equal("clear", clear["kind"]!.GetValue<string>());
+        Assert.Equal("Update", clear["message"]!.GetValue<string>());
+        Assert.Equal("Widget.cs", clear["sourcePath"]!.GetValue<string>());
+        // Pinned to the first assembly (the live type), like every born driver.
+        Assert.Equal(asm1, clear["originalAssembly"]!.GetValue<string>());
+        // The clear-marker is NOT a real driver: empty shim, skipped in wiring.
+        Assert.Equal("", clear["shimType"]!.GetValue<string>());
+    }
+
+    [Fact]
+    public void PlayModeBornType_removed_added_plain_member_tombstones_hot()
+    {
+        var service = new CompileService();
+        JsonObject p = ParamsFor();
+        p["domainGeneration"] = "born-remove-added-gen";
+
+        HotPatchBorn(service, p, BornBase);   // load
+        // Add a plain method, then remove it. The removal is invisible to the
+        // birth-text diff (the method never existed in OriginalText), so the
+        // live-text diff catches it and tombstones — a HOT no-op recording the
+        // deletion, NOT a false "nothing to apply".
+        string withMethod = BornBase.Replace(
+            "public int Value() { return Tick + 1; }",
+            "public int Value() { return Tick + 1; }\n        public int Doubled() { return Tick * 2; }");
+        HotPatchBorn(service, p, withMethod);
+
+        JsonNode v3 = HotPatchBorn(service, p, BornBase);   // back to birth text
+        Assert.True(v3["hot"]!.GetValue<bool>(), v3["files"]?.ToJsonString());
+        Assert.True(v3["noop"]?.GetValue<bool>() ?? false, v3.ToJsonString());
+        Assert.Equal(1, v3["deletionsNoted"]!.GetValue<int>());
+        Assert.Null(v3["messageDrivers"]);   // no driver to clear (plain member)
+
+        // The removal advanced LastAppliedText (committed on the no-op path), so a
+        // re-send of the birth text is a CLEAN unchanged-re-send no-op — NOT a
+        // re-tombstone of Doubled (which would drift the baseline forever).
+        JsonNode v4 = HotPatchBorn(service, p, BornBase);
+        Assert.True(v4["hot"]!.GetValue<bool>(), v4["files"]?.ToJsonString());
+        Assert.Null(v4["deletionsNoted"]);   // clean no-op, not a re-tombstone
+    }
+
+    [Fact]
+    public void PlayModeBornType_removed_added_field_is_hot_and_advances_baseline()
+    {
+        var service = new CompileService();
+        string outDir = Path.Combine(Path.GetTempPath(), "locus-born-rmfield-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            string runtimePath = CompileFieldStoreRuntime(service, outDir);
+            JsonObject p = ParamsFor();
+            p["domainGeneration"] = "born-remove-field-gen";
+
+            HotPatchBorn(service, p, BornBase);   // load
+
+            // Add a field + reader (M4 store), then remove BOTH back to birth. The
+            // removed FIELD surfaces only in live.FieldChanges (never RemovedMembers),
+            // so without the field-removal detection it would pass as a stale no-op
+            // and drift the baseline. It must route hot (the reader tombstones; the
+            // abandoned store is harmless) and advance LastAppliedText.
+            string withField = BornBase
+                .Replace("public int Tick;", "public int Tick;\n        public int Extra;")
+                .Replace("public int Value() { return Tick + 1; }",
+                         "public int Value() { return Tick + 1; }\n        public int ReadExtra() { return Extra; }");
+            HotPatchBorn(service, p, withField, runtimePath);
+
+            JsonNode v3 = HotPatchBorn(service, p, BornBase, runtimePath);   // remove field + reader
+            Assert.True(v3["hot"]!.GetValue<bool>(), v3["files"]?.ToJsonString());
+
+            // Baseline advanced → re-sending birth is a clean unchanged no-op.
+            JsonNode v4 = HotPatchBorn(service, p, BornBase, runtimePath);
+            Assert.True(v4["hot"]!.GetValue<bool>(), v4["files"]?.ToJsonString());
+            Assert.Null(v4["deletionsNoted"]);
+        }
+        finally
+        {
+            try { Directory.Delete(outDir, recursive: true); } catch { /* best effort */ }
+        }
+    }
+
+    // ── Feature #3: field retype (remove+add) on a play-mode-born type ────
+
+    [Fact]
+    public void PlayModeBornType_field_retype_reedit_is_hot_store_binds_first_assembly()
+    {
+        var service = new CompileService();
+        string outDir = Path.Combine(Path.GetTempPath(), "locus-born-retype-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            string runtimePath = CompileFieldStoreRuntime(service, outDir);
+            JsonObject p = ParamsFor();
+            p["domainGeneration"] = "born-retype-gen";
+
+            JsonNode v1 = HotPatchBorn(service, p, BornBase);   // load (int Tick)
+            string asm1 = v1["assemblyName"]!.GetValue<string>();
+
+            // Retype Tick int → long (a remove+add pair) and reprocess the reader
+            // so its Tick access routes to the new long store. Feature #2/#3
+            // previously steered this cold (the removed half tripped the gate); now
+            // it is HOT — the removed int placeholder preserves A1's layout, the
+            // added long lives in a side store that NAMES the first-assembly type,
+            // and a successful compile proves the binding.
+            string retyped = BornBase
+                .Replace("public int Tick;", "public long Tick;")
+                .Replace("public int Value() { return Tick + 1; }",
+                         "public int Value() { return (int)(Tick + 1); }");
+            JsonNode v2 = HotPatchBorn(service, p, retyped, runtimePath);
+
+            Assert.True(v2["hot"]!.GetValue<bool>(), v2["files"]?.ToJsonString());
+            Assert.True(v2["success"]!.GetValue<bool>(), v2["error"]?.GetValue<string>());
+            Assert.Empty(v2["newTypes"]!.AsArray());
+            // Value's body redirected onto the first assembly, pinned.
+            JsonNode detour = v2["methods"]!.AsArray().Single(m => m!["name"]!.GetValue<string>() == "Value")!;
+            Assert.Equal(asm1, detour["originalAssembly"]!.GetValue<string>());
+        }
+        finally
+        {
+            try { Directory.Delete(outDir, recursive: true); } catch { /* best effort */ }
+        }
+    }
+
+    // ── Feature #4: enum member added on a play-mode-born type ────────────
+
+    private const string BornEnum =
+@"namespace Born
+{
+    public enum Hue { Red, Green }
+
+    public class Painter
+    {
+        public int Pick() { return (int)Hue.Red; }
+    }
+}";
+
+    [Fact]
+    public void PlayModeBornType_enum_member_added_reedit_is_hot()
+    {
+        var service = new CompileService();
+        JsonObject p = ParamsFor();
+        p["domainGeneration"] = "born-enum-gen";
+
+        HotPatchBorn(service, p, BornEnum);   // load (Hue { Red, Green })
+
+        // Add a member to the born enum AND reference it from a redirected body.
+        // Previously cold (EnumAdditions tripped the gate); now HOT — the new
+        // member materializes as a cast literal in Pick's redirected body (the
+        // runtime only learns its NAME at the next recompile).
+        string withBlue = BornEnum
+            .Replace("public enum Hue { Red, Green }", "public enum Hue { Red, Green, Blue }")
+            .Replace("public int Pick() { return (int)Hue.Red; }",
+                     "public int Pick() { return (int)Hue.Blue; }");
+        JsonNode v2 = HotPatchBorn(service, p, withBlue);
+
+        Assert.True(v2["hot"]!.GetValue<bool>(), v2["files"]?.ToJsonString());
+        Assert.True(v2["success"]!.GetValue<bool>(), v2["error"]?.GetValue<string>());
+        var detour = Assert.Single(v2["methods"]!.AsArray())!;
+        Assert.Equal("Pick", detour["name"]!.GetValue<string>());
+    }
+
+    // ── Feature #5: a sibling type added to a play-mode-born file ─────────
+
+    private const string BornSiblingV1 =
+@"namespace Born
+{
+    public class Host
+    {
+        public int Seed;
+        public int Base() { return Seed + 1; }
+    }
+}";
+
+    // Adds a sibling type Helper alongside the born Host.
+    private const string BornSiblingV2 =
+@"namespace Born
+{
+    public class Host
+    {
+        public int Seed;
+        public int Base() { return Seed + 1; }
+    }
+
+    public class Helper
+    {
+        public int Boost() { return 100; }
+    }
+}";
+
+    // Body change to the sibling Helper.
+    private const string BornSiblingV3 =
+@"namespace Born
+{
+    public class Host
+    {
+        public int Seed;
+        public int Base() { return Seed + 1; }
+    }
+
+    public class Helper
+    {
+        public int Boost() { return 200; }
+    }
+}";
+
+    // A sibling type that CONTAINS a nested type (its metadata name nests with '+').
+    private const string BornNestedSiblingV2 =
+@"namespace Born
+{
+    public class Host
+    {
+        public int Seed;
+        public int Base() { return Seed + 1; }
+    }
+
+    public class Helper
+    {
+        public enum Mode { On, Off }
+        public int Boost() { return 100; }
+    }
+}";
+
+    private const string BornNestedSiblingV3 =
+@"namespace Born
+{
+    public class Host
+    {
+        public int Seed;
+        public int Base() { return Seed + 1; }
+    }
+
+    public class Helper
+    {
+        public enum Mode { On, Off }
+        public int Boost() { return 200; }
+    }
+}";
+
+    // A sibling whose nested type has its OWN method body (the re-edit target).
+    private const string BornNestedMethodSiblingV2 =
+@"namespace Born
+{
+    public class Host
+    {
+        public int Seed;
+        public int Base() { return Seed + 1; }
+    }
+
+    public class Helper
+    {
+        public class Inner
+        {
+            public int Calc() { return 1; }
+        }
+        public int Boost() { return 100; }
+    }
+}";
+
+    private const string BornNestedMethodSiblingV3 =
+@"namespace Born
+{
+    public class Host
+    {
+        public int Seed;
+        public int Base() { return Seed + 1; }
+    }
+
+    public class Helper
+    {
+        public class Inner
+        {
+            public int Calc() { return 2; }
+        }
+        public int Boost() { return 100; }
+    }
+}";
+
+    [Fact]
+    public void PlayModeBornType_sibling_nested_method_reedit_pins_to_sibling_assembly()
+    {
+        var service = new CompileService();
+        JsonObject p = ParamsFor();
+        p["domainGeneration"] = "born-sibling-nested-method-gen";
+
+        HotPatchBorn(service, p, BornSiblingV1);   // Host
+        JsonNode v2 = HotPatchBorn(service, p, BornNestedMethodSiblingV2);   // + Helper{Inner{Calc}}
+        Assert.True(v2["hot"]!.GetValue<bool>(), v2["files"]?.ToJsonString());
+        string asm2 = v2["assemblyName"]!.GetValue<string>();
+
+        // Re-edit the NESTED type's method body. Its detour must pin to the
+        // sibling's assembly A2 (where Born.Helper+Inner lives), NOT the file's
+        // first assembly — only the top-level Born.Helper is registered, so the
+        // nested type is matched by '+' prefix ([P2]). A mis-pin to A1 would make
+        // Unity fail to resolve the type.
+        JsonNode v3 = HotPatchBorn(service, p, BornNestedMethodSiblingV3);
+        Assert.True(v3["hot"]!.GetValue<bool>(), v3["files"]?.ToJsonString());
+        JsonNode detour = v3["methods"]!.AsArray().Single(m => m!["name"]!.GetValue<string>() == "Calc")!;
+        Assert.Equal("Born.Helper+Inner", detour["declaringType"]!.GetValue<string>());
+        Assert.Equal(asm2, detour["originalAssembly"]!.GetValue<string>());
+    }
+
+    [Fact]
+    public void PlayModeBornType_nested_type_added_to_first_batch_goes_cold()
+    {
+        var service = new CompileService();
+        JsonObject p = ParamsFor();
+        p["domainGeneration"] = "born-firstbatch-nested-gen";
+
+        HotPatchBorn(service, p, BornBase);   // Gadget (first-batch type, in A1)
+
+        // Add a NESTED type to the first-batch born type. You cannot add a nested
+        // type to an already-loaded type in place; routing it as a load_only
+        // NewType would never converge (cumulative.NewTypes never empties on resend,
+        // so every re-send re-patches). Cold ([P2]).
+        string withNested = BornBase.Replace(
+            "public int Tick;",
+            "public int Tick;\n        public class Inner { public int N() { return 7; } }");
+        JsonNode v2 = HotPatchBorn(service, p, withNested);
+        Assert.False(v2["hot"]!.GetValue<bool>(), v2["assemblyB64"]?.ToJsonString());
+    }
+
+    [Fact]
+    public void PlayModeBornType_sibling_with_nested_type_stays_hot_on_reedit()
+    {
+        var service = new CompileService();
+        JsonObject p = ParamsFor();
+        p["domainGeneration"] = "born-sibling-nested-gen";
+
+        HotPatchBorn(service, p, BornSiblingV1);   // Host
+
+        // Add a sibling Helper that CONTAINS a nested type (enum Mode). Only the
+        // top-level Born.Helper may be registered as a sibling — NOT the nested
+        // Born.Helper+Mode — else the next re-edit's top-level-only presence check
+        // mistakes Born.Helper+Mode for a removed sibling and steers cold ([P2]).
+        JsonNode v2 = HotPatchBorn(service, p, BornNestedSiblingV2);
+        Assert.True(v2["hot"]!.GetValue<bool>(), v2["files"]?.ToJsonString());
+        string asm2 = v2["assemblyName"]!.GetValue<string>();
+
+        // Re-edit the sibling's body: must stay HOT (redirect onto A2), not cold,
+        // and not re-load (which would strand the sibling's instances).
+        JsonNode v3 = HotPatchBorn(service, p, BornNestedSiblingV3);
+        Assert.True(v3["hot"]!.GetValue<bool>(), v3["files"]?.ToJsonString());
+        Assert.Empty(v3["newTypes"]!.AsArray());   // NOT re-loaded
+        JsonNode detour = Assert.Single(v3["methods"]!.AsArray())!;
+        Assert.Equal("Born.Helper", detour["declaringType"]!.GetValue<string>());
+        Assert.Equal("Boost", detour["name"]!.GetValue<string>());
+        Assert.Equal(asm2, detour["originalAssembly"]!.GetValue<string>());
+    }
+
+    [Fact]
+    public void PlayModeBornType_sibling_body_revert_goes_cold()
+    {
+        var service = new CompileService();
+        JsonObject p = ParamsFor();
+        p["domainGeneration"] = "born-sibling-revert-gen";
+
+        HotPatchBorn(service, p, BornSiblingV1);   // Host
+        HotPatchBorn(service, p, BornSiblingV2);   // + Helper{Boost 100}
+        HotPatchBorn(service, p, BornSiblingV3);   // Helper.Boost 100→200 (redirect onto A2)
+
+        // Revert the sibling's body to its birth version (200→100). The sibling's
+        // own diff (vs its FIXED birth text) shows no change, but the file live diff
+        // sees the revert — and a live detour cannot be un-redirected in place, so it
+        // steers COLD (recompile), exactly like a first-batch body revert. This is
+        // the one sibling case we deliberately cannot do hot.
+        JsonNode v4 = HotPatchBorn(service, p, BornSiblingV2);   // Boost back to 100
+        Assert.False(v4["hot"]!.GetValue<bool>(), v4["assemblyB64"]?.ToJsonString());
+    }
+
+    [Fact]
+    public void PlayModeBornType_added_sibling_type_is_hot_then_redirects_onto_its_own_assembly()
+    {
+        var service = new CompileService();
+        JsonObject p = ParamsFor();
+        p["domainGeneration"] = "born-sibling-gen";
+
+        // Birth: Host only, in the first assembly A1.
+        JsonNode v1 = HotPatchBorn(service, p, BornSiblingV1);
+        Assert.True(v1["success"]!.GetValue<bool>(), v1["error"]?.GetValue<string>());
+        Assert.Equal("Born.Host", Assert.Single(v1["newTypes"]!.AsArray())!["metadataName"]!.GetValue<string>());
+
+        // Add sibling Helper (feature #5): previously cold; now HOT — Helper is
+        // load_only'd into THIS batch's assembly A2 and registered as a sibling.
+        JsonNode v2 = HotPatchBorn(service, p, BornSiblingV2);
+        Assert.True(v2["hot"]!.GetValue<bool>(), v2["files"]?.ToJsonString());
+        Assert.True(v2["success"]!.GetValue<bool>(), v2["error"]?.GetValue<string>());
+        Assert.Equal("Born.Helper", Assert.Single(v2["newTypes"]!.AsArray())!["metadataName"]!.GetValue<string>());
+        string asm2 = v2["assemblyName"]!.GetValue<string>();
+
+        // Edit the sibling's body: it must REDIRECT onto A2 (its own assembly), so
+        // existing Helper instances update — NOT re-load as a fresh type (which
+        // would strand them). This is the per-type baseline + assembly at work.
+        JsonNode v3 = HotPatchBorn(service, p, BornSiblingV3);
+        Assert.True(v3["hot"]!.GetValue<bool>(), v3["files"]?.ToJsonString());
+        Assert.True(v3["success"]!.GetValue<bool>(), v3["error"]?.GetValue<string>());
+        Assert.Empty(v3["newTypes"]!.AsArray());   // NOT re-loaded
+        JsonNode detour = Assert.Single(v3["methods"]!.AsArray())!;
+        Assert.Equal("Born.Helper", detour["declaringType"]!.GetValue<string>());
+        Assert.Equal("Boost", detour["name"]!.GetValue<string>());
+        // Pinned to the sibling's OWN assembly (A2), not the file's first one.
+        Assert.Equal(asm2, detour["originalAssembly"]!.GetValue<string>());
+    }
+
+    [Fact]
+    public void PlayModeBornType_sibling_edit_does_not_strand_the_first_batch_type()
+    {
+        var service = new CompileService();
+        JsonObject p = ParamsFor();
+        p["domainGeneration"] = "born-sibling-host-gen";
+
+        JsonNode v1 = HotPatchBorn(service, p, BornSiblingV1);
+        string asm1 = v1["assemblyName"]!.GetValue<string>();
+        HotPatchBorn(service, p, BornSiblingV2);   // + Helper sibling (A2)
+
+        // Edit the FIRST-batch Host's body AND the sibling Helper's body together:
+        // Host redirects onto A1, Helper onto A2 — each detour pinned per type.
+        string both = BornSiblingV3
+            .Replace("public int Base() { return Seed + 1; }", "public int Base() { return Seed + 9; }");
+        JsonNode v3 = HotPatchBorn(service, p, both);
+        Assert.True(v3["hot"]!.GetValue<bool>(), v3["files"]?.ToJsonString());
+        Assert.Empty(v3["newTypes"]!.AsArray());
+
+        var methods = v3["methods"]!.AsArray();
+        JsonNode host = methods.Single(m => m!["declaringType"]!.GetValue<string>() == "Born.Host")!;
+        Assert.Equal(asm1, host["originalAssembly"]!.GetValue<string>());   // first assembly
+        JsonNode helper = methods.Single(m => m!["declaringType"]!.GetValue<string>() == "Born.Helper")!;
+        Assert.NotEqual(asm1, helper["originalAssembly"]!.GetValue<string>());   // sibling's own assembly
+    }
+
+    [Fact]
+    public void PlayModeBornType_added_message_on_sibling_pins_driver_to_sibling_assembly()
+    {
+        var service = new CompileService();
+        JsonObject p = ParamsFor();
+        p["domainGeneration"] = "born-sibling-msg-gen";
+
+        JsonNode v1 = HotPatchBorn(service, p, BornSiblingV1);   // Host in A1
+        string asm1 = v1["assemblyName"]!.GetValue<string>();
+        JsonNode v2 = HotPatchBorn(service, p, BornSiblingV2);   // + Helper sibling in A2
+        string asm2 = v2["assemblyName"]!.GetValue<string>();
+
+        // Add a Unity message (Update) to the SIBLING Helper. The driver must be
+        // pinned to the sibling's OWN assembly (A2), not the file's first one (A1):
+        // Helper does not exist in A1, so a mis-pin makes the runtime wiring fail
+        // and the whole batch fall closed to recompile. (The sidecar classifies
+        // Update by name even on a plain class; the MonoBehaviour check is runtime.)
+        string withSiblingUpdate = BornSiblingV2.Replace(
+            "public int Boost() { return 100; }",
+            "public int Boost() { return 100; }\n        public void Update() { }");
+        JsonNode v3 = HotPatchBorn(service, p, withSiblingUpdate);
+
+        Assert.True(v3["hot"]!.GetValue<bool>(), v3["files"]?.ToJsonString());
+        Assert.True(v3["success"]!.GetValue<bool>(), v3["error"]?.GetValue<string>());
+        JsonNode driver = Assert.Single(v3["messageDrivers"]!.AsArray())!;
+        Assert.Equal("Born.Helper", driver["declaringType"]!.GetValue<string>());
+        Assert.Equal("Update", driver["message"]!.GetValue<string>());
+        Assert.Equal(asm2, driver["originalAssembly"]!.GetValue<string>());   // sibling's assembly
+        Assert.NotEqual(asm1, driver["originalAssembly"]!.GetValue<string>());
+    }
+
+    [Fact]
+    public void PlayModeBornType_removed_added_message_on_sibling_clears_the_driver()
+    {
+        var service = new CompileService();
+        JsonObject p = ParamsFor();
+        p["domainGeneration"] = "born-sibling-rm-msg-gen";
+
+        HotPatchBorn(service, p, BornSiblingV1);   // Host
+        JsonNode v2 = HotPatchBorn(service, p, BornSiblingV2);   // + Helper sibling (A2)
+        string asm2 = v2["assemblyName"]!.GetValue<string>();
+
+        // Add a Unity message to the SIBLING (driver wired to A2, pump live)...
+        string withSiblingUpdate = BornSiblingV2.Replace(
+            "public int Boost() { return 100; }",
+            "public int Boost() { return 100; }\n        public void Update() { }");
+        JsonNode v3 = HotPatchBorn(service, p, withSiblingUpdate);
+        Assert.Single(v3["messageDrivers"]!.AsArray());   // Update wired
+
+        // ...then REMOVE it ([P1] for siblings). The sibling's own diff is against
+        // its FIXED birth text (which never had Update), so it cannot see the
+        // removal — but the FILE live diff (vs the last applied text) does. The
+        // removal is now HOT: a clear-marker tears down the stale A2 pump
+        // (replace-by-source keys off the file path, so the sibling's driver is
+        // cleared too). NOT a stale no-op.
+        JsonNode v4 = HotPatchBorn(service, p, BornSiblingV2);   // Update gone
+        Assert.True(v4["hot"]!.GetValue<bool>(), v4["files"]?.ToJsonString());
+        Assert.True(v4["success"]!.GetValue<bool>(), v4["error"]?.GetValue<string>());
+        JsonNode clear = Assert.Single(v4["messageDrivers"]!.AsArray())!;
+        Assert.Equal("clear", clear["kind"]!.GetValue<string>());
+        Assert.Equal("Born.Helper", clear["declaringType"]!.GetValue<string>());
+        Assert.Equal("Update", clear["message"]!.GetValue<string>());
+        Assert.Equal("Widget.cs", clear["sourcePath"]!.GetValue<string>());
+        Assert.Equal(asm2, clear["originalAssembly"]!.GetValue<string>());   // sibling's own assembly
+
+        // And re-sending the cleared text is a clean no-op (baseline advanced).
+        JsonNode v5 = HotPatchBorn(service, p, BornSiblingV2);
+        Assert.True(v5["hot"]!.GetValue<bool>(), v5["files"]?.ToJsonString());
+        Assert.Null(v5["messageDrivers"]);   // nothing left to clear
+    }
+
+    [Fact]
+    public void PlayModeBornType_removed_sibling_type_goes_cold()
+    {
+        var service = new CompileService();
+        JsonObject p = ParamsFor();
+        p["domainGeneration"] = "born-sibling-remove-gen";
+
+        HotPatchBorn(service, p, BornSiblingV1);   // Host
+        HotPatchBorn(service, p, BornSiblingV2);   // + Helper sibling
+
+        // Removing a sibling type is a removed type — its live instances cannot be
+        // cleaned up in place → COLD (recompile). (The conservative #5 boundary.)
+        JsonNode v3 = HotPatchBorn(service, p, BornSiblingV1);   // Helper gone
+        Assert.False(v3["hot"]!.GetValue<bool>(), v3["assemblyB64"]?.ToJsonString());
+    }
+
+    [Fact]
+    public void PlayModeBornType_sibling_unchanged_resend_is_hot_noop_not_cold()
+    {
+        var service = new CompileService();
+        JsonObject p = ParamsFor();
+        p["domainGeneration"] = "born-sibling-resend-gen";
+
+        HotPatchBorn(service, p, BornSiblingV1);   // Host
+        HotPatchBorn(service, p, BornSiblingV2);   // + Helper sibling (A2)
+
+        // Re-send the SAME text (the coordinator re-ships every dirty file each
+        // convergence batch). The already-born sibling folds to an empty diff —
+        // this must stay a clean HOT no-op, never cold (which would drag the whole
+        // batch cold). Regression guard for the sibling re-send routing.
+        JsonNode again = HotPatchBorn(service, p, BornSiblingV2);
+        Assert.True(again["hot"]!.GetValue<bool>(), again["files"]?.ToJsonString());
     }
 }

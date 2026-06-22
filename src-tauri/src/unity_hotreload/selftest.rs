@@ -3,22 +3,26 @@
 //! interfaces the agent tools use — coordinator baselines, the sidecar
 //! compile, the pipe — and reports a step-by-step diagnostic log.
 //!
-//! Coverage maps to the public hot-reload feature matrix
-//! (hotreload.net/zh/documentation/features), positive and negative:
+//! Coverage maps to the public hot-reload feature matrix, positive and negative:
 //!   • positives: method/property(get+set)/indexer/event/operator/
 //!     conversion/ctor body edits, expression-bodied members, lambda +
 //!     closure (including NEW captures), local functions, anonymous types,
 //!     pattern matching, nested types, iterator (coroutine) bodies, async
 //!     body edits and async↔sync, added methods (shim→shim chains) +
 //!     fields (instance and static, across separate batches),
-//!     instance-initializer edits, field deletion, signature changes
+//!     instance-initializer edits, field deletion, field RETYPE (the
+//!     remove+add decomposition — a live instance reads the new field's
+//!     default), added-const inlining, signature changes
 //!     (params / ref→out / static flip / rename) with call-site
 //!     verification, accessibility narrowing, using add/remove with
 //!     whole-file rehook, enum append, new files, new types in existing
 //!     files (top-level and nested), struct method bodies, interface-impl
 //!     bodies, deletions (members, properties, Unity messages, whole
 //!     files); plus edit-mode reloading of EDITOR-assembly code, in-flight
-//!     delegates following detours, Unity message body edits, store-held
+//!     delegates following detours, Unity message body edits, hot-added Unity
+//!     message drivers (PlayerLoop, lifecycle catch-up, plus component-proxy
+//!     forwarding for physics/trigger and non-physics messages), a
+//!     runtime diagnostic for hot-added MonoBehaviour AddComponent(Type), store-held
 //!     static persistence across patches, generic-typed and nested-type
 //!     field additions, #if-block edits, iterator→plain conversions,
 //!     extension-method additions (with the call site surviving LATER
@@ -61,7 +65,7 @@
 //!     virtual PROPERTY additions — plain property/indexer/event additions
 //!     are hot since B2), field-like event additions, struct
 //!     field layout, enum value edits, attribute edits, const edits,
-//!     new Unity message names, interface changes,
+//!     unsupported Unity message names/signatures, interface changes,
 //!     base-list changes, partial-type FIELD layout changes (body edits
 //!     are hot since B6), delegate signature changes,
 //!     conversions returning the declaring type, added members whose
@@ -71,7 +75,19 @@
 //!     untracked-input verdict for .asmdef edits (assembly restructuring
 //!     always needs unity_recompile), along with B2's pointed cold guards:
 //!     full-property ++, ??= set-skip, auto-property ref/out, and compound
-//!     indexers with non-repeatable index expressions.
+//!     indexers with non-repeatable index expressions; plus the N30+ extra
+//!     cold surface: type-kind flips (class↔struct), static-constructor
+//!     bodies, explicit-interface-implementation bodies, the enum-append
+//!     guards (non-literal value, value conflict) and enum removal, const
+//!     and constructor and finalizer REMOVAL, field-modifier changes,
+//!     operator additions, record types (rejected on presence — created
+//!     fresh so the C# 9 syntax never compiles), the M6 using-rehook gates
+//!     (non-literal const / non-literal static initializer / generic member /
+//!     explicit-interface / finalizer), and the remaining B6 partial
+//!     boundaries (part add/remove, new-part declaration, using-in-partial,
+//!     part-count change, initializer change, partial-method-twice). The
+//!     Burst, unsupported-operator and default-interface-method gate variants
+//!     stay in the HotDiff unit tests (package / unreachable / runtime-DIM).
 //!
 //! Flow: with the editor connected and NOT playing, it materializes a test
 //! corpus under Assets/LocusHotReloadSelfTest, imports + recompiles it as
@@ -80,7 +96,9 @@
 //! observable behavior through `unity_execute_code` snippets. Added-member
 //! behavior is always asserted through a PRE-EXISTING member (`Probe`)
 //! re-pointed at the new surface: snippets compile against the original
-//! assembly metadata, which never contains hot-added members. Every step
+//! assembly metadata, which never contains hot-added members. The hot-added
+//! MonoBehaviour AddComponent diagnostic uses reflection for the same reason.
+//! Every step
 //! is atomic: a failed apply reverts its file(s) on disk and in the ledger
 //! so one rejected patch cannot poison the following batches.
 //!
@@ -91,7 +109,7 @@
 //! the `unity-hotreload-selftest` event.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use tauri::Emitter;
@@ -100,11 +118,25 @@ use super::coordinator;
 
 static RUNNING: AtomicBool = AtomicBool::new(false);
 
+struct SelfTestRunningGuard;
+
+impl Drop for SelfTestRunningGuard {
+    fn drop(&mut self) {
+        RUNNING.store(false, Ordering::SeqCst);
+    }
+}
+
+const EXIT_PLAY_MODE_TIMEOUT: Duration = Duration::from_secs(90);
+const UNITY_SEMANTIC_READY_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const UNITY_SEMANTIC_READY_POLL: Duration = Duration::from_millis(500);
 const TEST_DIR: &str = "Assets/LocusHotReloadSelfTest";
 const SUBJECT_FILE: &str = "Assets/LocusHotReloadSelfTest/LocusSelfTestSubject.cs";
+const MESSAGE_FILE: &str = "Assets/LocusHotReloadSelfTest/LocusSelfTestMessages.cs";
 const HELPER_FILE: &str = "Assets/LocusHotReloadSelfTest/LocusSelfTestHelper.cs";
 const MODE_FILE: &str = "Assets/LocusHotReloadSelfTest/LocusSelfTestMode.cs";
 const FRESH_FILE: &str = "Assets/LocusHotReloadSelfTest/LocusSelfTestFresh.cs";
+const HOT_ADDED_BEHAVIOUR_FILE: &str =
+    "Assets/LocusHotReloadSelfTest/LocusSelfTestHotAddedBehaviour.cs";
 const STRUCT_FILE: &str = "Assets/LocusHotReloadSelfTest/LocusSelfTestStruct.cs";
 const CTOR_FILE: &str = "Assets/LocusHotReloadSelfTest/LocusSelfTestCtor.cs";
 const IFACE_FILE: &str = "Assets/LocusHotReloadSelfTest/LocusSelfTestIface.cs";
@@ -122,12 +154,73 @@ const LIB_FILE: &str = "Assets/LocusHotReloadSelfTest/Lib/LocusSelfTestLibType.c
 // path are exercised against the real compiler's part ordering.
 const PARTIAL_A_FILE: &str = "Assets/LocusHotReloadSelfTest/LocusSelfTestPartialA.cs";
 const PARTIAL_B_FILE: &str = "Assets/LocusHotReloadSelfTest/LocusSelfTestPartialB.cs";
+// Adversarial C#-syntax cases (A1–A4): pin known resolver / inlining gaps.
+const ADVERSARIAL_FILE: &str = "Assets/LocusHotReloadSelfTest/LocusSelfTestAdversarial.cs";
+const INLINE_CALLEE_FILE: &str = "Assets/LocusHotReloadSelfTest/LocusSelfTestInlineCallee.cs";
+const INLINE_CALLER_DIRECT_FILE: &str =
+    "Assets/LocusHotReloadSelfTest/LocusSelfTestInlineCallerDirect.cs";
+const INLINE_CALLER_NESTED_FILE: &str =
+    "Assets/LocusHotReloadSelfTest/LocusSelfTestInlineCallerNested.cs";
+const INLINE_CALLER_OVERLOAD_FILE: &str =
+    "Assets/LocusHotReloadSelfTest/LocusSelfTestInlineCallerOverload.cs";
+const INLINE_CALLER_LAMBDA_FILE: &str =
+    "Assets/LocusHotReloadSelfTest/LocusSelfTestInlineCallerLambda.cs";
+const INLINE_CALLER_BRANCH_FILE: &str =
+    "Assets/LocusHotReloadSelfTest/LocusSelfTestInlineCallerBranch.cs";
+const INLINE_CALLER_ARRAY_FILE: &str =
+    "Assets/LocusHotReloadSelfTest/LocusSelfTestInlineCallerArray.cs";
+// R12 — a depth-2 static inline chain across THREE files (Leaf→Mid→Top, each
+// hop AggressiveInlining bar the top): editing the leaf must refresh the mid
+// (round 1) and the top (round 2), exactly the INLINE_REFRESH_MAX_DEPTH limit.
+const INLINE_CHAIN_LEAF_FILE: &str = "Assets/LocusHotReloadSelfTest/LocusSelfTestChainLeaf.cs";
+const INLINE_CHAIN_MID_FILE: &str = "Assets/LocusHotReloadSelfTest/LocusSelfTestChainMid.cs";
+const INLINE_CHAIN_TOP_FILE: &str = "Assets/LocusHotReloadSelfTest/LocusSelfTestChainTop.cs";
+// R13 — cross-ASSEMBLY static inline refresh: a static lib method (Lib/ →
+// LocusSelfTestLib) inlined into an Assembly-CSharp caller. The refresh
+// recompiles callee+caller into ONE patch assembly, so the static patch-copy
+// redirect should erase the boundary.
+const LIB_INLINE_FILE: &str = "Assets/LocusHotReloadSelfTest/Lib/LocusSelfTestLibInline.cs";
+const LIB_INLINE_CALLER_FILE: &str =
+    "Assets/LocusHotReloadSelfTest/LocusSelfTestLibInlineCaller.cs";
+// R14 — same-ASSEMBLY INSTANCE inline refresh: an instance callee inlined into
+// a static caller. Exercises the instance self-shim redirect (Option A) with
+// the assembly boundary ruled out — the same-assembly counterpart of R05.
+const INST_INLINEE_FILE: &str = "Assets/LocusHotReloadSelfTest/LocusSelfTestInstInlinee.cs";
+const INST_INLINE_CALLER_FILE: &str =
+    "Assets/LocusHotReloadSelfTest/LocusSelfTestInstInlineCaller.cs";
+// Extra cold-classification surface (negative phase only). COLD_FILE holds
+// several independent types, each mutated in isolation to pin one rejection
+// reason: type-kind flip, static ctor, explicit-interface body, enum guards,
+// const/field/ctor/finalizer removal, operator addition.
+const COLD_FILE: &str = "Assets/LocusHotReloadSelfTest/LocusSelfTestColdSurface.cs";
+// A record type is rejected on PRESENCE (CollectTypes), so it cannot share a
+// file with anything else and must never reach a real compile — it is created
+// fresh inside the negative test, classified cold, and deleted (never imported
+// into the baseline), so a C#-9-shy editor can never abort the whole suite.
+const RECORD_FILE: &str = "Assets/LocusHotReloadSelfTest/LocusSelfTestRecord.cs";
+// Using-rehook gates (M6): each file pairs ONE un-re-detourable member with a
+// using directive; toggling the using fails the whole-file re-detour closed
+// with that member's precise reason. One member per file — the gate reports
+// the FIRST it finds, so they cannot be combined.
+const USE_CONST_FILE: &str = "Assets/LocusHotReloadSelfTest/LocusSelfTestUseConst.cs";
+const USE_STATIC_FILE: &str = "Assets/LocusHotReloadSelfTest/LocusSelfTestUseStatic.cs";
+const USE_GENERIC_FILE: &str = "Assets/LocusHotReloadSelfTest/LocusSelfTestUseGeneric.cs";
+const USE_EXPLICIT_FILE: &str = "Assets/LocusHotReloadSelfTest/LocusSelfTestUseExplicit.cs";
+const USE_FINALIZER_FILE: &str = "Assets/LocusHotReloadSelfTest/LocusSelfTestUseFinalizer.cs";
+// Partial-type cold boundaries (B6 v1). PARTIAL_COLD_FILE is a single-part
+// partial type used for part-removed / new-part / using-in-partial /
+// initializer / partial-method-twice; PARTIAL_COUNT_FILE carries TWO parts in
+// one file so the part-count change can fire.
+const PARTIAL_COLD_FILE: &str = "Assets/LocusHotReloadSelfTest/LocusSelfTestPartialCold.cs";
+const PARTIAL_COUNT_FILE: &str = "Assets/LocusHotReloadSelfTest/LocusSelfTestPartialCount.cs";
 
 const ALL_FILES: &[&str] = &[
     SUBJECT_FILE,
+    MESSAGE_FILE,
     HELPER_FILE,
     MODE_FILE,
     FRESH_FILE,
+    HOT_ADDED_BEHAVIOUR_FILE,
     STRUCT_FILE,
     CTOR_FILE,
     IFACE_FILE,
@@ -135,12 +228,198 @@ const ALL_FILES: &[&str] = &[
     EDITOR_FILE,
     PARTIAL_A_FILE,
     PARTIAL_B_FILE,
+    ADVERSARIAL_FILE,
+    INLINE_CALLEE_FILE,
+    INLINE_CALLER_DIRECT_FILE,
+    INLINE_CALLER_NESTED_FILE,
+    INLINE_CALLER_OVERLOAD_FILE,
+    INLINE_CALLER_LAMBDA_FILE,
+    INLINE_CALLER_BRANCH_FILE,
+    INLINE_CALLER_ARRAY_FILE,
+    // Multi-file inline caller-refresh characterization probes (R12–R14).
+    INLINE_CHAIN_LEAF_FILE,
+    INLINE_CHAIN_MID_FILE,
+    INLINE_CHAIN_TOP_FILE,
+    LIB_INLINE_CALLER_FILE,
+    INST_INLINEE_FILE,
+    INST_INLINE_CALLER_FILE,
+    // Extra cold-classification corpus (negative phase). RECORD_FILE is
+    // deliberately ABSENT: it is created fresh inside its test and never
+    // baseline-imported (see the FRESH_FILE-style filter in initialize_corpus).
+    COLD_FILE,
+    USE_CONST_FILE,
+    USE_STATIC_FILE,
+    USE_GENERIC_FILE,
+    USE_EXPLICIT_FILE,
+    USE_FINALIZER_FILE,
+    PARTIAL_COLD_FILE,
+    PARTIAL_COUNT_FILE,
+    RECORD_FILE,
     // The .asmdef imports BEFORE the lib source so the assembly exists by
     // the time its first script imports (both flush in one batch anyway —
     // the compilation pipeline recomputes asmdef ownership per compile).
     LIB_ASMDEF_FILE,
     LIB_FILE,
+    LIB_INLINE_FILE,
 ];
+
+// Adversarial corpus: four legal-C# constructs that stress overload identity
+// and inlining. All members are static and self-contained so editing them can
+// only affect this file's own steps (the type never participates in other
+// cases). See `run_adversarial_tests`.
+const ADVERSARIAL_BASELINE: &str = r#"namespace LocusSelfTestAdvA { public struct Tag { } }
+namespace LocusSelfTestAdvB { public struct Tag { } }
+
+public static class LocusSelfTestAdversarial
+{
+    // A1: overloads distinguishable ONLY by parameter namespace — both reflect
+    // to the simple type name "Tag"; the enriched signature carries the rest.
+    public static int ProbeNs(LocusSelfTestAdvA.Tag t) { return 1001; }
+    public static int ProbeNs(LocusSelfTestAdvB.Tag t) { return 2002; }
+
+    // A2: overloads distinguishable ONLY by generic argument — both reflect to
+    // "List`1".
+    public static int ProbeGen(System.Collections.Generic.List<int> a) { return 3003; }
+    public static int ProbeGen(System.Collections.Generic.List<string> a) { return 4004; }
+
+    // A3: inlined at call sites even in Debug; the detour is bypassed there.
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    public static int Inlined() { return 5005; }
+    public static int CallInlined() { return Inlined(); }
+
+    // A4: callers bake the default value at compile time, like a const.
+    public static int Defaulted(int x, int y = 1000) { return x + y; }
+    public static int CallDefaulted() { return Defaulted(7000); }
+}
+"#;
+
+const INLINE_CALLEE_BASELINE: &str = r#"public static class LocusSelfTestInlineCallee
+{
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    public static int Direct() { return 101; }
+
+    public static class Inner
+    {
+        [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+        public static int Nested() { return 201; }
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    public static int Pick(int x) { return x + 301; }
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    public static int Pick(string x) { return x.Length + 401; }
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    public static int LambdaSeed() { return 501; }
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    public static int BranchSeed(int x) { return x > 0 ? 601 : 0; }
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    public static int ArraySeed() { return 701; }
+}
+"#;
+
+const INLINE_CALLER_DIRECT_BASELINE: &str = r#"public static class LocusSelfTestInlineCallerDirect
+{
+    public static int Run() { return LocusSelfTestInlineCallee.Direct() + 1; }
+}
+"#;
+
+const INLINE_CALLER_NESTED_BASELINE: &str = r#"public static class LocusSelfTestInlineCallerNested
+{
+    public static int Run() { return LocusSelfTestInlineCallee.Inner.Nested() + 2; }
+}
+"#;
+
+const INLINE_CALLER_OVERLOAD_BASELINE: &str = r#"public static class LocusSelfTestInlineCallerOverload
+{
+    public static int Run() { return LocusSelfTestInlineCallee.Pick(3) + 3; }
+}
+"#;
+
+const INLINE_CALLER_LAMBDA_BASELINE: &str = r#"public static class LocusSelfTestInlineCallerLambda
+{
+    public static int Run()
+    {
+        System.Func<int> read = () => LocusSelfTestInlineCallee.LambdaSeed();
+        return read() + 4;
+    }
+}
+"#;
+
+const INLINE_CALLER_BRANCH_BASELINE: &str = r#"public static class LocusSelfTestInlineCallerBranch
+{
+    public static int Run(int x)
+    {
+        return x > 0 ? LocusSelfTestInlineCallee.BranchSeed(x) + 5 : -1;
+    }
+}
+"#;
+
+const INLINE_CALLER_ARRAY_BASELINE: &str = r#"public static class LocusSelfTestInlineCallerArray
+{
+    public static int Run()
+    {
+        var values = new System.Collections.Generic.List<int> { LocusSelfTestInlineCallee.ArraySeed() };
+        return values[0] + 6;
+    }
+}
+"#;
+
+// R12 — depth-2 static inline chain. Leaf and Mid are AggressiveInlining, so a
+// leaf edit must propagate through TWO refresh rounds to reach Top.
+const INLINE_CHAIN_LEAF_BASELINE: &str = r#"public static class LocusSelfTestChainLeaf
+{
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    public static int Leaf() { return 3100; }
+}
+"#;
+
+const INLINE_CHAIN_MID_BASELINE: &str = r#"public static class LocusSelfTestChainMid
+{
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    public static int Mid() { return LocusSelfTestChainLeaf.Leaf() + 30; }
+}
+"#;
+
+const INLINE_CHAIN_TOP_BASELINE: &str = r#"public static class LocusSelfTestChainTop
+{
+    public static int Top() { return LocusSelfTestChainMid.Mid() + 300; }
+}
+"#;
+
+// R13 — cross-asmdef STATIC inline refresh. The callee lives in the lib
+// assembly (Lib/ folder), the caller in Assembly-CSharp.
+const LIB_INLINE_BASELINE: &str = r#"public static class LocusSelfTestLibInline
+{
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    public static int Seed() { return 6200; }
+}
+"#;
+
+const LIB_INLINE_CALLER_BASELINE: &str = r#"public static class LocusSelfTestLibInlineCaller
+{
+    public static int Run() { return LocusSelfTestLibInline.Seed() + 6; }
+}
+"#;
+
+// R14 — same-assembly INSTANCE inline refresh. Tap() is an instance method, so
+// the patched-method redirect does not cover it and the refreshed caller
+// re-inlines the stale body.
+const INST_INLINEE_BASELINE: &str = r#"public class LocusSelfTestInstInlinee
+{
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    public int Tap() { return 8400; }
+}
+"#;
+
+const INST_INLINE_CALLER_BASELINE: &str = r#"public static class LocusSelfTestInstInlineCaller
+{
+    public static int Run() { return new LocusSelfTestInstInlinee().Tap() + 8; }
+}
+"#;
 
 const SUBJECT_BASELINE: &str = r#"using UnityEngine;
 using System.Threading.Tasks;
@@ -155,6 +434,7 @@ public class LocusSelfTestSubject : MonoBehaviour
     private int _ticks = 0;
     private int _seed = 40;
     private int _legacy = 3;
+    private int _flux = 5;
 
     public int Ticks { get { return _ticks; } }
     public int Gauge { get { return 17; } }
@@ -186,6 +466,8 @@ public class LocusSelfTestSubject : MonoBehaviour
     }
     public int Probe() { return 0; }
     public int Spare() { return 1; }
+    public int Flux() { return _flux; }
+    public int Spark() { return 0; }
     private int SecretCore() { return 7000; }
     public int Vaulted() { return SecretCore() + s_secret; }
     public int Relay() { return new LocusSelfTestNegative().Echo(20) + 1; }
@@ -214,6 +496,138 @@ public class LocusSelfTestSubject : MonoBehaviour
     }
     public Task<int> Pulse() { return Task.FromResult(2001); }
     public System.Collections.IEnumerator Counting() { yield return 1; }
+}
+"#;
+
+// The play-mode-born fresh file (P09 + the Phenomenon-3 re-edit trichotomy,
+// P09b–P09e). Authored entirely DURING play mode — filtered out of the baseline
+// import in initialize_corpus — so it loads as a fresh type into a
+// __LocusHotPatch_ assembly (engine: load_only) and a re-edit exercises the
+// NewTypeRegistry routing in the compile server.
+//
+// A MonoBehaviour with OBSERVABLE INSTANCE STATE: `Beat` plus the Bump() body
+// (birth: `Beat += 10`) is the surface the re-edit scenarios mutate, and `Live`
+// retains one spawned instance so a later body edit can be observed on the SAME
+// pre-existing instance. Everything else is FIXED (no field/signature/member
+// change across edits) so a Bump() body edit stays a pure-body, redirectable
+// change. The static reflection helpers (Spawn/ReadBeat) give the Rust snippets
+// a stable entry point even though the type is invisible to snippet metadata,
+// and Bump() is invoked directly on the retained instance. The static Ping()
+// preserves P09's original through-Probe assertion.
+const FRESH_BASELINE: &str = r#"using UnityEngine;
+
+public class LocusSelfTestFresh : MonoBehaviour
+{
+    public static LocusSelfTestFresh Live;
+    public int Beat;
+
+    public static int Ping() { return 4242; }
+
+    // Bump() is the redirect target. BIRTH body: Beat += 10. P09c rewrites the
+    // body (Beat += 7) — a pure body change that must redirect onto the FIRST
+    // loaded assembly so this very instance updates.
+    public int Bump() { Beat += 10; return Beat; }
+
+    // Reflection entry points (stable across edits — never re-shaped):
+    // create+retain the instance and read Beat back. Bump() itself is invoked
+    // DIRECTLY on the retained instance from the test (never through a wrapper),
+    // so a live detour is always observed even under Release inlining.
+    public static int Spawn()
+    {
+        var go = new GameObject("LocusSelfTestFreshLive");
+        Live = go.AddComponent<LocusSelfTestFresh>();
+        return Live.Beat;
+    }
+    public static int ReadBeat() { return Live == null ? -1 : Live.Beat; }
+}
+"#;
+
+const MESSAGE_BASELINE: &str = r#"using UnityEngine;
+
+public class LocusSelfTestMessages : MonoBehaviour
+{
+    public static LocusSelfTestMessages Instance;
+    public static LocusSelfTestMessages Physics3D;
+    public static LocusSelfTestMessages Physics2D;
+    public static int UpdateCount;
+    public static int LateUpdateCount;
+    public static int FixedUpdateCount;
+    public static int Trigger3D;
+    public static int TriggerStay3D;
+    public static int TriggerExit3D;
+    public static int Collision3D;
+    public static int CollisionStay3D;
+    public static int CollisionExit3D;
+    public static int Trigger2D;
+    public static int TriggerStay2D;
+    public static int TriggerExit2D;
+    public static int Collision2D;
+    public static int CollisionStay2D;
+    public static int CollisionExit2D;
+
+    void Awake()
+    {
+        if (gameObject.name == "LocusHotReloadSelfTestMessages") Instance = this;
+        if (gameObject.name.EndsWith("3D")) Physics3D = this;
+        if (gameObject.name.EndsWith("2D")) Physics2D = this;
+    }
+
+    public int Marker() { return 1; }
+
+    public static void ResetFrameCounters()
+    {
+        UpdateCount = 0;
+        LateUpdateCount = 0;
+        FixedUpdateCount = 0;
+    }
+
+    public static void ResetProxyCounters()
+    {
+        Trigger3D = 0;
+        TriggerStay3D = 0;
+        TriggerExit3D = 0;
+        Collision3D = 0;
+        CollisionStay3D = 0;
+        CollisionExit3D = 0;
+        Trigger2D = 0;
+        TriggerStay2D = 0;
+        TriggerExit2D = 0;
+        Collision2D = 0;
+        CollisionStay2D = 0;
+        CollisionExit2D = 0;
+    }
+
+    public static int FrameTotal() { return UpdateCount + LateUpdateCount + FixedUpdateCount; }
+}
+
+public class LocusSelfTestLifecycleMessages : MonoBehaviour
+{
+    public static LocusSelfTestLifecycleMessages Instance;
+    public static int AwakeCatchUp;
+    public static int StartCatchUp;
+    public static int ValidateCatchUp;
+    public static int MouseDownCount;
+    public static int AnimatorIkLayer;
+    public static int DestroyCount;
+
+    public int Marker() { return 2; }
+
+    public static void ResetLifecycleCounters()
+    {
+        AwakeCatchUp = 0;
+        StartCatchUp = 0;
+        ValidateCatchUp = 0;
+    }
+
+    public static void ResetUtilityProxyCounters()
+    {
+        MouseDownCount = 0;
+        AnimatorIkLayer = 0;
+        DestroyCount = 0;
+    }
+
+    public static int LifecycleTotal() { return AwakeCatchUp + StartCatchUp + ValidateCatchUp; }
+    public static int UtilityProxyTotal() { return MouseDownCount + AnimatorIkLayer + DestroyCount; }
 }
 "#;
 
@@ -292,6 +706,11 @@ public class LocusSelfTestNegative
     public int Hidden() { return _hidden; }
     internal int Wide() { return 5; }
     public T Echo<T>(T value) { return value; }
+}
+
+public class LocusSelfTestNegBehaviour : UnityEngine.MonoBehaviour
+{
+    public int Solid() { return 1; }
 }
 
 public class LocusSelfTestNegGeneric<T>
@@ -374,6 +793,150 @@ const PARTIAL_B_BASELINE: &str = r#"public partial class LocusSelfTestPartial
 }
 "#;
 
+// Cold-classification corpus: independent types, each mutated alone so exactly
+// one rejection reason fires (the unchanged siblings never diff). The Mark()
+// bodies differ on purpose so every swap anchor below is unique.
+const COLD_BASELINE: &str = r#"public class LocusSelfTestKind
+{
+    public int Mark() { return 1; }
+}
+
+public class LocusSelfTestStaticCtor
+{
+    public static int Counter;
+
+    static LocusSelfTestStaticCtor() { Counter = 1; }
+
+    public int Mark() { return Counter; }
+}
+
+public interface ILocusSelfTestExplicit
+{
+    int Plan();
+}
+
+public class LocusSelfTestExplicitImpl : ILocusSelfTestExplicit
+{
+    int ILocusSelfTestExplicit.Plan() { return 1; }
+}
+
+public enum LocusSelfTestColdEnum { P = 1, Q = 2 }
+
+public class LocusSelfTestConstHost
+{
+    public const int Cap = 5;
+
+    public int Use() { return 9; }
+}
+
+public class LocusSelfTestFieldMods
+{
+    public int Field;
+
+    public int Read() { return Field; }
+}
+
+public class LocusSelfTestCtorDrop
+{
+    public int Seed;
+
+    public LocusSelfTestCtorDrop() { Seed = 1; }
+    public LocusSelfTestCtorDrop(int seed) { Seed = seed; }
+}
+
+public class LocusSelfTestFinDrop
+{
+    public int Mark() { return 3; }
+
+    ~LocusSelfTestFinDrop() { }
+}
+
+public class LocusSelfTestOpHost
+{
+    public int Value;
+
+    public int Mark() { return Value; }
+}
+"#;
+
+// Created fresh and deleted inside its test — the record is rejected on
+// presence, so this text never reaches a real Unity compile.
+const RECORD_BASELINE: &str = r#"public record LocusSelfTestRecord
+{
+    public int Mark() { return 1; }
+}
+"#;
+
+// Using-rehook gate corpus (M6). Each file holds ONE member the whole-file
+// re-detour cannot reproduce; the test toggles a using directive to drive the
+// gate. Mark()/plain methods are present only as inert filler.
+const USE_CONST_BASELINE: &str = r#"public class LocusSelfTestUseConst
+{
+    public const int Cap = 1 + 2;
+
+    public int Mark() { return 7; }
+}
+"#;
+
+const USE_STATIC_BASELINE: &str = r#"public class LocusSelfTestUseStatic
+{
+    public static int Seed = Compute();
+
+    static int Compute() { return 3; }
+
+    public int Mark() { return 7; }
+}
+"#;
+
+const USE_GENERIC_BASELINE: &str = r#"public class LocusSelfTestUseGeneric
+{
+    public int Pick<T>(T value) { return 1; }
+}
+"#;
+
+const USE_EXPLICIT_BASELINE: &str = r#"public interface ILocusSelfTestUseExpl
+{
+    int Go();
+}
+
+public class LocusSelfTestUseExpl : ILocusSelfTestUseExpl
+{
+    int ILocusSelfTestUseExpl.Go() { return 1; }
+}
+"#;
+
+const USE_FINALIZER_BASELINE: &str = r#"public class LocusSelfTestUseFin
+{
+    public int Mark() { return 1; }
+
+    ~LocusSelfTestUseFin() { }
+}
+"#;
+
+// Single-part partial type: part-removed / new-part / using-in-partial /
+// initializer-changed / partial-method-twice all mutate this one file.
+const PARTIAL_COLD_BASELINE: &str = r#"public partial class LocusSelfTestPartialCold
+{
+    private int _value = 10;
+
+    partial void Hook();
+
+    public int Read() { return _value; }
+}
+"#;
+
+// Two parts of one type in one file, so dropping a part changes the count.
+const PARTIAL_COUNT_BASELINE: &str = r#"public partial class LocusSelfTestPartialCount
+{
+    public int A() { return 1; }
+}
+
+public partial class LocusSelfTestPartialCount
+{
+    public int B() { return 2; }
+}
+"#;
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SelfTestEvent {
@@ -390,6 +953,34 @@ struct NegativeLedgers {
     ctor_text: String,
     iface_text: String,
     partial_a_text: String,
+}
+
+/// Reply of the `hot_reload_inlining_active` bridge command: the editor's
+/// runtime "is Mono inlining right now?" verdict (force-JIT a canary, read its
+/// inline_info bit) plus the codeOptimization setting it disagreed with.
+#[derive(serde::Deserialize, Default)]
+struct InliningActiveResponse {
+    inlining_active: bool,
+    #[serde(default)]
+    code_optimization: String,
+    #[serde(default)]
+    detail: String,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct MessageDriverCapabilities {
+    physics3d: bool,
+    physics2d: bool,
+}
+
+impl MessageDriverCapabilities {
+    fn has_physics_proxy(self) -> bool {
+        self.physics3d || self.physics2d
+    }
+
+    fn label(self) -> String {
+        format!("physics3d={} physics2d={}", self.physics3d, self.physics2d)
+    }
 }
 
 struct SelfTest {
@@ -413,6 +1004,26 @@ struct SelfTest {
     /// left live so Phase 3 can assert its fate across the play transition
     /// (B5), reverting the file afterwards.
     editor_patch_live: bool,
+    /// Release-first: the connected editor is in Code Optimization = Release,
+    /// where Mono inlines some methods past the detour. Behavioral asserts then
+    /// tolerate an "inlined in Release" apply (the change converges on recompile
+    /// rather than through the live detour). Detected once at the start of `run`.
+    release_mode: bool,
+    /// Original Code Optimization mode, restored after the self-test forces
+    /// Release to exercise Mono inlining behavior.
+    original_code_optimization: Option<String>,
+    /// Set by `apply_texts` from the latest apply summary: true when Unity
+    /// reported methods it inlined (Release). Consulted by `expect_output`.
+    last_apply_inlined: bool,
+    /// The most recent hot-reload apply summary verbatim. Surfaced in
+    /// Release-strict failure diagnostics so a stale immediate read can be
+    /// localized (did the inline caller refresh engage / patch the caller, or
+    /// report a note?).
+    last_apply_summary: String,
+    /// Unity projects can include only the 3D physics module, only the 2D
+    /// physics module, both, or neither. Proxy-message coverage follows the
+    /// modules actually loaded by the editor.
+    message_driver_capabilities: MessageDriverCapabilities,
 }
 
 /// Replace exactly one occurrence, failing loudly when the anchor text is
@@ -459,6 +1070,301 @@ fn squash(text: &str) -> String {
         line.truncate(360);
     }
     line
+}
+
+fn reload_boundary_error(error: &str) -> bool {
+    matches!(error, "managed_reloading" | "domain_reload_interrupted")
+        || error.contains("managed_reloading")
+        || error.contains("domain_reload_interrupted")
+}
+
+fn remaining_or_timeout(
+    started: Instant,
+    timeout: Duration,
+    action: &str,
+) -> Result<Duration, String> {
+    timeout.checked_sub(started.elapsed()).ok_or_else(|| {
+        format!(
+            "{action} did not become ready within {}s",
+            timeout.as_secs()
+        )
+    })
+}
+
+fn spawn_test_objects_code(caps: MessageDriverCapabilities) -> String {
+    let mut code = String::from(
+        "foreach (var found in UnityEngine.Object.FindObjectsOfType(typeof(UnityEngine.GameObject), true))\n\
+         {\n\
+             var existing = found as UnityEngine.GameObject;\n\
+             if (existing != null && existing.name.StartsWith(\"LocusHotReloadSelfTest\")) UnityEngine.Object.Destroy(existing);\n\
+         }\n\
+         await ctx.WaitFrames(2);\n\
+         var go = new UnityEngine.GameObject(\"LocusHotReloadSelfTest\");\n\
+         go.AddComponent<LocusSelfTestSubject>();\n\
+         var messageGo = new UnityEngine.GameObject(\"LocusHotReloadSelfTestMessages\");\n\
+         messageGo.AddComponent<LocusSelfTestMessages>();\n",
+    );
+    code.push_str(
+        "var lifecycleGo = new UnityEngine.GameObject(\"LocusHotReloadSelfTestLifecycleMessages\");\n\
+         LocusSelfTestLifecycleMessages.Instance = lifecycleGo.AddComponent<LocusSelfTestLifecycleMessages>();\n",
+    );
+    if caps.physics3d {
+        code.push_str(
+            "var message3DGo = new UnityEngine.GameObject(\"LocusHotReloadSelfTestMessages3D\");\n\
+             message3DGo.AddComponent<LocusSelfTestMessages>();\n\
+             var box3D = message3DGo.AddComponent<UnityEngine.BoxCollider>();\n\
+             if (box3D == null) throw new System.InvalidOperationException(\"BoxCollider was not added\");\n\
+             box3D.isTrigger = true;\n",
+        );
+    }
+    if caps.physics2d {
+        code.push_str(
+            "var message2DGo = new UnityEngine.GameObject(\"LocusHotReloadSelfTestMessages2D\");\n\
+             message2DGo.AddComponent<LocusSelfTestMessages>();\n\
+             var box2D = message2DGo.AddComponent<UnityEngine.BoxCollider2D>();\n\
+             if (box2D == null) throw new System.InvalidOperationException(\"BoxCollider2D was not added\");\n\
+             box2D.isTrigger = true;\n",
+        );
+    }
+    code.push_str("return \"spawned\";");
+    code
+}
+
+fn initial_proxy_methods(caps: MessageDriverCapabilities) -> String {
+    let mut methods = String::new();
+    if caps.physics3d {
+        methods.push_str(
+            "    void OnTriggerEnter(Collider other) { Trigger3D += other != null ? 10 : 1; }\n\
+             void OnTriggerStay(Collider other) { TriggerStay3D += other != null ? 11 : 1; }\n\
+             void OnTriggerExit(Collider other) { TriggerExit3D += other != null ? 100 : 1; }\n\
+             void OnCollisionEnter(Collision collision) { Collision3D += collision == null ? 1 : 10; }\n\
+             void OnCollisionStay(Collision collision) { CollisionStay3D += collision == null ? 1 : 11; }\n\
+             void OnCollisionExit(Collision collision) { CollisionExit3D += collision == null ? 1 : 100; }\n",
+        );
+    }
+    if caps.physics2d {
+        methods.push_str(
+            "    void OnTriggerEnter2D(Collider2D other) { Trigger2D += other != null ? 20 : 1; }\n\
+             void OnTriggerStay2D(Collider2D other) { TriggerStay2D += other != null ? 21 : 1; }\n\
+             void OnTriggerExit2D(Collider2D other) { TriggerExit2D += other != null ? 200 : 1; }\n\
+             void OnCollisionEnter2D(Collision2D collision) { Collision2D += collision == null ? 1 : 20; }\n\
+             void OnCollisionStay2D(Collision2D collision) { CollisionStay2D += collision == null ? 1 : 21; }\n\
+             void OnCollisionExit2D(Collision2D collision) { CollisionExit2D += collision == null ? 1 : 200; }\n",
+        );
+    }
+    methods
+}
+
+fn physics3d_proxy_initial_assertion() -> &'static str {
+    "LocusSelfTestMessages.ResetProxyCounters();\n\
+     string InvokeEventProxy(UnityEngine.GameObject go, string message, object arg)\n\
+     {\n\
+         foreach (var behaviour in go.GetComponents<UnityEngine.MonoBehaviour>())\n\
+         {\n\
+             if (behaviour == null) continue;\n\
+             var type = behaviour.GetType();\n\
+             if (type.FullName != \"Locus.LocusEventProxy\") continue;\n\
+             var method = type.GetMethod(message, System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);\n\
+             if (method == null) return \"proxy-missing-method-\" + message;\n\
+             method.Invoke(behaviour, new object[] { arg });\n\
+             return \"\";\n\
+         }\n\
+         return \"proxy-missing-component-\" + message;\n\
+     }\n\
+     var instance = LocusSelfTestMessages.Physics3D;\n\
+     if (instance == null) return \"proxy-3d-missing-instance\";\n\
+     var go = instance.gameObject;\n\
+     var c3 = go.GetComponent<UnityEngine.BoxCollider>();\n\
+     if (c3 == null) return \"proxy-3d-missing-collider\";\n\
+     var err = InvokeEventProxy(go, \"OnTriggerEnter\", c3); if (err.Length > 0) return err;\n\
+     err = InvokeEventProxy(go, \"OnTriggerStay\", c3); if (err.Length > 0) return err;\n\
+     err = InvokeEventProxy(go, \"OnTriggerExit\", c3); if (err.Length > 0) return err;\n\
+     err = InvokeEventProxy(go, \"OnCollisionEnter\", null); if (err.Length > 0) return err;\n\
+     err = InvokeEventProxy(go, \"OnCollisionStay\", null); if (err.Length > 0) return err;\n\
+     err = InvokeEventProxy(go, \"OnCollisionExit\", null); if (err.Length > 0) return err;\n\
+     return LocusSelfTestMessages.Trigger3D == 10 && LocusSelfTestMessages.TriggerStay3D == 11 && LocusSelfTestMessages.TriggerExit3D == 100\n\
+         && LocusSelfTestMessages.Collision3D == 1 && LocusSelfTestMessages.CollisionStay3D == 1 && LocusSelfTestMessages.CollisionExit3D == 1\n\
+         ? \"proxy-3d-ok\"\n\
+         : (\"proxy-3d-missing t3=\" + LocusSelfTestMessages.Trigger3D + \" ts3=\" + LocusSelfTestMessages.TriggerStay3D + \" tx3=\" + LocusSelfTestMessages.TriggerExit3D\n\
+             + \" c3=\" + LocusSelfTestMessages.Collision3D + \" cs3=\" + LocusSelfTestMessages.CollisionStay3D + \" cx3=\" + LocusSelfTestMessages.CollisionExit3D);"
+}
+
+fn physics2d_proxy_initial_assertion() -> &'static str {
+    "LocusSelfTestMessages.ResetProxyCounters();\n\
+     string InvokeEventProxy(UnityEngine.GameObject go, string message, object arg)\n\
+     {\n\
+         foreach (var behaviour in go.GetComponents<UnityEngine.MonoBehaviour>())\n\
+         {\n\
+             if (behaviour == null) continue;\n\
+             var type = behaviour.GetType();\n\
+             if (type.FullName != \"Locus.LocusEventProxy\") continue;\n\
+             var method = type.GetMethod(message, System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);\n\
+             if (method == null) return \"proxy-missing-method-\" + message;\n\
+             method.Invoke(behaviour, new object[] { arg });\n\
+             return \"\";\n\
+         }\n\
+         return \"proxy-missing-component-\" + message;\n\
+     }\n\
+     var instance = LocusSelfTestMessages.Physics2D;\n\
+     if (instance == null) return \"proxy-2d-missing-instance\";\n\
+     var go = instance.gameObject;\n\
+     var c2 = go.GetComponent<UnityEngine.BoxCollider2D>();\n\
+     if (c2 == null) return \"proxy-2d-missing-collider\";\n\
+     var err = InvokeEventProxy(go, \"OnTriggerEnter2D\", c2); if (err.Length > 0) return err;\n\
+     err = InvokeEventProxy(go, \"OnTriggerStay2D\", c2); if (err.Length > 0) return err;\n\
+     err = InvokeEventProxy(go, \"OnTriggerExit2D\", c2); if (err.Length > 0) return err;\n\
+     err = InvokeEventProxy(go, \"OnCollisionEnter2D\", null); if (err.Length > 0) return err;\n\
+     err = InvokeEventProxy(go, \"OnCollisionStay2D\", null); if (err.Length > 0) return err;\n\
+     err = InvokeEventProxy(go, \"OnCollisionExit2D\", null); if (err.Length > 0) return err;\n\
+     return LocusSelfTestMessages.Trigger2D == 20 && LocusSelfTestMessages.TriggerStay2D == 21 && LocusSelfTestMessages.TriggerExit2D == 200\n\
+         && LocusSelfTestMessages.Collision2D == 1 && LocusSelfTestMessages.CollisionStay2D == 1 && LocusSelfTestMessages.CollisionExit2D == 1\n\
+         ? \"proxy-2d-ok\"\n\
+         : (\"proxy-2d-missing t2=\" + LocusSelfTestMessages.Trigger2D + \" ts2=\" + LocusSelfTestMessages.TriggerStay2D + \" tx2=\" + LocusSelfTestMessages.TriggerExit2D\n\
+             + \" c2=\" + LocusSelfTestMessages.Collision2D + \" cs2=\" + LocusSelfTestMessages.CollisionStay2D + \" cx2=\" + LocusSelfTestMessages.CollisionExit2D);"
+}
+
+fn physics3d_proxy_reedit_assertion() -> &'static str {
+    "LocusSelfTestMessages.ResetProxyCounters();\n\
+     string InvokeEventProxy(UnityEngine.GameObject go, string message, object arg)\n\
+     {\n\
+         foreach (var behaviour in go.GetComponents<UnityEngine.MonoBehaviour>())\n\
+         {\n\
+             if (behaviour == null) continue;\n\
+             var type = behaviour.GetType();\n\
+             if (type.FullName != \"Locus.LocusEventProxy\") continue;\n\
+             var method = type.GetMethod(message, System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);\n\
+             if (method == null) return \"proxy-missing-method-\" + message;\n\
+             method.Invoke(behaviour, new object[] { arg });\n\
+             return \"\";\n\
+         }\n\
+         return \"proxy-missing-component-\" + message;\n\
+     }\n\
+     var instance = LocusSelfTestMessages.Physics3D;\n\
+     if (instance == null) return \"proxy-3d-reedit-missing-instance\";\n\
+     var go = instance.gameObject;\n\
+     var c3 = go.GetComponent<UnityEngine.BoxCollider>();\n\
+     if (c3 == null) return \"proxy-3d-reedit-missing-collider\";\n\
+     var err = InvokeEventProxy(go, \"OnTriggerEnter\", c3); if (err.Length > 0) return err;\n\
+     err = InvokeEventProxy(go, \"OnTriggerStay\", c3); if (err.Length > 0) return err;\n\
+     err = InvokeEventProxy(go, \"OnCollisionEnter\", null); if (err.Length > 0) return err;\n\
+     return LocusSelfTestMessages.Trigger3D == 30 && LocusSelfTestMessages.TriggerStay3D == 3011 && LocusSelfTestMessages.Collision3D == 1\n\
+         ? \"proxy-3d-reedit-ok\"\n\
+         : (\"proxy-3d-reedit-mismatch t3=\" + LocusSelfTestMessages.Trigger3D + \" ts3=\" + LocusSelfTestMessages.TriggerStay3D + \" c3=\" + LocusSelfTestMessages.Collision3D);"
+}
+
+fn physics2d_proxy_reedit_assertion() -> &'static str {
+    "LocusSelfTestMessages.ResetProxyCounters();\n\
+     string InvokeEventProxy(UnityEngine.GameObject go, string message, object arg)\n\
+     {\n\
+         foreach (var behaviour in go.GetComponents<UnityEngine.MonoBehaviour>())\n\
+         {\n\
+             if (behaviour == null) continue;\n\
+             var type = behaviour.GetType();\n\
+             if (type.FullName != \"Locus.LocusEventProxy\") continue;\n\
+             var method = type.GetMethod(message, System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);\n\
+             if (method == null) return \"proxy-missing-method-\" + message;\n\
+             method.Invoke(behaviour, new object[] { arg });\n\
+             return \"\";\n\
+         }\n\
+         return \"proxy-missing-component-\" + message;\n\
+     }\n\
+     var instance = LocusSelfTestMessages.Physics2D;\n\
+     if (instance == null) return \"proxy-2d-reedit-missing-instance\";\n\
+     var go = instance.gameObject;\n\
+     var c2 = go.GetComponent<UnityEngine.BoxCollider2D>();\n\
+     if (c2 == null) return \"proxy-2d-reedit-missing-collider\";\n\
+     var err = InvokeEventProxy(go, \"OnTriggerEnter2D\", c2); if (err.Length > 0) return err;\n\
+     err = InvokeEventProxy(go, \"OnTriggerStay2D\", c2); if (err.Length > 0) return err;\n\
+     err = InvokeEventProxy(go, \"OnCollisionEnter2D\", null); if (err.Length > 0) return err;\n\
+     return LocusSelfTestMessages.Trigger2D == 40 && LocusSelfTestMessages.TriggerStay2D == 4021 && LocusSelfTestMessages.Collision2D == 1\n\
+         ? \"proxy-2d-reedit-ok\"\n\
+         : (\"proxy-2d-reedit-mismatch t2=\" + LocusSelfTestMessages.Trigger2D + \" ts2=\" + LocusSelfTestMessages.TriggerStay2D + \" c2=\" + LocusSelfTestMessages.Collision2D);"
+}
+
+fn physics3d_proxy_second_reedit_assertion() -> &'static str {
+    "LocusSelfTestMessages.ResetProxyCounters();\n\
+     string InvokeEventProxy(UnityEngine.GameObject go, string message, object arg)\n\
+     {\n\
+         foreach (var behaviour in go.GetComponents<UnityEngine.MonoBehaviour>())\n\
+         {\n\
+             if (behaviour == null) continue;\n\
+             var type = behaviour.GetType();\n\
+             if (type.FullName != \"Locus.LocusEventProxy\") continue;\n\
+             var method = type.GetMethod(message, System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);\n\
+             if (method == null) return \"proxy-missing-method-\" + message;\n\
+             method.Invoke(behaviour, new object[] { arg });\n\
+             return \"\";\n\
+         }\n\
+         return \"proxy-missing-component-\" + message;\n\
+     }\n\
+     var instance = LocusSelfTestMessages.Physics3D;\n\
+     if (instance == null) return \"proxy-3d-second-reedit-missing-instance\";\n\
+     var go = instance.gameObject;\n\
+     var c3 = go.GetComponent<UnityEngine.BoxCollider>();\n\
+     if (c3 == null) return \"proxy-3d-second-reedit-missing-collider\";\n\
+     var err = InvokeEventProxy(go, \"OnTriggerEnter\", c3); if (err.Length > 0) return err;\n\
+     err = InvokeEventProxy(go, \"OnTriggerExit\", c3); if (err.Length > 0) return err;\n\
+     err = InvokeEventProxy(go, \"OnCollisionExit\", null); if (err.Length > 0) return err;\n\
+     return LocusSelfTestMessages.Trigger3D == 50 && LocusSelfTestMessages.TriggerExit3D == 5100 && LocusSelfTestMessages.CollisionExit3D == 1\n\
+         ? \"proxy-3d-second-reedit-ok\"\n\
+         : (\"proxy-3d-second-reedit-mismatch t3=\" + LocusSelfTestMessages.Trigger3D + \" tx3=\" + LocusSelfTestMessages.TriggerExit3D + \" cx3=\" + LocusSelfTestMessages.CollisionExit3D);"
+}
+
+fn physics2d_proxy_second_reedit_assertion() -> &'static str {
+    "LocusSelfTestMessages.ResetProxyCounters();\n\
+     string InvokeEventProxy(UnityEngine.GameObject go, string message, object arg)\n\
+     {\n\
+         foreach (var behaviour in go.GetComponents<UnityEngine.MonoBehaviour>())\n\
+         {\n\
+             if (behaviour == null) continue;\n\
+             var type = behaviour.GetType();\n\
+             if (type.FullName != \"Locus.LocusEventProxy\") continue;\n\
+             var method = type.GetMethod(message, System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);\n\
+             if (method == null) return \"proxy-missing-method-\" + message;\n\
+             method.Invoke(behaviour, new object[] { arg });\n\
+             return \"\";\n\
+         }\n\
+         return \"proxy-missing-component-\" + message;\n\
+     }\n\
+     var instance = LocusSelfTestMessages.Physics2D;\n\
+     if (instance == null) return \"proxy-2d-second-reedit-missing-instance\";\n\
+     var go = instance.gameObject;\n\
+     var c2 = go.GetComponent<UnityEngine.BoxCollider2D>();\n\
+     if (c2 == null) return \"proxy-2d-second-reedit-missing-collider\";\n\
+     var err = InvokeEventProxy(go, \"OnTriggerEnter2D\", c2); if (err.Length > 0) return err;\n\
+     err = InvokeEventProxy(go, \"OnTriggerExit2D\", c2); if (err.Length > 0) return err;\n\
+     err = InvokeEventProxy(go, \"OnCollisionExit2D\", null); if (err.Length > 0) return err;\n\
+     return LocusSelfTestMessages.Trigger2D == 60 && LocusSelfTestMessages.TriggerExit2D == 6200 && LocusSelfTestMessages.CollisionExit2D == 1\n\
+         ? \"proxy-2d-second-reedit-ok\"\n\
+         : (\"proxy-2d-second-reedit-mismatch t2=\" + LocusSelfTestMessages.Trigger2D + \" tx2=\" + LocusSelfTestMessages.TriggerExit2D + \" cx2=\" + LocusSelfTestMessages.CollisionExit2D);"
+}
+
+fn utility_proxy_assertion() -> &'static str {
+    "LocusSelfTestLifecycleMessages.ResetUtilityProxyCounters();\n\
+     string InvokeMessageProxy(UnityEngine.GameObject go, string proxyTypeName, string message, object arg)\n\
+     {\n\
+         foreach (var behaviour in go.GetComponents<UnityEngine.MonoBehaviour>())\n\
+         {\n\
+             if (behaviour == null) continue;\n\
+             var type = behaviour.GetType();\n\
+             if (type.FullName != proxyTypeName) continue;\n\
+             var method = type.GetMethod(message, System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);\n\
+             if (method == null) return \"utility-proxy-missing-method-\" + proxyTypeName + \".\" + message;\n\
+             object[] args = arg == null ? null : new object[] { arg };\n\
+             method.Invoke(behaviour, args);\n\
+             return \"\";\n\
+         }\n\
+         return \"utility-proxy-missing-component-\" + proxyTypeName + \".\" + message;\n\
+     }\n\
+     var instance = LocusSelfTestLifecycleMessages.Instance;\n\
+     if (instance == null) return \"utility-proxy-missing-instance\";\n\
+     var go = instance.gameObject;\n\
+     var err = InvokeMessageProxy(go, \"Locus.LocusMouseProxy\", \"OnMouseDown\", null); if (err.Length > 0) return err;\n\
+     err = InvokeMessageProxy(go, \"Locus.LocusEventProxy\", \"OnAnimatorIK\", 7); if (err.Length > 0) return err;\n\
+     err = InvokeMessageProxy(go, \"Locus.LocusEventProxy\", \"OnDestroy\", null); if (err.Length > 0) return err;\n\
+     return LocusSelfTestLifecycleMessages.MouseDownCount == 1 && LocusSelfTestLifecycleMessages.AnimatorIkLayer == 7 && LocusSelfTestLifecycleMessages.DestroyCount == 1\n\
+         ? \"utility-proxy-ok\"\n\
+         : (\"utility-proxy-mismatch mouse=\" + LocusSelfTestLifecycleMessages.MouseDownCount + \" ik=\" + LocusSelfTestLifecycleMessages.AnimatorIkLayer + \" destroy=\" + LocusSelfTestLifecycleMessages.DestroyCount);"
 }
 
 impl SelfTest {
@@ -533,21 +1439,570 @@ impl SelfTest {
         crate::unity_bridge::unity_execute_code(&self.project, code).await
     }
 
+    async fn wait_for_semantic_ready(
+        &self,
+        action: &str,
+        timeout: Duration,
+        require_asset_modification: bool,
+    ) -> Result<(), String> {
+        crate::unity_bridge::set_state_probe_enabled(true);
+        crate::unity_bridge::start_unity_semantic_state_observer(&self.project);
+
+        let started = Instant::now();
+        let mut last_signature = String::new();
+        loop {
+            let state = crate::unity_bridge::unity_semantic_state(&self.project).await;
+            let signature = format!(
+                "{}|{}|{}|{}|{}|{}|{}|{}",
+                state.phase,
+                state.source,
+                state.reload_phase.as_deref().unwrap_or(""),
+                state.domain.phase,
+                state.editor_mode.value,
+                state.safety.can_call_unity_api,
+                state.safety.can_modify_assets_safely,
+                state.safety.recommended_action
+            );
+            if signature != last_signature {
+                last_signature = signature;
+                self.log(format!(
+                    "  semantic wait ({action}): requirement={} phase={} source={} domain={} editorMode={} canCall={} canModify={} action={}",
+                    if require_asset_modification {
+                        "assetModification"
+                    } else {
+                        "unityApi"
+                    },
+                    state.phase,
+                    state.source,
+                    state.domain.phase,
+                    state.editor_mode.value,
+                    state.safety.can_call_unity_api,
+                    state.safety.can_modify_assets_safely,
+                    state.safety.recommended_action
+                ));
+            }
+            let ready = if require_asset_modification {
+                state.safety.can_modify_assets_safely
+            } else {
+                state.safety.can_call_unity_api
+            };
+            if ready {
+                return Ok(());
+            }
+            if started.elapsed() >= timeout {
+                return Err(format!(
+                    "Unity was not ready for {action} within {}s; phase={} source={} recommendedAction={}",
+                    timeout.as_secs(),
+                    state.phase,
+                    state.source,
+                    state.safety.recommended_action
+                ));
+            }
+            tokio::time::sleep(UNITY_SEMANTIC_READY_POLL).await;
+        }
+    }
+
+    async fn wait_for_semantic_asset_ready(
+        &self,
+        action: &str,
+        timeout: Duration,
+    ) -> Result<(), String> {
+        self.wait_for_semantic_ready(action, timeout, true).await
+    }
+
+    async fn wait_for_semantic_unity_api_ready(
+        &self,
+        action: &str,
+        timeout: Duration,
+    ) -> Result<(), String> {
+        self.wait_for_semantic_ready(action, timeout, false).await
+    }
+
+    async fn set_code_optimization_retrying(
+        &self,
+        desired: &str,
+        action: &str,
+    ) -> Result<String, String> {
+        let started = Instant::now();
+        loop {
+            self.wait_for_semantic_asset_ready(
+                action,
+                remaining_or_timeout(started, UNITY_SEMANTIC_READY_TIMEOUT, action)?,
+            )
+            .await?;
+
+            match coordinator::set_code_optimization(&self.project, desired).await {
+                Ok(value) => {
+                    self.wait_for_semantic_asset_ready(
+                        action,
+                        remaining_or_timeout(started, UNITY_SEMANTIC_READY_TIMEOUT, action)?,
+                    )
+                    .await?;
+                    return Ok(value);
+                }
+                Err(error)
+                    if reload_boundary_error(&error)
+                        && started.elapsed() < UNITY_SEMANTIC_READY_TIMEOUT =>
+                {
+                    self.log(format!(
+                        "  {action}: Unity is reloading while switching Code Optimization ({error}); retrying"
+                    ));
+                    tokio::time::sleep(UNITY_SEMANTIC_READY_POLL).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    /// Runtime "is Mono inlining right now?" check. Force-JITs a small canary in
+    /// the editor and reports whether its inline_info bit was set — the JIT's
+    /// EFFECTIVE behavior, which can disagree with the codeOptimization setting
+    /// (play-mode has been observed Debug-effective while the setting reads
+    /// release, so nothing inlines). Returns (active, human_detail); false on any
+    /// transport/parse error so a failure only ever soft-skips an inline assert,
+    /// never falsely claims inlining.
+    async fn inlining_active(&self) -> (bool, String) {
+        match crate::unity_bridge::send_message_with_timeout(
+            &self.project,
+            "hot_reload_inlining_active",
+            "",
+            Duration::from_secs(15),
+        )
+        .await
+        {
+            Ok(resp) if resp.ok => {
+                let message = resp.message.unwrap_or_default();
+                match serde_json::from_str::<InliningActiveResponse>(&message) {
+                    Ok(parsed) => (
+                        parsed.inlining_active,
+                        format!(
+                            "code_optimization={} {}",
+                            parsed.code_optimization, parsed.detail
+                        ),
+                    ),
+                    Err(error) => (
+                        false,
+                        format!("parse failed: {error}; raw: {}", squash(&message)),
+                    ),
+                }
+            }
+            Ok(resp) => (
+                false,
+                resp.error
+                    .unwrap_or_else(|| "inlining_active failed".to_string()),
+            ),
+            Err(error) => (false, format!("transport: {}", squash(&error))),
+        }
+    }
+
     /// Snippet whose output must contain `expected` (sentinel values are
     /// chosen to be unambiguous).
+    ///
+    /// STRICT — no inlining tolerance. The inline caller refresh now re-patches the
+    /// parent method to un-inline (and the edited method's own detour is live), so
+    /// the new behavior MUST be observable immediately even in Release. A stale read
+    /// is a real gap — a refresh that could not redirect or hit its budget, or the
+    /// snippet caller inlining the callee — and is surfaced as a failure rather than
+    /// deferred to the queued recompile.
     async fn expect_output(&mut self, name: &str, code: &str, expected: &str) {
+        match self.execute(code).await {
+            Ok(output) if output.contains(expected) => {
+                self.pass(name, format!("observed {expected}"));
+            }
+            Ok(output) => {
+                // Help localize: a stale read that the apply ALSO reported inlined is
+                // an un-inline (caller-refresh) gap; a stale read with no inlining is
+                // a different bug (wrong patch / wrong expectation).
+                let hint = if self.release_mode && self.last_apply_inlined {
+                    " — apply reported inlined in Release, so caller refresh did not make it live (un-inline gap)"
+                } else {
+                    ""
+                };
+                self.fail(
+                    name,
+                    format!(
+                        "expected '{expected}' in output, got: {}{hint}",
+                        output.trim()
+                    ),
+                );
+            }
+            Err(error) => self.fail(name, format!("snippet failed: {error}")),
+        }
+    }
+
+    /// Adversarial release-only assertion: unlike `expect_output`, this does
+    /// not tolerate the Release inlining fallback. It verifies whether the
+    /// just-applied patch is observable immediately through live detours.
+    async fn expect_release_immediate_output(&mut self, name: &str, code: &str, expected: &str) {
+        if !self.release_mode {
+            return;
+        }
         match self.execute(code).await {
             Ok(output) => {
                 if output.contains(expected) {
-                    self.pass(name, format!("observed {expected}"));
+                    self.pass(name, format!("observed {expected} immediately"));
                 } else {
+                    // Surface the apply summary so a stale read is diagnosable:
+                    // whether the inline caller refresh reported inlining and
+                    // actually patched the caller, or emitted a note instead.
                     self.fail(
                         name,
-                        format!("expected '{expected}' in output, got: {output}"),
+                        format!(
+                            "Release immediate effect missing; expected '{expected}' in output, got: {}. \
+                             Last apply summary: {}",
+                            output.trim(),
+                            squash(&self.last_apply_summary),
+                        ),
                     );
                 }
             }
             Err(error) => self.fail(name, format!("snippet failed: {error}")),
+        }
+    }
+
+    // ── play-mode-born (Phenomenon 3) reflection helpers ─────────────────
+    // The fresh type lives in a __LocusHotPatch_ assembly and is invisible to
+    // snippet metadata (the snippet compiles against the original Assembly-CSharp
+    // image, which never contains it), so every access goes through reflection —
+    // the same constraint and pattern as the P47 hot-added MonoBehaviour
+    // diagnostic. They reach the type by scanning loaded assemblies for it by
+    // name, then use its static entry points (Spawn/ReadBeat) and its `Live`
+    // field; Bump() is invoked directly on the retained instance.
+
+    /// Locate `LocusSelfTestFresh` across loaded assemblies and call its static
+    /// `Spawn()`, which creates and retains one instance in the type's `Live`
+    /// slot. Returns true iff the instance was established (Beat reads its 0
+    /// default). On any gap it logs and returns false so the caller can skip the
+    /// re-edit scenarios rather than emit misleading failures.
+    async fn spawn_fresh_instance(&mut self) -> bool {
+        let snippet = r#"var t = System.AppDomain.CurrentDomain.GetAssemblies()
+    .Select(a => a.GetType("LocusSelfTestFresh", false))
+    .FirstOrDefault(x => x != null);
+if (t == null) { print("fresh_spawn=type-missing"); return null; }
+var spawn = t.GetMethod("Spawn", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static);
+if (spawn == null) { print("fresh_spawn=spawn-missing"); return null; }
+var beat = System.Convert.ToInt32(spawn.Invoke(null, null));
+print("fresh_spawn=ok:" + beat);
+return null;"#;
+        match self.execute(snippet).await {
+            Ok(output) if output.contains("fresh_spawn=ok:0") => {
+                self.pass(
+                    "P09a play-mode-born instance spawned",
+                    "retained a live instance of the play-mode-born type (Beat=0)",
+                );
+                true
+            }
+            Ok(output) => {
+                self.fail(
+                    "P09a play-mode-born instance spawned",
+                    format!("could not retain a fresh instance: {}", squash(&output)),
+                );
+                false
+            }
+            Err(error) => {
+                self.fail(
+                    "P09a play-mode-born instance spawned",
+                    format!("spawn snippet failed: {}", squash(&error)),
+                );
+                false
+            }
+        }
+    }
+
+    /// Read the RETAINED fresh instance's `Beat` (via static `ReadBeat()`) and
+    /// assert it equals `expected`. This reads the SAME pre-existing instance —
+    /// the load-bearing observation for the body-redirect case.
+    async fn expect_fresh_beat(&mut self, name: &str, expected: i64) {
+        let snippet = r#"var t = System.AppDomain.CurrentDomain.GetAssemblies()
+    .Select(a => a.GetType("LocusSelfTestFresh", false))
+    .FirstOrDefault(x => x != null);
+if (t == null) { print("fresh_beat=type-missing"); return null; }
+var read = t.GetMethod("ReadBeat", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static);
+print("fresh_beat=" + System.Convert.ToInt32(read.Invoke(null, null)));
+return null;"#;
+        let want = format!("fresh_beat={expected}");
+        match self.execute(snippet).await {
+            Ok(output) if output.lines().any(|l| l.trim() == want) => {
+                self.pass(name, format!("retained instance reports Beat={expected}"));
+            }
+            Ok(output) => self.fail(name, format!("expected '{want}', got: {}", squash(&output))),
+            Err(error) => self.fail(name, format!("beat snippet failed: {}", squash(&error))),
+        }
+    }
+
+    /// Invoke `Bump()` ONCE directly on the retained `Live` instance (read from
+    /// the static slot) and assert the returned new `Beat`. The call goes
+    /// through `MethodInfo.Invoke` on the instance method, so it always hits the
+    /// method's native entry point and observes a live detour — deliberately NOT
+    /// routed through a pre-JITed wrapper (e.g. BumpVia), which Release-mode Mono
+    /// could have inlined the call into and thereby bypassed the detour. Because
+    /// `Live` is an instance of the FIRST loaded assembly's type, a redirect
+    /// installed there takes effect, so the returned value distinguishes the new
+    /// body from the birth body.
+    async fn expect_fresh_bump(&mut self, name: &str, expected: i64) {
+        let snippet = r#"var t = System.AppDomain.CurrentDomain.GetAssemblies()
+    .Select(a => a.GetType("LocusSelfTestFresh", false))
+    .FirstOrDefault(x => x != null);
+if (t == null) { print("fresh_bump=type-missing"); return null; }
+var live = t.GetField("Live", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static).GetValue(null);
+if (live == null) { print("fresh_bump=live-missing"); return null; }
+var bump = t.GetMethod("Bump", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance);
+print("fresh_bump=" + System.Convert.ToInt32(bump.Invoke(live, null)));
+return null;"#;
+        let want = format!("fresh_bump={expected}");
+        match self.execute(snippet).await {
+            Ok(output) if output.lines().any(|l| l.trim() == want) => {
+                self.pass(name, format!("retained instance bumped to Beat={expected}"));
+            }
+            Ok(output) => self.fail(name, format!("expected '{want}', got: {}", squash(&output))),
+            Err(error) => self.fail(name, format!("bump snippet failed: {}", squash(&error))),
+        }
+    }
+
+    /// Phenomenon 3 — the play-mode-born re-edit trichotomy plus the Tier-2
+    /// additions case, asserted against a LIVE editor with a retained instance of
+    /// the play-mode-born type. Ordered so the never-redirected no-op fires BEFORE
+    /// the redirect (branch 2 in HandleCompileHotPatch requires !Redirected), then
+    /// the body redirect, then the two cold guards, then (P09f) an ADDED Unity
+    /// message driven onto the same instance. `fresh` is the file's current text
+    /// ledger; on entry the retained instance is at Beat=0 (P09a spawned it
+    /// without bumping).
+    async fn run_play_mode_born_reedit_tests(&mut self, fresh: &mut String) {
+        // P09b — UNCHANGED re-send of a never-redirected play-mode-born file →
+        // clean HOT no-op (NOT cold). The live coordinator re-ships every dirty
+        // file against its empty baseline each convergence batch, so a
+        // load_only'd file recurs unchanged; that must not drag the batch cold.
+        // The empty re-diff contributes nothing — no detour, no fresh assembly —
+        // so the retained instance is untouched and still reads Beat=0.
+        let name = "P09b unchanged re-send is a hot no-op";
+        self.log(format!("— {name}"));
+        match self
+            .apply_texts(
+                name,
+                &[(FRESH_FILE, fresh.as_str())],
+                &[(FRESH_FILE, fresh.as_str())],
+            )
+            .await
+        {
+            Some(_) => {
+                self.pass(name, "unchanged re-send stayed hot (no cold verdict)");
+                // The no-op changed nothing: the retained instance is unmoved.
+                self.expect_fresh_beat("P09b instance unchanged by no-op", 0)
+                    .await;
+            }
+            None => { /* apply_texts already recorded the failure + reverted */ }
+        }
+
+        // P09c — CORE: a BODY edit redirects onto the FIRST loaded assembly's
+        // type, so the ALREADY-SPAWNED instance updates (not just new ones).
+        // Birth Bump() did Beat += 10; the redirect rewrites the body to
+        // Beat += 7. The retained instance sits at Beat=0; invoking Bump() once
+        // on it through the detour therefore reads 7. Were the fix absent, every
+        // re-edit would re-load into a fresh assembly and this pre-existing
+        // instance would keep running its BIRTH body (+= 10 → 10); 7-vs-10 is the
+        // distinguishing observation that the existing instance runs the NEW body.
+        let name = "P09c body re-edit updates the EXISTING instance";
+        self.log(format!("— {name}"));
+        // `original` is the never-redirected text; P09e reuses it verbatim as
+        // the "revert to original AFTER a redirect" input, so keep it intact.
+        let original = fresh.clone();
+        let mut redirected = false;
+        match swap(fresh, "Beat += 10; return Beat;", "Beat += 7; return Beat;") {
+            Ok(()) => {
+                let applied = self
+                    .apply_texts(
+                        name,
+                        &[(FRESH_FILE, fresh.as_str())],
+                        &[(FRESH_FILE, original.as_str())],
+                    )
+                    .await;
+                if applied.is_some() {
+                    redirected = true;
+                    // THE load-bearing assertion: the SAME pre-existing instance
+                    // runs the redirected body. 0 (birth Beat) + 7 (new body) = 7.
+                    self.expect_fresh_bump("P09c existing instance runs the redirected body", 7)
+                        .await;
+                } else {
+                    *fresh = original.clone();
+                }
+            }
+            Err(error) => self.fail(name, error),
+        }
+
+        // The revert cold guard below only makes sense once a redirect is live
+        // (the registry flag is Redirected=true): a revert-to-the-birth body must
+        // clear the detour cold rather than pass as a stranding no-op. If the
+        // redirect did not apply, skip it — without a live detour a revert is just
+        // an unchanged no-op (hot), so asserting cold would be wrong.
+        if !redirected {
+            self.log(
+                "skipping P09e (cold guard): the P09c redirect did not apply, \
+                 so there is no live detour to guard",
+            );
+            *fresh = original;
+            return;
+        }
+        let post_redirect = fresh.clone();
+
+        // (Member REMOVAL of a play-mode-born type is now HOT — feature #1 — so the
+        // former P09d cold-removal probe was retired. P09g below exercises the
+        // hottest removal: deleting an added Unity message clears its pump driver.)
+
+        // P09e — REVERT a redirected BODY to its birth version → COLD. With a
+        // detour live (Bump redirected to += 7), reverting Bump to its birth body
+        // (+= 10) leaves the cumulative birth-diff empty, so the live-text diff is
+        // what reveals the revert; a live detour cannot be un-redirected in place,
+        // so the fix steers cold for a recompile (a load_only would falsely report
+        // "applied" while the instance keeps the redirected body). Restored to the
+        // post-redirect text so later phases see a consistent file.
+        self.expect_cold(
+            "P09e revert-after-redirect is cold",
+            FRESH_FILE,
+            &original,
+            "reverted to its birth version",
+            &post_redirect,
+        )
+        .await;
+        *fresh = post_redirect.clone();
+
+        // P09f — TIER-2: ADD a Unity message (Update) to the play-mode-born type.
+        // Tier-1 steered any addition COLD; Tier-2 keeps it HOT and wires a
+        // player_loop driver pinned to the FIRST hot-patch assembly, so the pump
+        // resolves the type THERE (its default resolver skips __LocusHotPatch_
+        // assemblies) and drives the message on the ALREADY-RETAINED instance.
+        // The added body does `Beat += 100`; after the apply the pump must grow
+        // the SAME instance's Beat each frame. Were the addition mis-pinned (or
+        // cold), the existing instance would never receive Update — the
+        // distinguishing observation. `Live` is undisturbed by the addition (the
+        // new body lives in a side shim, the type's layout is unchanged), so the
+        // pre-existing Beat (7 after P09c) is the baseline the growth starts from.
+        let name = "P09f added Unity message drives the EXISTING instance";
+        self.log(format!("— {name}"));
+        let mut with_update = post_redirect.clone();
+        match swap(
+            &mut with_update,
+            "    public int Bump() { Beat += 7; return Beat; }",
+            "    public int Bump() { Beat += 7; return Beat; }\n\n    public void Update() { Beat += 100; }",
+        ) {
+            Ok(()) => {
+                let applied = self
+                    .apply_texts(
+                        name,
+                        &[(FRESH_FILE, with_update.as_str())],
+                        &[(FRESH_FILE, post_redirect.as_str())],
+                    )
+                    .await;
+                if applied.is_some() {
+                    *fresh = with_update;
+                    // THE load-bearing assertion: the pump fires the added Update
+                    // on the retained instance, so its Beat keeps climbing.
+                    self.expect_fresh_pumped(
+                        "P09f pump drives added Update on the retained instance",
+                    )
+                    .await;
+
+                    // P09g — feature #1 / [P1] fix: REMOVE the added Update. The
+                    // pump drove it through the shim (not native dispatch), so the
+                    // only way to stop it is to CLEAR the driver. The birth-text
+                    // diff can't see Update removed (it was added AFTER birth), so
+                    // the live-text diff catches it and emits a clear-marker; the
+                    // plugin tears the driver down (replace-by-source). Were the
+                    // bug unfixed, the desktop would report "nothing to apply"
+                    // while the stale pump kept growing Beat — so the retained
+                    // instance's Beat must now STOP climbing.
+                    let name = "P09g removing the added Update clears its pump driver";
+                    self.log(format!("— {name}"));
+                    let applied_clear = self
+                        .apply_texts(
+                            name,
+                            &[(FRESH_FILE, post_redirect.as_str())],
+                            &[(FRESH_FILE, fresh.as_str())],
+                        )
+                        .await;
+                    if applied_clear.is_some() {
+                        *fresh = post_redirect.clone();
+                        self.expect_fresh_not_pumped(
+                            "P09g pump stopped after the added Update was removed",
+                        )
+                        .await;
+                    }
+                } else {
+                    *fresh = post_redirect;
+                }
+            }
+            Err(error) => self.fail(name, error),
+        }
+    }
+
+    /// Read the retained `Live` instance's `Beat`, let a few frames pass, then
+    /// read it again and assert it GREW — proving a hot-added per-frame Unity
+    /// message (Update, body `Beat += 100`) is being pumped onto this EXISTING
+    /// instance of a play-mode-born type. All through reflection (the type is
+    /// invisible to snippet metadata), with `ctx.WaitSeconds` to advance frames
+    /// (the same way the compiled-type P46 frame-driver assertions wait).
+    async fn expect_fresh_pumped(&mut self, name: &str) {
+        let snippet = r#"var t = System.AppDomain.CurrentDomain.GetAssemblies()
+    .Select(a => a.GetType("LocusSelfTestFresh", false))
+    .FirstOrDefault(x => x != null);
+if (t == null) { print("fresh_pump=type-missing"); return null; }
+var liveField = t.GetField("Live", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static);
+var live = liveField.GetValue(null);
+if (live == null) { print("fresh_pump=live-missing"); return null; }
+var beatField = t.GetField("Beat", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance);
+int before = System.Convert.ToInt32(beatField.GetValue(live));
+await ctx.WaitSeconds(0.8f);
+int after = System.Convert.ToInt32(beatField.GetValue(live));
+print(after > before ? "fresh_pump=driven" : ("fresh_pump=stalled before=" + before + " after=" + after));
+return null;"#;
+        match self.execute(snippet).await {
+            Ok(output) if output.lines().any(|l| l.trim() == "fresh_pump=driven") => {
+                self.pass(
+                    name,
+                    "retained instance's Beat advanced — added Update is pumped",
+                );
+            }
+            Ok(output) => self.fail(
+                name,
+                format!("expected 'fresh_pump=driven', got: {}", squash(&output)),
+            ),
+            Err(error) => self.fail(name, format!("pump snippet failed: {}", squash(&error))),
+        }
+    }
+
+    /// The inverse of `expect_fresh_pumped`: read the retained instance's `Beat`,
+    /// let a few frames pass, and assert it did NOT grow —
+    /// proving a previously hot-added Unity message (Update) STOPPED being pumped
+    /// after the re-edit removed it (the clear-marker tore the driver down). Two
+    /// idle reads with `WaitSeconds` between, exactly mirroring the pumped probe.
+    async fn expect_fresh_not_pumped(&mut self, name: &str) {
+        let snippet = r#"var t = System.AppDomain.CurrentDomain.GetAssemblies()
+    .Select(a => a.GetType("LocusSelfTestFresh", false))
+    .FirstOrDefault(x => x != null);
+if (t == null) { print("fresh_pump=type-missing"); return null; }
+var liveField = t.GetField("Live", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static);
+var live = liveField.GetValue(null);
+if (live == null) { print("fresh_pump=live-missing"); return null; }
+var beatField = t.GetField("Beat", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance);
+int before = System.Convert.ToInt32(beatField.GetValue(live));
+await ctx.WaitSeconds(0.8f);
+int after = System.Convert.ToInt32(beatField.GetValue(live));
+print(after == before ? "fresh_pump=stopped" : ("fresh_pump=still-growing before=" + before + " after=" + after));
+return null;"#;
+        match self.execute(snippet).await {
+            Ok(output) if output.lines().any(|l| l.trim() == "fresh_pump=stopped") => {
+                self.pass(
+                    name,
+                    "retained instance's Beat held steady — the cleared Update is no longer pumped",
+                );
+            }
+            Ok(output) => self.fail(
+                name,
+                format!("expected 'fresh_pump=stopped', got: {}", squash(&output)),
+            ),
+            Err(error) => self.fail(
+                name,
+                format!("pump-stop snippet failed: {}", squash(&error)),
+            ),
         }
     }
 
@@ -576,8 +2031,10 @@ impl SelfTest {
                 return None;
             }
         }
+        self.last_apply_inlined = false;
         match self.hot_reload(None).await {
             Ok(summary) if summary.contains("Hot reload not applicable") => {
+                self.last_apply_summary = summary.clone();
                 self.fail(
                     name,
                     format!("unexpected cold verdict: {}", squash(&summary)),
@@ -585,7 +2042,14 @@ impl SelfTest {
                 self.revert_files(reverts).await;
                 None
             }
-            Ok(summary) => Some(summary),
+            Ok(summary) => {
+                // Release-first: remember whether Unity inlined any method in
+                // this batch so the following behavioral assert can tolerate it,
+                // and keep the full summary for failure diagnostics.
+                self.last_apply_inlined = summary.contains("inlined in Release");
+                self.last_apply_summary = summary.clone();
+                Some(summary)
+            }
             Err(error) => {
                 self.fail(name, squash(&error));
                 self.revert_files(reverts).await;
@@ -685,6 +2149,10 @@ impl SelfTest {
     async fn initialize_corpus(&mut self) -> Result<(), String> {
         self.log("Phase 1/7 — initializing the test corpus (edit mode)");
 
+        let dir = self.absolute(TEST_DIR);
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        let _ = tokio::fs::remove_file(self.absolute(&format!("{TEST_DIR}.meta"))).await;
+
         // Inside an edit session the imports queue instead of firing one by
         // one; the recompile below releases the session, flushes the queue
         // and compiles in a single deterministic pass.
@@ -697,6 +2165,7 @@ impl SelfTest {
         }
 
         self.write_tracked(SUBJECT_FILE, SUBJECT_BASELINE).await?;
+        self.write_tracked(MESSAGE_FILE, MESSAGE_BASELINE).await?;
         self.write_tracked(HELPER_FILE, HELPER_BASELINE).await?;
         self.write_tracked(MODE_FILE, MODE_BASELINE).await?;
         self.write_tracked(STRUCT_FILE, STRUCT_BASELINE).await?;
@@ -708,6 +2177,55 @@ impl SelfTest {
             .await?;
         self.write_tracked(PARTIAL_B_FILE, PARTIAL_B_BASELINE)
             .await?;
+        // Extra cold-classification corpus for the negative phase. RECORD_FILE
+        // is intentionally NOT written here — its test creates it fresh so the
+        // record syntax never reaches a real compile.
+        self.write_tracked(COLD_FILE, COLD_BASELINE).await?;
+        self.write_tracked(USE_CONST_FILE, USE_CONST_BASELINE)
+            .await?;
+        self.write_tracked(USE_STATIC_FILE, USE_STATIC_BASELINE)
+            .await?;
+        self.write_tracked(USE_GENERIC_FILE, USE_GENERIC_BASELINE)
+            .await?;
+        self.write_tracked(USE_EXPLICIT_FILE, USE_EXPLICIT_BASELINE)
+            .await?;
+        self.write_tracked(USE_FINALIZER_FILE, USE_FINALIZER_BASELINE)
+            .await?;
+        self.write_tracked(PARTIAL_COLD_FILE, PARTIAL_COLD_BASELINE)
+            .await?;
+        self.write_tracked(PARTIAL_COUNT_FILE, PARTIAL_COUNT_BASELINE)
+            .await?;
+        // Adversarial syntax edge cases (A1–A4).
+        self.write_tracked(ADVERSARIAL_FILE, ADVERSARIAL_BASELINE)
+            .await?;
+        self.write_tracked(INLINE_CALLEE_FILE, INLINE_CALLEE_BASELINE)
+            .await?;
+        self.write_tracked(INLINE_CALLER_DIRECT_FILE, INLINE_CALLER_DIRECT_BASELINE)
+            .await?;
+        self.write_tracked(INLINE_CALLER_NESTED_FILE, INLINE_CALLER_NESTED_BASELINE)
+            .await?;
+        self.write_tracked(INLINE_CALLER_OVERLOAD_FILE, INLINE_CALLER_OVERLOAD_BASELINE)
+            .await?;
+        self.write_tracked(INLINE_CALLER_LAMBDA_FILE, INLINE_CALLER_LAMBDA_BASELINE)
+            .await?;
+        self.write_tracked(INLINE_CALLER_BRANCH_FILE, INLINE_CALLER_BRANCH_BASELINE)
+            .await?;
+        self.write_tracked(INLINE_CALLER_ARRAY_FILE, INLINE_CALLER_ARRAY_BASELINE)
+            .await?;
+        // Multi-file inline caller-refresh probes (R12–R14). The lib-side file
+        // (LIB_INLINE_FILE) is written with the other Lib/ source below.
+        self.write_tracked(INLINE_CHAIN_LEAF_FILE, INLINE_CHAIN_LEAF_BASELINE)
+            .await?;
+        self.write_tracked(INLINE_CHAIN_MID_FILE, INLINE_CHAIN_MID_BASELINE)
+            .await?;
+        self.write_tracked(INLINE_CHAIN_TOP_FILE, INLINE_CHAIN_TOP_BASELINE)
+            .await?;
+        self.write_tracked(LIB_INLINE_CALLER_FILE, LIB_INLINE_CALLER_BASELINE)
+            .await?;
+        self.write_tracked(INST_INLINEE_FILE, INST_INLINEE_BASELINE)
+            .await?;
+        self.write_tracked(INST_INLINE_CALLER_FILE, INST_INLINE_CALLER_BASELINE)
+            .await?;
         // Editor/ folder → Assembly-CSharp-Editor: edit-mode hot reload of
         // editor tooling is its own phase.
         self.write_tracked(EDITOR_FILE, EDITOR_BASELINE).await?;
@@ -718,6 +2236,8 @@ impl SelfTest {
         self.write_tracked(LIB_ASMDEF_FILE, LIB_ASMDEF_BASELINE)
             .await?;
         self.write_tracked(LIB_FILE, LIB_BASELINE).await?;
+        self.write_tracked(LIB_INLINE_FILE, LIB_INLINE_BASELINE)
+            .await?;
 
         // The corpus was written behind Unity's back: the AssetDatabase must
         // import it or the compile would not include the new files at all
@@ -730,7 +2250,16 @@ impl SelfTest {
         imports.extend(
             ALL_FILES
                 .iter()
-                .filter(|relative| **relative != FRESH_FILE) // created later, mid-play
+                .filter(|relative| {
+                    // Created later, mid-play, so their baselines are empty and
+                    // the sidecar sees the full file as hot-added surface.
+                    // RECORD_FILE is created fresh in its own negative test and
+                    // never baseline-compiled (record syntax would otherwise
+                    // need a C# 9 editor just to import the corpus).
+                    **relative != FRESH_FILE
+                        && **relative != HOT_ADDED_BEHAVIOUR_FILE
+                        && **relative != RECORD_FILE
+                })
                 .map(|relative| relative.to_string()),
         );
         crate::unity_bridge::import_assets(&self.project, &imports)
@@ -807,6 +2336,10 @@ impl SelfTest {
                         format!("unexpected cold verdict: {}", squash(&summary)),
                     );
                 }
+                // STRICT: assert the editor method is live immediately even in
+                // Release (its detour holds at non-inlined sites and the refresh
+                // un-inlines any caller). On success editor_patch_live → E02 asserts
+                // the carry-over; a stale read fails loudly instead of being skipped.
                 Ok(_) => match self
                     .execute("return LocusSelfTestEditorTool.Reading();")
                     .await
@@ -828,6 +2361,39 @@ impl SelfTest {
             self.log("  editor patch held live across the play transition (B5 — E02 asserts, then reverts)");
         } else if let Err(error) = self.write_tracked(EDITOR_FILE, EDITOR_BASELINE).await {
             self.log(format!("  editor corpus revert failed: {error}"));
+        }
+    }
+
+    async fn probe_message_driver_capabilities(&mut self) {
+        let snippet = "bool HasUnityType(string fullName)\n\
+                       {\n\
+                           return System.AppDomain.CurrentDomain.GetAssemblies()\n\
+                               .Any(a => a.GetType(fullName, false) != null);\n\
+                       }\n\
+                       var physics3d = HasUnityType(\"UnityEngine.Collider\")\n\
+                           && HasUnityType(\"UnityEngine.Collision\")\n\
+                           && HasUnityType(\"UnityEngine.BoxCollider\");\n\
+                       var physics2d = HasUnityType(\"UnityEngine.Collider2D\")\n\
+                           && HasUnityType(\"UnityEngine.Collision2D\")\n\
+                           && HasUnityType(\"UnityEngine.BoxCollider2D\");\n\
+                       return \"physics3d=\" + (physics3d ? \"true\" : \"false\")\n\
+                           + \" physics2d=\" + (physics2d ? \"true\" : \"false\");";
+        match self.execute(snippet).await {
+            Ok(output) => {
+                let lower = output.to_ascii_lowercase();
+                self.message_driver_capabilities = MessageDriverCapabilities {
+                    physics3d: lower.contains("physics3d=true"),
+                    physics2d: lower.contains("physics2d=true"),
+                };
+                self.log(format!(
+                    "Unity message proxy modules: {}",
+                    self.message_driver_capabilities.label()
+                ));
+            }
+            Err(error) => {
+                self.message_driver_capabilities = MessageDriverCapabilities::default();
+                self.fail("message driver capability probe", error);
+            }
         }
     }
 
@@ -873,14 +2439,15 @@ impl SelfTest {
         // The play transition settles behind the status flip (classic mode:
         // the play-mode domain reload; no-reload mode: scene setup only).
         tokio::time::sleep(Duration::from_secs(2)).await;
-
-        self.execute(
-            "var go = new UnityEngine.GameObject(\"LocusHotReloadSelfTest\");\n\
-             go.AddComponent<LocusSelfTestSubject>();\n\
-             return \"spawned\";",
+        self.wait_for_semantic_unity_api_ready(
+            "play-mode transition",
+            UNITY_SEMANTIC_READY_TIMEOUT,
         )
-        .await
-        .map_err(|e| format!("spawning the test component failed: {e}"))?;
+        .await?;
+
+        self.execute(&spawn_test_objects_code(self.message_driver_capabilities))
+            .await
+            .map_err(|e| format!("spawning the test component failed: {e}"))?;
         tokio::time::sleep(Duration::from_millis(300)).await;
         self.log("Test component is live in play mode.");
 
@@ -915,9 +2482,9 @@ impl SelfTest {
                     "8118",
                 )
                 .await;
+                let active = coordinator::project_active_patches(&self.project).await;
                 self.log(format!(
-                    "  coordinator continuity: {} active patch(es) carried across play-enter ({})",
-                    super::counters().active_patches,
+                    "  coordinator continuity: {active} active patch(es) carried across play-enter ({})",
                     if self.domain_reload_on_play == Some(false) {
                         "domain reload disabled"
                     } else {
@@ -986,6 +2553,12 @@ impl SelfTest {
                 "4221",
             )
             .await;
+            self.expect_release_immediate_output(
+                "R01 release strict method body edit",
+                "return LocusSelfTestSubject.Instance.Mult();",
+                "4221",
+            )
+            .await;
         }
 
         // P01b — Unity message BODY edit (the engine drives the detoured
@@ -1008,6 +2581,12 @@ impl SelfTest {
                 "beating",
             )
             .await;
+            self.expect_release_immediate_output(
+                "R02 release strict Unity message body edit",
+                "return LocusSelfTestSubject.UpdateBeats > 0 ? \"beating\" : \"still\";",
+                "beating",
+            )
+            .await;
         }
 
         // P02 — async↔sync conversion.
@@ -1024,6 +2603,12 @@ impl SelfTest {
         {
             self.expect_output(
                 "P02 async<->sync conversion",
+                "return await LocusSelfTestSubject.Instance.Pulse();",
+                "2002",
+            )
+            .await;
+            self.expect_release_immediate_output(
+                "R03 release strict async conversion",
                 "return await LocusSelfTestSubject.Instance.Pulse();",
                 "2002",
             )
@@ -1066,6 +2651,12 @@ impl SelfTest {
             .is_some()
         {
             self.expect_output("P03 added methods (shim chain)", "return LocusSelfTestSubject.Instance.Probe();", "7707").await;
+            self.expect_release_immediate_output(
+                "R04 release strict added shim chain",
+                "return LocusSelfTestSubject.Instance.Probe();",
+                "7707",
+            )
+            .await;
         }
 
         // P04 — parameter-list change with the call site OUTSIDE the batch:
@@ -1319,21 +2910,39 @@ impl SelfTest {
 
         // P09 — brand-new file with a brand-new type (TI-C visibility),
         // observed through Probe (the type is invisible to snippets).
+        //
+        // The fresh file is authored ENTIRELY during play mode (this is the
+        // play-mode-born shape: it was filtered OUT of the baseline import in
+        // initialize_corpus, so its coordinator baseline is empty and it loads
+        // as a fresh type into a __LocusHotPatch_ assembly, engine: load_only).
+        // It is a MonoBehaviour carrying observable INSTANCE state (`Beat` +
+        // Bump()) plus a retained `Live` instance, so the re-edit scenarios
+        // below (P09b–P09f) can prove the Phenomenon-3 fix: a later BODY edit
+        // redirects onto the FIRST loaded assembly's type, updating the
+        // already-spawned instance — not just newly created ones; and (Tier-2)
+        // an ADDED Unity message drives that same instance via a pinned pump.
+        // `fresh` is an owned ledger (like `subject`) so the re-edits mutate it
+        // incrementally.
+        // The static Ping() is kept for P09's original through-Probe assertion.
         let name = "P09 new file with new type";
         self.log(format!("— {name}"));
         let subject_snapshot = subject.clone();
-        let fresh = "public static class LocusSelfTestFresh { public static int Ping() { return 4242; } }\n";
+        let mut fresh = FRESH_BASELINE.to_string();
         let p09 = swap_line(
             subject,
             "    public int Probe()",
             "    public int Probe() { return LocusSelfTestFresh.Ping(); }",
         );
+        let mut fresh_live = false;
         match p09 {
             Ok(()) => {
                 let applied = self
                     .apply_texts(
                         name,
-                        &[(FRESH_FILE, fresh), (SUBJECT_FILE, subject.as_str())],
+                        &[
+                            (FRESH_FILE, fresh.as_str()),
+                            (SUBJECT_FILE, subject.as_str()),
+                        ],
                         // Reverting a brand-new file means an empty stand-in;
                         // the deletion pass would tombstone it anyway, so
                         // keep the file with a harmless body on failure.
@@ -1347,11 +2956,51 @@ impl SelfTest {
                         "4242",
                     )
                     .await;
+                    // Spawn and RETAIN one instance of the play-mode-born type
+                    // (held in its own static `Live` slot), so the body-redirect
+                    // scenario can read the SAME pre-existing instance after a
+                    // later edit. The type is invisible to snippet metadata
+                    // (never in the baseline assembly), so everything goes
+                    // through reflection — the P47 pattern. Spawn() does not
+                    // bump, so the retained instance starts at Beat=0; P09c later
+                    // runs exactly one Bump() on it through the redirected body.
+                    fresh_live = self.spawn_fresh_instance().await;
+                    if fresh_live {
+                        self.expect_fresh_beat("P09a play-mode-born instance retained", 0)
+                            .await;
+                    }
                 } else {
                     *subject = subject_snapshot;
                 }
             }
             Err(error) => self.fail(name, error),
+        }
+
+        // ── Phenomenon 3 — play-mode-born re-edit trichotomy + Tier-2 (P09b–P09f) ──
+        // A file authored entirely in play mode loads once as a fresh type.
+        // Re-editing it routes: body change → redirect (P09c), unchanged → no-op
+        // (P09b), structural removal/revert → cold (P09d/e), and (Tier-2)
+        // additions → hot via the M2/M4/driver machinery pinned to the first
+        // assembly (P09f adds a Unity message). Unit tests live in
+        // HotPatchTests.PlayModeBornReeditTests, multi-batch convergence in
+        // SelfTestReplayTests. These LIVE cases assert the distinguishing RUNTIME
+        // behavior the unit tests cannot: an EXISTING instance's observable state
+        // changes after a body re-edit, and after an added Unity message.
+        //
+        // ⚠ self-test pending (实机待跑): authored against the live harness and
+        // cargo-check-clean, but not yet executed on real hardware. The shapes
+        // mirror P09 (which is exercised), P47 (reflection on a play-mode-born
+        // MonoBehaviour) and P46 (frame-driver pump observation), so they are
+        // expected to pass; flag any failure here as a real regression in the
+        // Phenomenon-3 / Tier-2 routing rather than harness drift. Run via
+        // Settings > Code Analysis against a connected editor in play mode.
+        if fresh_live {
+            self.run_play_mode_born_reedit_tests(&mut fresh).await;
+        } else {
+            self.log(
+                "skipping P09b–P09f (play-mode-born re-edit trichotomy + Tier-2): \
+                 the retained fresh instance could not be established",
+            );
         }
 
         // P10 — property getter body edit.
@@ -2713,6 +4362,72 @@ impl SelfTest {
                 "6103", // LibBody(6100) + 3, read through the Assembly-CSharp caller
             )
             .await;
+            // R05 — Release-strict, cross-asmdef INSTANCE callee. LibBody is an
+            // instance method Mono inlines into LibRelay in Release; the inline
+            // caller refresh re-emits its changed body as a static self-shim
+            // (Option A) and rewrites LibRelay's
+            // `new LocusSelfTestLibType().LibBody()` to call that shim, so the
+            // refreshed caller observes the new body immediately even across the
+            // assembly boundary (callee+caller compile into one patch assembly).
+            // This strict probe is the suite-level gate for the instance arm.
+            //
+            // On failure it LOCALIZES the staleness instead of just printing the
+            // value: it reads LibBody() directly and dumps the P41 apply summary,
+            // so a stale LibRelay can be pinned to one of:
+            //   • callee detour live (LibBody direct == 6100) but LibRelay's
+            //     inlined call site was not refreshed → the refresh didn't patch
+            //     the caller (summary shows a note, not "Inline caller refresh
+            //     patched … LocusSelfTestSubject.cs"); or
+            //   • callee detour itself not in effect (LibBody direct == 5).
+            let name = "R05 release strict cross-asmdef body edit";
+            if self.release_mode {
+                // Surface the P41 inline-refresh segment UNtruncated on EVERY run
+                // (pass or fail): R05 is flaky even under confirmed Release, so
+                // capturing what the refresh did on a PASSING run lets us diff it
+                // against a failing run — did it patch LibRelay (methods>0, names
+                // LocusSelfTestSubject.cs) or bail with a note / methods==0? The
+                // dotnet repro proves the compile-level redirect is correct
+                // cross-asmdef, so a live miss is caller discovery/force-detour or
+                // a stale caller-index cache, not IL generation.
+                let refresh_tail = self
+                    .last_apply_summary
+                    .find("Inline caller refresh")
+                    .map(|idx| self.last_apply_summary[idx..].trim().to_string())
+                    .unwrap_or_else(|| {
+                        "<no 'Inline caller refresh' segment in summary>".to_string()
+                    });
+                self.log(format!(
+                    "  R05 P41 inline-refresh segment: [{refresh_tail}]"
+                ));
+                match self
+                    .execute("return LocusSelfTestSubject.Instance.LibRelay();")
+                    .await
+                {
+                    Ok(ref output) if output.contains("6103") => {
+                        self.pass(name, "observed 6103 immediately");
+                    }
+                    Ok(output) => {
+                        let lib_direct = self
+                            .execute("return new LocusSelfTestLibType().LibBody();")
+                            .await
+                            .unwrap_or_else(|error| format!("<error: {error}>"));
+                        self.fail(
+                            name,
+                            format!(
+                                "Release immediate effect missing; expected '6103' through LibRelay, got: {}. \
+                                 LibBody() direct = {} (6100 ⇒ callee detour live, LibRelay's inlined call site was \
+                                 NOT refreshed; 5 ⇒ callee detour not in effect). Inline-refresh segment: [{}]. \
+                                 Full P41 apply summary: {}",
+                                output.trim(),
+                                lib_direct.trim(),
+                                refresh_tail,
+                                squash(&self.last_apply_summary),
+                            ),
+                        );
+                    }
+                    Err(error) => self.fail(name, format!("snippet failed: {error}")),
+                }
+            }
         }
 
         // P42 — lib method SIGNATURE change with the caller in ANOTHER
@@ -2993,6 +4708,56 @@ impl SelfTest {
             }
         }
 
+        // P48 — retyping an instance field decomposes into remove(placeholder)
+        // + add(store): the old int slot is parked and a fresh long field is
+        // virtualized, so the already-live instance reads the new field's
+        // default (the documented value-loss on a hot retype).
+        if self
+            .step_file("P48 instance field retype", SUBJECT_FILE, subject, |s| {
+                swap(
+                    s,
+                    "    private int _flux = 5;",
+                    "    private long _flux = 5;",
+                )?;
+                swap(
+                    s,
+                    "public int Flux() { return _flux; }",
+                    "public int Flux() { return (int)(_flux + 9990); }",
+                )
+            })
+            .await
+            .is_some()
+        {
+            self.expect_output(
+                "P48 instance field retype",
+                "return LocusSelfTestSubject.Instance.Flux();",
+                "9990", // live instance: the freshly-virtualized long field defaults to 0
+            )
+            .await;
+        }
+
+        // P49 — a newly added const is inlined into the patch; a same-batch
+        // reader resolves it immediately (no pre-existing call site referenced
+        // it, so nothing stale survives).
+        if self
+            .step_file("P49 added const inlined", SUBJECT_FILE, subject, |s| {
+                swap(
+                    s,
+                    "    public int Spark() { return 0; }",
+                    "    private const int SparkK = 88;\n    public int Spark() { return SparkK; }",
+                )
+            })
+            .await
+            .is_some()
+        {
+            self.expect_output(
+                "P49 added const inlined",
+                "return LocusSelfTestSubject.Instance.Spark();",
+                "88",
+            )
+            .await;
+        }
+
         // Hand the per-file ledgers to the negative phase: it restores files
         // to exactly these texts after each cold probe.
         self.negative_ledgers = NegativeLedgers {
@@ -3001,6 +4766,1060 @@ impl SelfTest {
             iface_text: iface_ledger,
             partial_a_text: partial_a_ledger,
         };
+    }
+
+    async fn run_message_driver_tests(&mut self, messages: &mut String) {
+        self.log("Phase 4b — hot-added Unity message drivers");
+
+        self.expect_output(
+            "P46 baseline message corpus",
+            "return LocusSelfTestMessages.Instance != null && LocusSelfTestMessages.Instance.Marker() == 1 ? \"messages-ready\" : \"messages-missing\";",
+            "messages-ready",
+        )
+        .await;
+
+        // P46a — add the three parameterless per-frame messages after the type is
+        // already loaded. Unity will not discover them natively; Locus must drive
+        // them through its PlayerLoop driver.
+        let frame_name = "P46a added Update/LateUpdate/FixedUpdate";
+        if self
+            .step_file(frame_name, MESSAGE_FILE, messages, |s| {
+                swap(
+                    s,
+                    "    public int Marker() { return 1; }\n",
+                    "    public int Marker() { return 1; }\n\n    void Update() { UpdateCount += 1; }\n    void LateUpdate() { LateUpdateCount += 1; }\n    void FixedUpdate() { FixedUpdateCount += 1; }\n",
+                )
+            })
+            .await
+            .is_some()
+        {
+            self.expect_output(
+                frame_name,
+                "LocusSelfTestMessages.ResetFrameCounters();\n\
+                 await ctx.WaitSeconds(0.8f);\n\
+                 return LocusSelfTestMessages.UpdateCount > 0 && LocusSelfTestMessages.LateUpdateCount > 0 && LocusSelfTestMessages.FixedUpdateCount > 0\n\
+                     ? \"frame-drivers-ok\" : (\"frame-drivers-missing u=\" + LocusSelfTestMessages.UpdateCount + \" l=\" + LocusSelfTestMessages.LateUpdateCount + \" f=\" + LocusSelfTestMessages.FixedUpdateCount);",
+                "frame-drivers-ok",
+            )
+            .await;
+        }
+
+        let caps = self.message_driver_capabilities;
+        if caps.has_physics_proxy() {
+            // P46b — add physics/trigger message methods in a later patch to the
+            // SAME source file. This verifies component-proxy dispatch and also
+            // catches replace-by-source bugs where adding proxy drivers accidentally
+            // drops the earlier PlayerLoop drivers from the same file.
+            let proxy_name = "P46b added physics/trigger message proxy";
+            if self
+                .step_file(proxy_name, MESSAGE_FILE, messages, |s| {
+                    let replacement = format!(
+                        "    public int Marker() {{ return 1; }}\n\n{}",
+                        initial_proxy_methods(caps)
+                    );
+                    swap(s, "    public int Marker() { return 1; }\n", &replacement)
+                })
+                .await
+                .is_some()
+            {
+                if caps.physics3d {
+                    self.expect_output(
+                        "P46b 3D physics/trigger message proxy",
+                        physics3d_proxy_initial_assertion(),
+                        "proxy-3d-ok",
+                    )
+                    .await;
+                }
+                if caps.physics2d {
+                    self.expect_output(
+                        "P46b 2D physics/trigger message proxy",
+                        physics2d_proxy_initial_assertion(),
+                        "proxy-2d-ok",
+                    )
+                    .await;
+                }
+
+                // P46c/P46d — edit the same component-proxy message repeatedly.
+                // The proxy registration must bind to the newest shim exactly once,
+                // while unrelated proxy messages from the same source file stay live.
+                let proxy_reedit_name = "P46c repeated component-proxy edit replaces prior shim";
+                if self
+                    .step_file(proxy_reedit_name, MESSAGE_FILE, messages, |s| {
+                        if caps.physics3d {
+                            swap_line(
+                                s,
+                                "    void OnTriggerEnter(Collider other)",
+                                "    void OnTriggerEnter(Collider other) { Trigger3D += other != null ? 30 : 3; TriggerStay3D += 3000; }",
+                            )?;
+                        }
+                        if caps.physics2d {
+                            swap_line(
+                                s,
+                                "    void OnTriggerEnter2D(Collider2D other)",
+                                "    void OnTriggerEnter2D(Collider2D other) { Trigger2D += other != null ? 40 : 4; TriggerStay2D += 4000; }",
+                            )?;
+                        }
+                        Ok(())
+                    })
+                    .await
+                    .is_some()
+                {
+                    if caps.physics3d {
+                        self.expect_output(
+                            "P46c 3D repeated component-proxy edit replaces prior shim",
+                            physics3d_proxy_reedit_assertion(),
+                            "proxy-3d-reedit-ok",
+                        )
+                        .await;
+                    }
+                    if caps.physics2d {
+                        self.expect_output(
+                            "P46c 2D repeated component-proxy edit replaces prior shim",
+                            physics2d_proxy_reedit_assertion(),
+                            "proxy-2d-reedit-ok",
+                        )
+                        .await;
+                    }
+
+                    let proxy_second_reedit_name =
+                        "P46d second component-proxy edit remains single-bound";
+                    if self
+                        .step_file(proxy_second_reedit_name, MESSAGE_FILE, messages, |s| {
+                            if caps.physics3d {
+                                swap_line(
+                                    s,
+                                    "    void OnTriggerEnter(Collider other)",
+                                    "    void OnTriggerEnter(Collider other) { Trigger3D += other != null ? 50 : 5; TriggerExit3D += 5000; }",
+                                )?;
+                            }
+                            if caps.physics2d {
+                                swap_line(
+                                    s,
+                                    "    void OnTriggerEnter2D(Collider2D other)",
+                                    "    void OnTriggerEnter2D(Collider2D other) { Trigger2D += other != null ? 60 : 6; TriggerExit2D += 6000; }",
+                                )?;
+                            }
+                            Ok(())
+                        })
+                        .await
+                        .is_some()
+                    {
+                        if caps.physics3d {
+                            self.expect_output(
+                                "P46d 3D second component-proxy edit remains single-bound",
+                                physics3d_proxy_second_reedit_assertion(),
+                                "proxy-3d-second-reedit-ok",
+                            )
+                            .await;
+                        }
+                        if caps.physics2d {
+                            self.expect_output(
+                                "P46d 2D second component-proxy edit remains single-bound",
+                                physics2d_proxy_second_reedit_assertion(),
+                                "proxy-2d-second-reedit-ok",
+                            )
+                            .await;
+                        }
+                    }
+                }
+
+                self.expect_output(
+                    "P46e message drivers survive same-file proxy patch",
+                    "var before = LocusSelfTestMessages.FrameTotal();\n\
+                     await ctx.WaitSeconds(0.5f);\n\
+                     return LocusSelfTestMessages.FrameTotal() > before ? \"frame-drivers-still-live\" : \"frame-drivers-dropped\";",
+                    "frame-drivers-still-live",
+                )
+                .await;
+            }
+        } else {
+            self.log(
+                "  skipping physics/trigger proxy message tests; no 3D/2D physics module detected",
+            );
+        }
+
+        self.expect_output(
+            "P46f frame message drivers honor component enabled",
+            "var foundTargets = UnityEngine.Object.FindObjectsOfType(typeof(LocusSelfTestMessages), true);\n\
+             var targets = new System.Collections.Generic.List<LocusSelfTestMessages>();\n\
+             foreach (var foundTarget in foundTargets)\n\
+             {\n\
+                 var target = foundTarget as LocusSelfTestMessages;\n\
+                 if (target != null) targets.Add(target);\n\
+             }\n\
+             if (targets.Count == 0) return \"enabled-gate-missing-instance\";\n\
+             var before = LocusSelfTestMessages.FrameTotal();\n\
+             foreach (var target in targets) target.enabled = false;\n\
+             await ctx.WaitSeconds(0.35f);\n\
+             var disabled = LocusSelfTestMessages.FrameTotal();\n\
+             foreach (var target in targets) target.enabled = true;\n\
+             await ctx.WaitSeconds(0.35f);\n\
+             return disabled == before && LocusSelfTestMessages.FrameTotal() > disabled ? \"enabled-gate-ok\" : (\"enabled-gate-leaked before=\" + before + \" disabled=\" + disabled + \" after=\" + LocusSelfTestMessages.FrameTotal());",
+            "enabled-gate-ok",
+        )
+        .await;
+
+        // P46g — add lifecycle messages whose native timing already passed for
+        // this loaded component type. Locus should run each catch-up shim once on
+        // the existing live instance.
+        let lifecycle_name = "P46g added Awake/Start/OnValidate catch-up";
+        match self
+            .execute("LocusSelfTestLifecycleMessages.ResetLifecycleCounters(); return \"lifecycle-reset\";")
+            .await
+        {
+            Ok(output) if output.contains("lifecycle-reset") => {}
+            Ok(output) => self.fail(
+                lifecycle_name,
+                format!("counter reset returned unexpected output: {}", output.trim()),
+            ),
+            Err(error) => self.fail(lifecycle_name, format!("counter reset failed: {error}")),
+        }
+        if self
+            .step_file(lifecycle_name, MESSAGE_FILE, messages, |s| {
+                swap(
+                    s,
+                    "    public int Marker() { return 2; }\n",
+                    "    public int Marker() { return 2; }\n\n    void Awake() { AwakeCatchUp += 1; }\n    void Start() { StartCatchUp += 1; }\n    void OnValidate() { ValidateCatchUp += 1; }\n",
+                )
+            })
+            .await
+            .is_some()
+        {
+            self.expect_output(
+                lifecycle_name,
+                "return LocusSelfTestLifecycleMessages.AwakeCatchUp == 1 && LocusSelfTestLifecycleMessages.StartCatchUp == 1 && LocusSelfTestLifecycleMessages.ValidateCatchUp == 1\n\
+                     ? \"lifecycle-catchup-ok\" : (\"lifecycle-catchup-mismatch awake=\" + LocusSelfTestLifecycleMessages.AwakeCatchUp + \" start=\" + LocusSelfTestLifecycleMessages.StartCatchUp + \" validate=\" + LocusSelfTestLifecycleMessages.ValidateCatchUp);",
+                "lifecycle-catchup-ok",
+            )
+            .await;
+        }
+
+        // P46h — non-physics component proxies: parameterless mouse, int-argument
+        // animator IK, and lifecycle OnDestroy all forward through the proxy hub.
+        let utility_proxy_name = "P46h added non-physics message proxies";
+        if self
+            .step_file(utility_proxy_name, MESSAGE_FILE, messages, |s| {
+                swap(
+                    s,
+                    "    public static int UtilityProxyTotal() { return MouseDownCount + AnimatorIkLayer + DestroyCount; }\n",
+                    "    public static int UtilityProxyTotal() { return MouseDownCount + AnimatorIkLayer + DestroyCount; }\n\n    void OnMouseDown() { MouseDownCount += 1; }\n    void OnAnimatorIK(int layer) { AnimatorIkLayer = layer; }\n    void OnDestroy() { DestroyCount += 1; }\n",
+                )
+            })
+            .await
+            .is_some()
+        {
+            self.expect_output(utility_proxy_name, utility_proxy_assertion(), "utility-proxy-ok")
+                .await;
+        }
+    }
+
+    async fn run_hot_added_mono_behaviour_diagnostic(&mut self) {
+        self.log("Phase 4c — hot-added MonoBehaviour AddComponent diagnostic");
+
+        let name = "P47 hot-added MonoBehaviour AddComponent(Type)";
+        self.log(format!("— {name}"));
+        let source = r#"using UnityEngine;
+
+public class LocusSelfTestHotAddedBehaviour : MonoBehaviour
+{
+    public static int AwakeCount;
+    public static int EnableCount;
+    public static int UpdateCount;
+    public static string LastObjectName = "";
+
+    public int marker = 4701;
+
+    public static void ResetCounters()
+    {
+        AwakeCount = 0;
+        EnableCount = 0;
+        UpdateCount = 0;
+        LastObjectName = "";
+    }
+
+    void Awake()
+    {
+        AwakeCount += 1;
+        LastObjectName = gameObject.name;
+    }
+
+    void OnEnable()
+    {
+        EnableCount += 1;
+    }
+
+    void Update()
+    {
+        UpdateCount += 1;
+    }
+
+    public int Marker()
+    {
+        return marker;
+    }
+}
+"#;
+
+        let Some(summary) = self
+            .apply_texts(name, &[(HOT_ADDED_BEHAVIOUR_FILE, source)], &[])
+            .await
+        else {
+            return;
+        };
+        if summary.contains("new type") {
+            self.pass(
+                name,
+                format!(
+                    "hot patch loaded the new MonoBehaviour type ({})",
+                    squash(&summary)
+                ),
+            );
+        } else {
+            self.fail(
+                name,
+                format!(
+                    "hot patch did not report a loaded new type; summary: {}",
+                    squash(&summary)
+                ),
+            );
+        }
+
+        match self
+            .execute("return typeof(LocusSelfTestHotAddedBehaviour).FullName;")
+            .await
+        {
+            Ok(output) => self.pass(
+                "P47a unity_execute compile-scope diagnostic",
+                format!("strong type reference compiled: {}", squash(&output)),
+            ),
+            Err(error)
+                if error.contains("CS0246")
+                    || error.contains("could not be found")
+                    || error.contains("compilation") =>
+            {
+                self.pass(
+                    "P47a unity_execute compile-scope diagnostic",
+                    format!(
+                        "strong type reference is outside the snippet compile references: {}",
+                        squash(&error)
+                    ),
+                );
+            }
+            Err(error) => self.fail(
+                "P47a unity_execute compile-scope diagnostic",
+                format!("unexpected execute failure: {}", squash(&error)),
+            ),
+        }
+
+        let diagnostic = r#"var typeName = "LocusSelfTestHotAddedBehaviour";
+var assemblies = System.AppDomain.CurrentDomain.GetAssemblies();
+var hotAssemblies = assemblies
+    .Where(a => a.GetName().Name.StartsWith("__LocusHotPatch_"))
+    .Select(a => a.GetName().Name)
+    .OrderBy(n => n)
+    .ToArray();
+print("hot_patch_assemblies=" + string.Join(",", hotAssemblies));
+
+var t = assemblies
+    .Select(a => a.GetType(typeName, false))
+    .FirstOrDefault(x => x != null);
+print("type_found=" + (t != null));
+if (t == null)
+{
+    print("hot_component_status=gap");
+    return null;
+}
+
+print("type_full_name=" + t.FullName);
+print("type_assembly=" + t.Assembly.GetName().Name);
+print("type_location_empty=" + string.IsNullOrEmpty(t.Assembly.Location));
+var isMono = typeof(UnityEngine.MonoBehaviour).IsAssignableFrom(t);
+print("is_mono_behaviour=" + isMono);
+
+var reset = t.GetMethod("ResetCounters", BindingFlags.Public | BindingFlags.Static);
+reset?.Invoke(null, null);
+
+UnityEngine.GameObject go = null;
+UnityEngine.Component comp = null;
+bool addOk = false;
+bool markerOk = false;
+int awakeCount = -1;
+int enableCount = -1;
+int updateCount = -1;
+string lastObjectName = "";
+string monoScriptPath = "<not-run>";
+string serializedScript = "<not-run>";
+
+try
+{
+    go = new UnityEngine.GameObject("LocusHotAddedBehaviourProbe");
+    comp = go.AddComponent(t);
+    addOk = comp != null;
+    print("add_ok=" + addOk);
+    if (comp != null)
+    {
+        print("component_type=" + comp.GetType().FullName);
+        print("component_enabled=" + ((UnityEngine.Behaviour)comp).enabled);
+        var marker = t.GetMethod("Marker", BindingFlags.Public | BindingFlags.Instance)?.Invoke(comp, null);
+        markerOk = object.Equals(marker, 4701);
+        print("marker=" + (marker == null ? "<null>" : marker.ToString()));
+
+        try
+        {
+            var script = UnityEditor.MonoScript.FromMonoBehaviour((UnityEngine.MonoBehaviour)comp);
+            monoScriptPath = script == null ? "<null>" : UnityEditor.AssetDatabase.GetAssetPath(script);
+        }
+        catch (System.Exception ex)
+        {
+            monoScriptPath = "EX:" + ex.GetType().Name + ":" + ex.Message;
+        }
+        print("monoscript_path=" + monoScriptPath);
+
+        try
+        {
+            var serialized = new UnityEditor.SerializedObject(comp);
+            var scriptProperty = serialized.FindProperty("m_Script");
+            var scriptObject = scriptProperty == null ? null : scriptProperty.objectReferenceValue;
+            serializedScript = scriptObject == null ? "<null>" : scriptObject.name;
+        }
+        catch (System.Exception ex)
+        {
+            serializedScript = "EX:" + ex.GetType().Name + ":" + ex.Message;
+        }
+        print("serialized_m_script=" + serializedScript);
+    }
+}
+catch (System.Exception ex)
+{
+    print("add_exception=" + ex.GetType().Name + ":" + ex.Message);
+}
+
+await ctx.WaitFrames(4);
+
+if (t != null)
+{
+    awakeCount = System.Convert.ToInt32(t.GetField("AwakeCount", BindingFlags.Public | BindingFlags.Static)?.GetValue(null) ?? -1);
+    enableCount = System.Convert.ToInt32(t.GetField("EnableCount", BindingFlags.Public | BindingFlags.Static)?.GetValue(null) ?? -1);
+    updateCount = System.Convert.ToInt32(t.GetField("UpdateCount", BindingFlags.Public | BindingFlags.Static)?.GetValue(null) ?? -1);
+    lastObjectName = (string)(t.GetField("LastObjectName", BindingFlags.Public | BindingFlags.Static)?.GetValue(null) ?? "");
+    print("lifecycle_counts=awake:" + awakeCount + ",enable:" + enableCount + ",update:" + updateCount + ",name:" + lastObjectName);
+}
+
+if (go != null)
+{
+    UnityEngine.Object.Destroy(go);
+    await ctx.WaitFrame();
+}
+
+var status = t != null
+    && isMono
+    && addOk
+    && markerOk
+    && awakeCount > 0
+    && enableCount > 0
+    && updateCount > 0
+        ? "ok"
+        : "gap";
+print("hot_component_status=" + status);
+return null;"#;
+
+        match self.execute(diagnostic).await {
+            Ok(output) if output.contains("hot_component_status=ok") => {
+                let mono_script = output
+                    .lines()
+                    .find(|line| line.contains("monoscript_path="))
+                    .map(str::trim)
+                    .unwrap_or("monoscript_path=<missing>");
+                self.pass(
+                    "P47b runtime AddComponent diagnostic",
+                    format!(
+                        "AddComponent(Type), Marker, Awake/OnEnable/Update all worked; {mono_script}"
+                    ),
+                );
+            }
+            Ok(output) => self.fail(
+                "P47b runtime AddComponent diagnostic",
+                format!("hot-added component gap: {}", squash(&output)),
+            ),
+            Err(error) => self.fail(
+                "P47b runtime AddComponent diagnostic",
+                format!("diagnostic snippet failed: {}", squash(&error)),
+            ),
+        }
+    }
+
+    /// Phase 2b — Release-only positive coverage for caller refresh. The
+    /// callee is explicitly marked AggressiveInlining, so Unity/Mono reports it
+    /// as `inlined in Release`; Locus then refreshes the caller method within
+    /// the two-level hard limit and the immediate call-site read observes the
+    /// new value.
+    async fn run_release_inline_tests(&mut self) {
+        self.log("Phase 2b — Release inline caller refresh");
+        // Gate the "inlined in Release" assertions on the JIT's EFFECTIVE
+        // behavior, not the codeOptimization setting: play mode has been observed
+        // Debug-effective (nothing inlines) even when the setting reads release,
+        // which previously failed R10/R11 spuriously. When inlining is inactive
+        // the behavioral sub-asserts below still verify correctness via the direct
+        // detour; only the "inlining was detected" claim is skipped.
+        let (inlining_active, inlining_detail) = self.inlining_active().await;
+        if inlining_active {
+            self.log(format!(
+                "  runtime inlining ACTIVE (Release-effective) — inline-refresh path exercised [{inlining_detail}]"
+            ));
+        } else {
+            self.log(format!(
+                "  runtime inlining INACTIVE (Debug-effective) — inline-detection asserts soft-skipped; behavior still verified [{inlining_detail}]"
+            ));
+        }
+        let name = "R10 aggressive-inlining caller refresh";
+        let edited = ADVERSARIAL_BASELINE.replace("return 5005;", "return 6116;");
+        if let Some(summary) = self
+            .apply_texts(
+                name,
+                &[(ADVERSARIAL_FILE, edited.as_str())],
+                &[(ADVERSARIAL_FILE, ADVERSARIAL_BASELINE)],
+            )
+            .await
+        {
+            if summary.contains("inlined in Release") {
+                self.pass(name, "reported inlined in Release");
+            } else if inlining_active {
+                self.fail(
+                    name,
+                    format!(
+                        "expected Release inline detection in summary, got: {}",
+                        squash(&summary)
+                    ),
+                );
+            } else {
+                self.pass(
+                    name,
+                    "Debug-effective runtime: inline detection N/A; behavior asserted below",
+                );
+            }
+            self.expect_release_immediate_output(
+                name,
+                "return LocusSelfTestAdversarial.CallInlined();",
+                "6116",
+            )
+            .await;
+        }
+
+        let _ = self
+            .apply_texts(
+                "R10 restore aggressive-inlining corpus",
+                &[(ADVERSARIAL_FILE, ADVERSARIAL_BASELINE)],
+                &[(ADVERSARIAL_FILE, ADVERSARIAL_BASELINE)],
+            )
+            .await;
+
+        let name = "R11 cross-file inline caller refresh batch";
+        let edited = INLINE_CALLEE_BASELINE
+            .replace("return 101;", "return 1101;")
+            .replace("return 201;", "return 1201;")
+            .replace("return x + 301;", "return x + 1301;")
+            .replace("return 501;", "return 1501;")
+            .replace("return x > 0 ? 601 : 0;", "return x > 0 ? 1601 : 0;")
+            .replace("return 701;", "return 1701;");
+        if let Some(summary) = self
+            .apply_texts(
+                name,
+                &[(INLINE_CALLEE_FILE, edited.as_str())],
+                &[(INLINE_CALLEE_FILE, INLINE_CALLEE_BASELINE)],
+            )
+            .await
+        {
+            // The summary must report Release inlining was detected; the caller
+            // refresh itself is proven BEHAVIORALLY by R11a–f below. The
+            // "Inline caller refresh patched" line only appears when the batch's
+            // refresh recompile actually patches a caller — which the large
+            // cumulative batch may legitimately skip (the predicted-inlined
+            // callees' direct detours deliver the values, methods==0 + a note),
+            // so it is not a reliable suite gate (keying on it reddened a healthy
+            // run while R11a–f all passed).
+            if summary.contains("inlined in Release") {
+                self.pass(
+                    name,
+                    "reported inlined in Release; caller refresh asserted behaviorally below",
+                );
+            } else if inlining_active {
+                self.fail(
+                    name,
+                    format!(
+                        "expected Release inline detection, got: {}",
+                        squash(&summary)
+                    ),
+                );
+            } else {
+                self.pass(name, "Debug-effective runtime: inline detection N/A; caller refresh asserted behaviorally below");
+            }
+            self.expect_release_immediate_output(
+                "R11a direct caller file",
+                "return LocusSelfTestInlineCallerDirect.Run();",
+                "1102",
+            )
+            .await;
+            self.expect_release_immediate_output(
+                "R11b nested callee caller file",
+                "return LocusSelfTestInlineCallerNested.Run();",
+                "1203",
+            )
+            .await;
+            self.expect_release_immediate_output(
+                "R11c overload caller file",
+                "return LocusSelfTestInlineCallerOverload.Run();",
+                "1307",
+            )
+            .await;
+            self.expect_release_immediate_output(
+                "R11d lambda caller file",
+                "return LocusSelfTestInlineCallerLambda.Run();",
+                "1505",
+            )
+            .await;
+            self.expect_release_immediate_output(
+                "R11e branch caller file",
+                "return LocusSelfTestInlineCallerBranch.Run(2);",
+                "1606",
+            )
+            .await;
+            self.expect_release_immediate_output(
+                "R11f collection caller file",
+                "return LocusSelfTestInlineCallerArray.Run();",
+                "1707",
+            )
+            .await;
+        }
+
+        let _ = self
+            .apply_texts(
+                "R11 restore cross-file inline corpus",
+                &[(INLINE_CALLEE_FILE, INLINE_CALLEE_BASELINE)],
+                &[(INLINE_CALLEE_FILE, INLINE_CALLEE_BASELINE)],
+            )
+            .await;
+    }
+
+    /// Phase 2b+ — multi-file caller-refresh coverage for the shapes R10/R11
+    /// don't reach: a depth-2 static chain (R12), a cross-assembly static callee
+    /// (R13), and a same-assembly INSTANCE callee (R14 — the same-assembly
+    /// counterpart of the R05 suite-gate, hot since the instance self-shim
+    /// redirect landed). All three are confirmed HOT on Unity, so they are real
+    /// suite assertions (promoted out of the earlier diagnostic phase).
+    async fn run_release_inline_multifile_tests(&mut self) {
+        self.log("Phase 2b+ — multi-file inline caller refresh");
+
+        // R12 — depth-2 static inline chain across three files: editing Leaf
+        // refreshes Mid (round 1, caller of Leaf) and then Top (round 2, caller
+        // of Mid), the exact INLINE_REFRESH_MAX_DEPTH ceiling. Each hop is
+        // static, and a force-detoured intermediate re-enters the diff as a
+        // changed method, so its own caller redirects too.
+        let name = "R12 depth-2 static inline chain";
+        self.log(format!("— {name}"));
+        let edited = INLINE_CHAIN_LEAF_BASELINE.replace("return 3100;", "return 9100;");
+        if self
+            .apply_texts(
+                name,
+                &[(INLINE_CHAIN_LEAF_FILE, edited.as_str())],
+                &[(INLINE_CHAIN_LEAF_FILE, INLINE_CHAIN_LEAF_BASELINE)],
+            )
+            .await
+            .is_some()
+        {
+            self.expect_release_immediate_output(
+                name,
+                "return LocusSelfTestChainTop.Top();",
+                "9430", // 9100 + 30 + 300, observed at the two-hops-removed caller
+            )
+            .await;
+        }
+        let _ = self
+            .apply_texts(
+                "R12 restore inline chain",
+                &[(INLINE_CHAIN_LEAF_FILE, INLINE_CHAIN_LEAF_BASELINE)],
+                &[(INLINE_CHAIN_LEAF_FILE, INLINE_CHAIN_LEAF_BASELINE)],
+            )
+            .await;
+
+        // R13 — cross-ASSEMBLY static inline refresh: a static lib method
+        // inlined into an Assembly-CSharp caller. The refresh recompiles
+        // callee+caller into ONE patch assembly, so the static patch-copy
+        // redirect erases the boundary (confirming the assembly boundary alone
+        // never blocked the refresh — R05's earlier failure was instance-only).
+        let name = "R13 cross-asmdef static inline refresh";
+        self.log(format!("— {name}"));
+        let edited = LIB_INLINE_BASELINE.replace("return 6200;", "return 7200;");
+        if self
+            .apply_texts(
+                name,
+                &[(LIB_INLINE_FILE, edited.as_str())],
+                &[(LIB_INLINE_FILE, LIB_INLINE_BASELINE)],
+            )
+            .await
+            .is_some()
+        {
+            self.expect_release_immediate_output(
+                name,
+                "return LocusSelfTestLibInlineCaller.Run();",
+                "7206", // 7200 + 6, read through the Assembly-CSharp caller
+            )
+            .await;
+        }
+        let _ = self
+            .apply_texts(
+                "R13 restore lib inline corpus",
+                &[(LIB_INLINE_FILE, LIB_INLINE_BASELINE)],
+                &[(LIB_INLINE_FILE, LIB_INLINE_BASELINE)],
+            )
+            .await;
+
+        // R14 — same-ASSEMBLY INSTANCE inline refresh: an instance callee
+        // inlined into a static caller. This is R05 with the assembly boundary
+        // removed. The instance self-shim redirect (Option A) binds the inlined
+        // instance call to the changed body's static self-shim, so the immediate
+        // read observes 9408 — the same-assembly companion to the R05 gate.
+        let name = "R14 same-asm instance inline refresh";
+        self.log(format!("— {name}"));
+        let edited = INST_INLINEE_BASELINE.replace("return 8400;", "return 9400;");
+        if self
+            .apply_texts(
+                name,
+                &[(INST_INLINEE_FILE, edited.as_str())],
+                &[(INST_INLINEE_FILE, INST_INLINEE_BASELINE)],
+            )
+            .await
+            .is_some()
+        {
+            self.expect_release_immediate_output(
+                name,
+                "return LocusSelfTestInstInlineCaller.Run();",
+                "9408", // 9400 + 8 — instance self-shim delivers the new body
+            )
+            .await;
+        }
+        let _ = self
+            .apply_texts(
+                "R14 restore instance inline corpus",
+                &[(INST_INLINEE_FILE, INST_INLINEE_BASELINE)],
+                &[(INST_INLINEE_FILE, INST_INLINEE_BASELINE)],
+            )
+            .await;
+    }
+
+    /// Phase D rollout measurement — A/B the experimental inline force-evaluation
+    /// to quantify its over-refresh cost on this runtime. The SAME edit is applied
+    /// with the flag OFF then ON; the delta in reported high-confidence (StubInlined)
+    /// classifications is what force-evaluation ADDS — methods the static heuristic
+    /// would have missed and that now drive an extra caller refresh. On this Mono
+    /// the delta is expected to be ~0 (Gate A: Mono's real inline gate ≈ the ≤20-IL
+    /// heuristic, and a changed method whose caller already ran has its bit set so
+    /// the stub never builds), which is itself the data point that makes default-on
+    /// cost-free here. Soft pass on the measurement; the behavioral read of the
+    /// refreshed caller IS asserted on the ON leg. Restores the PRIOR flag value
+    /// (default-agnostic) and the corpus afterward.
+    async fn run_inline_force_evaluate_check(&mut self) {
+        let name = "PD inline force-evaluate A/B";
+        self.log("Phase D — inline force-evaluate A/B (rollout over-refresh measurement)");
+        let (inlining_active, detail) = self.inlining_active().await;
+        self.log(format!(
+            "  runtime inlining {} [{detail}]",
+            if inlining_active {
+                "ACTIVE"
+            } else {
+                "INACTIVE"
+            }
+        ));
+        let prior = crate::unity_hotreload::inline_force_evaluate_enabled();
+        let edited = ADVERSARIAL_BASELINE.replace("return 5005;", "return 5115;");
+
+        // OFF leg — baseline classification without force-evaluation.
+        crate::unity_hotreload::set_inline_force_evaluate_enabled(false);
+        let off_high = self
+            .apply_texts(
+                "PD off-leg",
+                &[(ADVERSARIAL_FILE, edited.as_str())],
+                &[(ADVERSARIAL_FILE, ADVERSARIAL_BASELINE)],
+            )
+            .await
+            .map(|summary| summary.matches("(high-confidence)").count())
+            .unwrap_or(0);
+        let _ = self
+            .apply_texts(
+                "PD off-leg restore",
+                &[(ADVERSARIAL_FILE, ADVERSARIAL_BASELINE)],
+                &[(ADVERSARIAL_FILE, ADVERSARIAL_BASELINE)],
+            )
+            .await;
+
+        // ON leg — force-evaluation enabled.
+        crate::unity_hotreload::set_inline_force_evaluate_enabled(true);
+        let on_summary = self
+            .apply_texts(
+                "PD on-leg",
+                &[(ADVERSARIAL_FILE, edited.as_str())],
+                &[(ADVERSARIAL_FILE, ADVERSARIAL_BASELINE)],
+            )
+            .await;
+        if let Some(summary) = &on_summary {
+            let on_high = summary.matches("(high-confidence)").count();
+            self.log(format!(
+                "  over-refresh delta (force-eval-attributable StubInlined): off={off_high} on={on_high} → +{}",
+                on_high.saturating_sub(off_high)
+            ));
+            self.pass(
+                name,
+                format!(
+                    "A/B measured; force-eval added {} high-confidence classification(s) over the heuristic",
+                    on_high.saturating_sub(off_high)
+                ),
+            );
+            // Convergence must hold with the flag on, inline verdict notwithstanding.
+            self.expect_release_immediate_output(
+                name,
+                "return LocusSelfTestAdversarial.CallInlined();",
+                "5115",
+            )
+            .await;
+        }
+
+        // Restore the prior (config-default) flag value, not a hardcoded one, so the
+        // remaining phases run under the shipped default.
+        crate::unity_hotreload::set_inline_force_evaluate_enabled(prior);
+        let _ = self
+            .apply_texts(
+                "PD restore adversarial corpus",
+                &[(ADVERSARIAL_FILE, ADVERSARIAL_BASELINE)],
+                &[(ADVERSARIAL_FILE, ADVERSARIAL_BASELINE)],
+            )
+            .await;
+    }
+
+    /// Drive the editor to Release-EFFECTIVE inlining and verify it at runtime.
+    ///
+    /// The plain `set_code_optimization(release)` at startup has been observed not
+    /// to take JIT effect — the canary shows `inlining_active=no` even in edit
+    /// mode after the baseline reload (no debugger attached), so either the
+    /// setting reverts across the reload or the release recompile was superseded.
+    /// This re-asserts release and forces a recompile+reload to apply it, logging
+    /// the codeOptimization setting and the runtime inlining verdict before and
+    /// after so a stuck-Debug session is fully diagnosed. Returns whether inlining
+    /// is active afterward.
+    ///
+    /// MUST run before the edit-mode patch tests (E01/E02): its recompile would
+    /// otherwise revert E01's live editor patch before E02 asserts it survives
+    /// play-enter.
+    async fn ensure_release_effective(&mut self) -> bool {
+        self.log("Ensuring Release-effective inlining (runtime-verified)...");
+        let (active_before, detail_before) = self.inlining_active().await;
+        let (_, setting_before) = coordinator::detect_code_optimization(&self.project).await;
+        self.log(format!(
+            "  before: codeOptimization setting={}, inlining_active={} [{detail_before}]",
+            setting_before.as_deref().unwrap_or("unknown"),
+            active_before
+        ));
+        if active_before {
+            self.log("  already Release-effective; no recompile needed");
+            return true;
+        }
+
+        match self
+            .set_code_optimization_retrying("release", "Release-effective reassert")
+            .await
+        {
+            Ok(value) => self.log(format!("  re-asserted codeOptimization → {value}")),
+            Err(error) => self.log(format!("  re-assert failed: {error}")),
+        }
+        // Force a recompile + domain reload so the release setting is applied to
+        // the loaded/JITed assemblies (the set alone only schedules it).
+        match crate::unity_bridge::recompile_and_wait(&self.project).await {
+            Ok(_) => self.log("  forced recompile+reload complete"),
+            Err(error) => self.log(format!("  forced recompile failed: {error}")),
+        }
+
+        let (active_after, detail_after) = self.inlining_active().await;
+        let (_, setting_after) = coordinator::detect_code_optimization(&self.project).await;
+        self.log(format!(
+            "  after: codeOptimization setting={}, inlining_active={} [{detail_after}]",
+            setting_after.as_deref().unwrap_or("unknown"),
+            active_after
+        ));
+        if !active_after {
+            self.log(
+                "  *** STILL Debug-effective after re-assert+recompile (no debugger) — \
+                 inline coverage is unavailable this session; the Release-inline tests will \
+                 soft-skip their inline-detection asserts. Likely codeOptimization not \
+                 persisting across reloads or a Mono optimization config; needs deeper fix. ***",
+            );
+        }
+        active_after
+    }
+
+    /// Phase A — inline-risk force-evaluation probes (DIAGNOSTIC ONLY).
+    ///
+    /// Sends a plugin-local command that, for a handful of method shapes, reads
+    /// Mono's inline_info/inline_failure bits, force-JITs a synthetic caller stub
+    /// (so Mono's inliner evaluates the callee at compile time), then re-reads the
+    /// bits. It answers whether we can move the inline bit from the outside, what
+    /// a refused/oversized method does, whether force-JITing runs a callee's
+    /// static cctor, and which JIT-forcing API is stable — the data that gates
+    /// wiring force-evaluation into IsMethodInlined (Phase B).
+    ///
+    /// The probe corpus lives in the plugin and is never wired into the hot-patch
+    /// decision path, so this phase asserts nothing: it logs the report verbatim
+    /// and records a soft pass on a successful round-trip. The probe is read
+    /// cleanest on the first run after a domain reload (the callee inline bit is
+    /// sticky for the domain lifetime).
+    async fn run_inline_probes(&mut self) {
+        let name = "PA inline-risk probes";
+        self.log("Phase A — inline-risk force-evaluation probes (diagnostic, no assertions)");
+        // Log the codeOptimization SETTING as seen right here (edit mode, after the
+        // baseline reload). If this reads debug, the release set reverted across a
+        // reload; if release while the probe below still shows inlining_active=no,
+        // the setting holds but the JIT runs Debug-effective (debugger agent).
+        let (_, setting_now) = coordinator::detect_code_optimization(&self.project).await;
+        self.log(format!(
+            "  codeOptimization setting at probe point (edit mode): {}",
+            setting_now.as_deref().unwrap_or("unknown")
+        ));
+        match crate::unity_bridge::send_message_with_timeout(
+            &self.project,
+            "hot_reload_inline_probe",
+            "",
+            Duration::from_secs(30),
+        )
+        .await
+        {
+            Ok(resp) if resp.ok => {
+                let report = resp.message.unwrap_or_default();
+                for line in report.lines() {
+                    self.log(format!("  {line}"));
+                }
+                self.pass(name, "probes ran; see report lines above");
+            }
+            Ok(resp) => {
+                let error = resp
+                    .error
+                    .unwrap_or_else(|| "inline probe failed".to_string());
+                if error.starts_with("unknown message type") {
+                    self.log("  note: this Unity plugin predates the inline probe; skipping (rebuild the plugin to collect data)");
+                } else {
+                    self.fail(name, error);
+                }
+            }
+            Err(error) => self.fail(name, squash(&error)),
+        }
+    }
+
+    /// Phase 2c — adversarial C#-syntax cases that pin tricky resolver /
+    /// inlining behaviour. They catch regressions and document the edges:
+    ///   A1 — overloads distinct only by parameter NAMESPACE,
+    ///   A2 — overloads distinct only by GENERIC ARGUMENT.
+    ///        Both collapse to one reflection simple param name, so the coarse
+    ///        identity is ambiguous; they resolve HOT via the enriched
+    ///        per-parameter signature (namespace + closed generic argument)
+    ///        the desktop now sends alongside (`param_type_sigs`).
+    ///   A3 — an [AggressiveInlining] method body edit. Under the suite's
+    ///        forced Release the apply reports it inlined and converges via
+    ///        recompile (the behavioral assert tolerates the inline fallback).
+    ///   A4 — a default parameter VALUE change. The caller is co-located in this
+    ///        file and re-emitted with the new default; a caller outside the
+    ///        batch would keep the baked-in old value.
+    ///
+    /// All four edit a dedicated `LocusSelfTestAdversarial` type, so a failure
+    /// here cannot poison the other phases. Once pinned as known gaps and routed
+    /// to the diagnostic tally; now confirmed HOT on Unity and promoted into the
+    /// real suite (a regression here legitimately reddens the suite again).
+    async fn run_adversarial_tests(&mut self) {
+        self.log("Phase 2c — adversarial C# syntax edge cases");
+        let mut adv = ADVERSARIAL_BASELINE.to_string();
+
+        // A1 — body edit of an overload distinct only by parameter namespace.
+        if self
+            .step_file(
+                "A1 namespace-distinct overload",
+                ADVERSARIAL_FILE,
+                &mut adv,
+                |s| {
+                    swap(
+                        s,
+                        "public static int ProbeNs(LocusSelfTestAdvA.Tag t) { return 1001; }",
+                        "public static int ProbeNs(LocusSelfTestAdvA.Tag t) { return 4221; }",
+                    )
+                },
+            )
+            .await
+            .is_some()
+        {
+            self.expect_output(
+                "A1 namespace-distinct overload",
+                "return LocusSelfTestAdversarial.ProbeNs(default(LocusSelfTestAdvA.Tag));",
+                "4221",
+            )
+            .await;
+        }
+
+        // A2 — body edit of an overload distinct only by generic argument.
+        if self
+            .step_file(
+                "A2 generic-arg-distinct overload",
+                ADVERSARIAL_FILE,
+                &mut adv,
+                |s| {
+                    swap(
+                        s,
+                        "public static int ProbeGen(System.Collections.Generic.List<int> a) { return 3003; }",
+                        "public static int ProbeGen(System.Collections.Generic.List<int> a) { return 4221; }",
+                    )
+                },
+            )
+            .await
+            .is_some()
+        {
+            self.expect_output(
+                "A2 generic-arg-distinct overload",
+                "return LocusSelfTestAdversarial.ProbeGen(new System.Collections.Generic.List<int>());",
+                "4221",
+            )
+            .await;
+        }
+
+        // A3 — body edit of an aggressively-inlined method (call-site bypass).
+        if self
+            .step_file(
+                "A3 aggressive-inlining body edit",
+                ADVERSARIAL_FILE,
+                &mut adv,
+                |s| swap(s, "return 5005;", "return 6116;"),
+            )
+            .await
+            .is_some()
+        {
+            self.expect_output(
+                "A3 aggressive-inlining body edit",
+                "return LocusSelfTestAdversarial.CallInlined();",
+                "6116",
+            )
+            .await;
+        }
+
+        // A4 — default parameter value change (callers baked the old default).
+        if self
+            .step_file(
+                "A4 default parameter value change",
+                ADVERSARIAL_FILE,
+                &mut adv,
+                |s| swap(s, "int y = 1000", "int y = 2000"),
+            )
+            .await
+            .is_some()
+        {
+            self.expect_output(
+                "A4 default parameter value change",
+                "return LocusSelfTestAdversarial.CallDefaulted();",
+                "9000",
+            )
+            .await;
+        }
     }
 
     async fn run_negative_tests(&mut self) {
@@ -3140,17 +5959,21 @@ impl SelfTest {
             .await;
         }
 
-        // N07 — Unity message names are discovered at real compiles only.
+        // N07 — unsupported Unity message names still stay cold. The supported
+        // add-after-load families (PlayerLoop pump + component proxy: physics,
+        // GUI/mouse, animator/particle/controller, lifecycle catch-ups) are
+        // covered positively in P46. OnBecameVisible depends on Camera/Renderer
+        // visibility timing and has no driver, so it stays cold.
         let mut text = neg.clone();
         if swap(
             &mut text,
-            "    public int Solid() { return 1; }\n",
-            "    public int Solid() { return 1; }\n    void Update() { }\n",
+            "    public int Solid() { return 1; }\n}\n",
+            "    public int Solid() { return 1; }\n    void OnBecameVisible() { }\n}\n",
         )
         .is_ok()
         {
             self.expect_cold(
-                "N07 Unity message added",
+                "N07 unsupported Unity message added",
                 NEG_FILE,
                 &text,
                 "new Unity message method",
@@ -3524,6 +6347,457 @@ impl SelfTest {
             .await;
         }
 
+        // ── extra cold surface (N30+) ────────────────────────────────────
+        // Each clones a dedicated baseline and mutates one type, so exactly
+        // one rejection reason fires. None of these files are touched by the
+        // positive phase, so the baseline IS the restore text (no ledger).
+
+        // N30 — class↔struct is a metadata type-kind change.
+        let mut text = COLD_BASELINE.to_string();
+        if swap(
+            &mut text,
+            "public class LocusSelfTestKind",
+            "public struct LocusSelfTestKind",
+        )
+        .is_ok()
+        {
+            self.expect_cold(
+                "N30 type kind changed (class to struct)",
+                COLD_FILE,
+                &text,
+                "type kind changed",
+                COLD_BASELINE,
+            )
+            .await;
+        }
+
+        // N31 — the static constructor already ran in the loaded domain.
+        let mut text = COLD_BASELINE.to_string();
+        if swap(
+            &mut text,
+            "static LocusSelfTestStaticCtor() { Counter = 1; }",
+            "static LocusSelfTestStaticCtor() { Counter = 2; }",
+        )
+        .is_ok()
+        {
+            self.expect_cold(
+                "N31 static constructor changed",
+                COLD_FILE,
+                &text,
+                "static constructor changed",
+                COLD_BASELINE,
+            )
+            .await;
+        }
+
+        // N32 — explicit interface implementations dispatch through the
+        // interface map; a detour cannot reach them.
+        let mut text = COLD_BASELINE.to_string();
+        if swap(
+            &mut text,
+            "int ILocusSelfTestExplicit.Plan() { return 1; }",
+            "int ILocusSelfTestExplicit.Plan() { return 2; }",
+        )
+        .is_ok()
+        {
+            self.expect_cold(
+                "N32 explicit interface impl changed",
+                COLD_FILE,
+                &text,
+                "explicit interface implementation changed",
+                COLD_BASELINE,
+            )
+            .await;
+        }
+
+        // N33 — appended enum members must carry an integer LITERAL; an
+        // expression cannot be resolved without a real compile.
+        let mut text = COLD_BASELINE.to_string();
+        if swap(
+            &mut text,
+            "public enum LocusSelfTestColdEnum { P = 1, Q = 2 }",
+            "public enum LocusSelfTestColdEnum { P = 1, Q = 2, R = 1 + 2 }",
+        )
+        .is_ok()
+        {
+            self.expect_cold(
+                "N33 enum appended non-literal value",
+                COLD_FILE,
+                &text,
+                "enum member value not resolvable",
+                COLD_BASELINE,
+            )
+            .await;
+        }
+
+        // N34 — an appended value that collides with an existing member is
+        // ambiguous at the inlined use sites.
+        let mut text = COLD_BASELINE.to_string();
+        if swap(
+            &mut text,
+            "public enum LocusSelfTestColdEnum { P = 1, Q = 2 }",
+            "public enum LocusSelfTestColdEnum { P = 1, Q = 2, R = 2 }",
+        )
+        .is_ok()
+        {
+            self.expect_cold(
+                "N34 enum appended conflicting value",
+                COLD_FILE,
+                &text,
+                "enum member value conflicts",
+                COLD_BASELINE,
+            )
+            .await;
+        }
+
+        // N35 — a removed enum cannot be verified (values are inlined).
+        let mut text = COLD_BASELINE.to_string();
+        if swap(
+            &mut text,
+            "public enum LocusSelfTestColdEnum { P = 1, Q = 2 }\n\n",
+            "",
+        )
+        .is_ok()
+        {
+            self.expect_cold(
+                "N35 enum removed",
+                COLD_FILE,
+                &text,
+                "enum removed",
+                COLD_BASELINE,
+            )
+            .await;
+        }
+
+        // N36 — a removed const was inlined at every use site.
+        let mut text = COLD_BASELINE.to_string();
+        if swap(&mut text, "    public const int Cap = 5;\n", "").is_ok() {
+            self.expect_cold(
+                "N36 const removed",
+                COLD_FILE,
+                &text,
+                "const removed",
+                COLD_BASELINE,
+            )
+            .await;
+        }
+
+        // N37 — field modifiers live in immutable metadata.
+        let mut text = COLD_BASELINE.to_string();
+        if swap(&mut text, "public int Field;", "public readonly int Field;").is_ok() {
+            self.expect_cold(
+                "N37 field modifiers changed",
+                COLD_FILE,
+                &text,
+                "field attributes or modifiers changed",
+                COLD_BASELINE,
+            )
+            .await;
+        }
+
+        // N38 — constructor surface changes (the parameterless ctor stays).
+        let mut text = COLD_BASELINE.to_string();
+        if swap(
+            &mut text,
+            "    public LocusSelfTestCtorDrop(int seed) { Seed = seed; }\n",
+            "",
+        )
+        .is_ok()
+        {
+            self.expect_cold(
+                "N38 constructor removed",
+                COLD_FILE,
+                &text,
+                "constructor removed",
+                COLD_BASELINE,
+            )
+            .await;
+        }
+
+        // N39 — finalizer removal (N06/N19 cover added/changed).
+        let mut text = COLD_BASELINE.to_string();
+        if swap(&mut text, "    ~LocusSelfTestFinDrop() { }\n", "").is_ok() {
+            self.expect_cold(
+                "N39 finalizer removed",
+                COLD_FILE,
+                &text,
+                "finalizer removed",
+                COLD_BASELINE,
+            )
+            .await;
+        }
+
+        // N40 — adding an operator: its call sites live outside the batch.
+        let mut text = COLD_BASELINE.to_string();
+        if swap(
+            &mut text,
+            "    public int Mark() { return Value; }\n",
+            "    public int Mark() { return Value; }\n\n    public static LocusSelfTestOpHost operator +(LocusSelfTestOpHost a, LocusSelfTestOpHost b) { return a; }\n",
+        )
+        .is_ok()
+        {
+            self.expect_cold(
+                "N40 operator added",
+                COLD_FILE,
+                &text,
+                "member kind addition not hot-reloadable",
+                COLD_BASELINE,
+            )
+            .await;
+        }
+
+        // N41 — record types are rejected on PRESENCE. Created fresh and
+        // deleted so the C# 9 syntax never reaches a real compile (a cold
+        // verdict returns before the sidecar would build it).
+        let name = "N41 record type rejected";
+        self.log(format!("— {name}"));
+        match self.write_tracked(RECORD_FILE, RECORD_BASELINE).await {
+            Ok(()) => {
+                let verdict = self.hot_reload(Some(vec![RECORD_FILE.to_string()])).await;
+                let vtext = match &verdict {
+                    Ok(summary) => summary.clone(),
+                    Err(error) => error.clone(),
+                };
+                if vtext.contains("Hot reload not applicable")
+                    && vtext.contains("record types are not hot-reloadable")
+                {
+                    self.pass(name, "record classified cold on presence");
+                } else {
+                    self.fail(
+                        name,
+                        format!("expected the record cold verdict, got: {}", squash(&vtext)),
+                    );
+                }
+                if let Err(error) = self.delete_tracked(RECORD_FILE).await {
+                    self.fail(name, format!("cleanup of {RECORD_FILE} failed: {error}"));
+                }
+            }
+            Err(error) => self.fail(name, error),
+        }
+
+        // N42–N46 — using-rehook (M6) gates: toggling a using forces the
+        // whole-file re-detour, which fails closed on the one member each
+        // file holds that cannot be re-detoured. (C74 Burst needs the Burst
+        // package; an "unsupported operator" is unreachable — every
+        // overloadable C# operator has a metadata name; a default-interface-
+        // method gate would need runtime DIM support. All three are left to
+        // the HotDiff unit tests.)
+        let mut text = USE_CONST_BASELINE.to_string();
+        if swap(
+            &mut text,
+            "public class LocusSelfTestUseConst",
+            "using System.Text;\n\npublic class LocusSelfTestUseConst",
+        )
+        .is_ok()
+        {
+            self.expect_cold(
+                "N42 using-rehook gate: non-literal const",
+                USE_CONST_FILE,
+                &text,
+                "a non-literal const value is inlined under the old bindings",
+                USE_CONST_BASELINE,
+            )
+            .await;
+        }
+
+        let mut text = USE_STATIC_BASELINE.to_string();
+        if swap(
+            &mut text,
+            "public class LocusSelfTestUseStatic",
+            "using System.Text;\n\npublic class LocusSelfTestUseStatic",
+        )
+        .is_ok()
+        {
+            self.expect_cold(
+                "N43 using-rehook gate: non-literal static initializer",
+                USE_STATIC_FILE,
+                &text,
+                "a non-literal static initializer already ran under the old bindings",
+                USE_STATIC_BASELINE,
+            )
+            .await;
+        }
+
+        let mut text = USE_GENERIC_BASELINE.to_string();
+        if swap(
+            &mut text,
+            "public class LocusSelfTestUseGeneric",
+            "using System.Text;\n\npublic class LocusSelfTestUseGeneric",
+        )
+        .is_ok()
+        {
+            self.expect_cold(
+                "N44 using-rehook gate: generic member",
+                USE_GENERIC_FILE,
+                &text,
+                "generic members cannot be re-detoured",
+                USE_GENERIC_BASELINE,
+            )
+            .await;
+        }
+
+        let mut text = USE_EXPLICIT_BASELINE.to_string();
+        if swap(
+            &mut text,
+            "public interface ILocusSelfTestUseExpl",
+            "using System.Text;\n\npublic interface ILocusSelfTestUseExpl",
+        )
+        .is_ok()
+        {
+            self.expect_cold(
+                "N45 using-rehook gate: explicit interface impl",
+                USE_EXPLICIT_FILE,
+                &text,
+                "an explicit interface implementation cannot be re-detoured",
+                USE_EXPLICIT_BASELINE,
+            )
+            .await;
+        }
+
+        let mut text = USE_FINALIZER_BASELINE.to_string();
+        if swap(
+            &mut text,
+            "public class LocusSelfTestUseFin",
+            "using System.Text;\n\npublic class LocusSelfTestUseFin",
+        )
+        .is_ok()
+        {
+            self.expect_cold(
+                "N46 using-rehook gate: finalizer",
+                USE_FINALIZER_FILE,
+                &text,
+                "a finalizer cannot be re-detoured",
+                USE_FINALIZER_BASELINE,
+            )
+            .await;
+        }
+
+        // N47–N52 — partial-type cold boundaries (B6 v1). Body edits are HOT
+        // (P44/P45); these are the structural shapes the per-file diff cannot
+        // reason about across parts.
+
+        // N47 — a vanished partial part is not a type deletion (other parts
+        // may live elsewhere). Pass a replacement type, not a swap.
+        self.expect_cold(
+            "N47 partial part removed",
+            PARTIAL_COLD_FILE,
+            "public class LocusSelfTestPartialColdSpacer\n{\n    public int Mark() { return 1; }\n}\n",
+            "partial type part removed",
+            PARTIAL_COLD_BASELINE,
+        )
+        .await;
+
+        // N48 — a new partial declaration is ambiguous from one file.
+        let mut text = PARTIAL_COLD_BASELINE.to_string();
+        if swap(
+            &mut text,
+            "    public int Read() { return _value; }\n}\n",
+            "    public int Read() { return _value; }\n}\n\npublic partial class LocusSelfTestPartialColdNew\n{\n}\n",
+        )
+        .is_ok()
+        {
+            self.expect_cold(
+                "N48 new partial type declaration",
+                PARTIAL_COLD_FILE,
+                &text,
+                "new partial type declaration",
+                PARTIAL_COLD_BASELINE,
+            )
+            .await;
+        }
+
+        // N49 — the whole-file re-detour cannot cover a partial type's other
+        // parts, so a using change in a partial file fails closed.
+        let mut text = PARTIAL_COLD_BASELINE.to_string();
+        if swap(
+            &mut text,
+            "public partial class LocusSelfTestPartialCold",
+            "using System.Text;\n\npublic partial class LocusSelfTestPartialCold",
+        )
+        .is_ok()
+        {
+            self.expect_cold(
+                "N49 using changed in a partial file",
+                PARTIAL_COLD_FILE,
+                &text,
+                "using directives changed in a file with a partial type",
+                PARTIAL_COLD_BASELINE,
+            )
+            .await;
+        }
+
+        // N50 — adding/dropping a part within one file changes how the
+        // compiler interleaves members.
+        let mut text = PARTIAL_COUNT_BASELINE.to_string();
+        if swap(
+            &mut text,
+            "\npublic partial class LocusSelfTestPartialCount\n{\n    public int B() { return 2; }\n}\n",
+            "",
+        )
+        .is_ok()
+        {
+            self.expect_cold(
+                "N50 partial part count changed in file",
+                PARTIAL_COUNT_FILE,
+                &text,
+                "partial type part count changed in file",
+                PARTIAL_COUNT_BASELINE,
+            )
+            .await;
+        }
+
+        // N51 — a partial type's initializers compile into ctors that may
+        // live in other parts.
+        let mut text = PARTIAL_COLD_BASELINE.to_string();
+        if swap(
+            &mut text,
+            "private int _value = 10;",
+            "private int _value = 20;",
+        )
+        .is_ok()
+        {
+            self.expect_cold(
+                "N51 partial type initializer changed",
+                PARTIAL_COLD_FILE,
+                &text,
+                "partial type instance initializer changed",
+                PARTIAL_COLD_BASELINE,
+            )
+            .await;
+        }
+
+        // N52 — a partial method whose defining and implementing halves land
+        // in the same (merged) file cannot be paired.
+        let mut text = PARTIAL_COLD_BASELINE.to_string();
+        if swap(
+            &mut text,
+            "    partial void Hook();\n",
+            "    partial void Hook();\n    partial void Hook() { }\n",
+        )
+        .is_ok()
+        {
+            self.expect_cold(
+                "N52 partial method declared twice in this file",
+                PARTIAL_COLD_FILE,
+                &text,
+                "partial method declared twice in this file",
+                PARTIAL_COLD_BASELINE,
+            )
+            .await;
+        }
+
+        // Intentional integration-coverage gaps (covered by the HotDiff unit
+        // tests, not reproducible here): [BurstCompile] surface needs the Burst
+        // package; an "unsupported operator" is unreachable (every overloadable
+        // C# operator has a metadata name); the default-interface-method gate
+        // needs runtime DIM support the baseline corpus must not assume; and
+        // explicit-interface ADD/REMOVE cannot be isolated without first
+        // tripping another reason (a same-file contract change).
+        self.log(
+            "  note: Burst / unsupported-operator / default-interface-method gate variants are \
+             covered by HotDiff unit tests, not this suite",
+        );
+
         // N20 — an added member with NO reachable caller compiles to a shim
         // but detours nothing: the verdict must say the addition is parked,
         // not pretend nothing changed.
@@ -3746,8 +7020,25 @@ impl SelfTest {
 
     async fn finalize(&mut self) {
         self.log("Phase 7/7 — leaving play mode and converging");
-        if let Err(error) = crate::unity_bridge::exit_play_mode(&self.project).await {
-            self.log(format!("exit_play_mode failed (continuing): {error}"));
+        // The component-proxy coverage above edits real Unity physics message
+        // signatures into MESSAGE_FILE during play mode. Restore the baseline
+        // before the real Unity recompile so older editors with sparse module
+        // references can converge the corpus cleanly.
+        self.revert_files(&[(MESSAGE_FILE, MESSAGE_BASELINE)]).await;
+        self.log("Message test corpus restored before convergence.");
+        self.log("Requesting play mode exit...");
+        match tokio::time::timeout(
+            EXIT_PLAY_MODE_TIMEOUT,
+            crate::unity_bridge::exit_play_mode(&self.project),
+        )
+        .await
+        {
+            Ok(Ok(())) => self.log("exit_play_mode completed"),
+            Ok(Err(error)) => self.log(format!("exit_play_mode failed (continuing): {error}")),
+            Err(_) => self.log(format!(
+                "exit_play_mode timed out after {}ms (continuing)",
+                EXIT_PLAY_MODE_TIMEOUT.as_millis()
+            )),
         }
         if let Err(error) = self
             .wait_for_play_state(false, Duration::from_secs(60))
@@ -3787,6 +7078,11 @@ impl SelfTest {
             }
         }
 
+        self.cleanup_corpus().await;
+        self.restore_code_optimization().await;
+    }
+
+    async fn cleanup_corpus(&mut self) {
         // The corpus served its purpose. Deleting through the tracker keeps
         // the paths in the pending set, so the cleanup recompile forwards
         // them and the plugin refreshes the stale AssetDatabase entries away.
@@ -3805,16 +7101,48 @@ impl SelfTest {
         }
     }
 
+    async fn restore_code_optimization(&mut self) {
+        let Some(original) = self.original_code_optimization.take() else {
+            return;
+        };
+        if original != "debug" && original != "release" {
+            return;
+        }
+        if original == "release" {
+            return;
+        }
+        match self
+            .set_code_optimization_retrying(&original, "Code Optimization restore")
+            .await
+        {
+            Ok(value) => {
+                self.log(format!("Code Optimization restored to {value}."));
+            }
+            Err(error) => {
+                self.log(format!("Code Optimization restore failed: {error}"));
+            }
+        }
+    }
+
     async fn wait_for_convergence(&self, timeout: Duration) -> Result<(), String> {
         let start = std::time::Instant::now();
+        let mut next_progress_log = Duration::ZERO;
         loop {
-            if super::counters().active_patches == 0 {
+            let elapsed = start.elapsed();
+            let active = coordinator::project_active_patches(&self.project).await;
+            if active == 0 {
                 return Ok(());
             }
-            if start.elapsed() > timeout {
+            if elapsed >= next_progress_log {
+                self.log(format!(
+                    "Waiting for convergence: {active} patch(es) active after {}s",
+                    elapsed.as_secs()
+                ));
+                next_progress_log += Duration::from_secs(10);
+            }
+            if elapsed > timeout {
                 return Err(format!(
-                    "{} patch(es) still active after {}s",
-                    super::counters().active_patches,
+                    "{active} patch(es) still active after {}s",
                     timeout.as_secs()
                 ));
             }
@@ -3853,12 +7181,52 @@ impl SelfTest {
             "preconditions",
             "editor connected in edit mode; features enabled",
         );
+        self.probe_message_driver_capabilities().await;
+
+        // Force Release for this suite so the AggressiveInlining sample and
+        // caller-refresh path run against Mono's actual inliner. Teardown
+        // restores the original mode on both success and post-switch failure.
+        let (_, code_optimization) = coordinator::detect_code_optimization(&self.project).await;
+        self.original_code_optimization = code_optimization.clone();
+        if code_optimization.as_deref() != Some("release") {
+            match self
+                .set_code_optimization_retrying("release", "preconditions Code Optimization")
+                .await
+            {
+                Ok(value) => {
+                    self.release_mode = value == "release";
+                    self.log(format!(
+                        "Code Optimization switched from {} to {} for Release inline coverage",
+                        code_optimization.as_deref().unwrap_or("unknown"),
+                        value,
+                    ));
+                }
+                Err(error) => {
+                    self.fail("preconditions", error);
+                    self.restore_code_optimization().await;
+                    self.emit(None, true);
+                    return;
+                }
+            }
+        } else {
+            self.release_mode = true;
+            self.log("Code Optimization = release");
+        }
 
         if let Err(error) = self.initialize_corpus().await {
             self.fail("initialize", error);
+            self.restore_code_optimization().await;
+            self.cleanup_corpus().await;
             self.emit(None, true);
             return;
         }
+        // Force + runtime-verify Release BEFORE the edit-mode patch tests: the
+        // ensure step recompiles, which would revert E01's live editor patch if it
+        // ran between E01 and the E02 play-enter assertion. The probe then reads
+        // inline bits in a known Release (or explicitly-flagged-Debug) edit-mode
+        // domain, so its data is never silently confounded.
+        self.ensure_release_effective().await;
+        self.run_inline_probes().await;
         self.run_editmode_tests().await;
         if let Err(error) = self.enter_play_mode().await {
             self.fail("enter play mode", error);
@@ -3869,9 +7237,16 @@ impl SelfTest {
 
         // Evolving source ledgers: every step edits from the CURRENT text.
         let mut subject = SUBJECT_BASELINE.to_string();
+        let mut messages = MESSAGE_BASELINE.to_string();
         let mut helper = HELPER_BASELINE.to_string();
 
         self.run_positive_tests(&mut subject, &mut helper).await;
+        self.run_message_driver_tests(&mut messages).await;
+        self.run_hot_added_mono_behaviour_diagnostic().await;
+        self.run_release_inline_tests().await;
+        self.run_release_inline_multifile_tests().await;
+        self.run_inline_force_evaluate_check().await;
+        self.run_adversarial_tests().await;
         self.run_negative_tests().await;
         self.run_deletion_tests(&mut subject, &mut helper).await;
         self.finalize().await;
@@ -3906,19 +7281,22 @@ pub async fn run(app: tauri::AppHandle, project_path: String) -> Result<(), Stri
         return Err("the hot-reload self-test is already running".to_string());
     }
 
-    tauri::async_runtime::spawn(async move {
-        let mut test = SelfTest {
-            app,
-            project: project_path,
-            passed: 0,
-            failed: 0,
-            negative_ledgers: NegativeLedgers::default(),
-            domain_reload_on_play: None,
-            epmo_enabled: None,
-            editor_patch_live: false,
-        };
-        test.run().await;
-        RUNNING.store(false, Ordering::SeqCst);
-    });
+    let _running_guard = SelfTestRunningGuard;
+    let mut test = SelfTest {
+        app,
+        project: project_path,
+        passed: 0,
+        failed: 0,
+        negative_ledgers: NegativeLedgers::default(),
+        domain_reload_on_play: None,
+        epmo_enabled: None,
+        editor_patch_live: false,
+        release_mode: false,
+        original_code_optimization: None,
+        last_apply_inlined: false,
+        last_apply_summary: String::new(),
+        message_driver_capabilities: MessageDriverCapabilities::default(),
+    };
+    test.run().await;
     Ok(())
 }

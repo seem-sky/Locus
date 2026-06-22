@@ -151,6 +151,37 @@ public sealed class HotDiffFileDto
     public string? NewText { get; set; }
 }
 
+public sealed class ForceDetourDto
+{
+    [JsonPropertyName("path")]
+    public string? Path { get; set; }
+
+    /// <summary>
+    /// CallerScan caller method keys:
+    /// DeclaringType|MetadataName|ParameterCount|s/i.
+    /// </summary>
+    [JsonPropertyName("methodKeys")]
+    public string[]? MethodKeys { get; set; }
+}
+
+public sealed class CallerQueryTargetDto
+{
+    [JsonPropertyName("declaringType")]
+    public string? DeclaringType { get; set; }
+
+    [JsonPropertyName("memberName")]
+    public string? MemberName { get; set; }
+}
+
+public sealed class CallerQueryRequestDto
+{
+    [JsonPropertyName("params")]
+    public CompileParamsDto? Params { get; set; }
+
+    [JsonPropertyName("targets")]
+    public CallerQueryTargetDto[]? Targets { get; set; }
+}
+
 public sealed class AnalyzeHotDiffRequestDto
 {
     [JsonPropertyName("files")]
@@ -229,6 +260,14 @@ public sealed class CompileHotPatchRequestDto
     /// closed through the completeness gate.</summary>
     [JsonPropertyName("baselineSiblings")]
     public BaselineSiblingDto[]? BaselineSiblings { get; set; }
+
+    /// <summary>
+    /// Release-inline caller refresh: compile these unchanged caller files and
+    /// detour only the listed caller methods, so stale inlined call sites can
+    /// be refreshed without rehooking a whole file.
+    /// </summary>
+    [JsonPropertyName("forceDetours")]
+    public ForceDetourDto[]? ForceDetours { get; set; }
 }
 
 /// <summary>One candidate sibling part file (B6): current disk text only —
@@ -280,7 +319,7 @@ public sealed class CompileAccessProbeRequestDto
 
 public sealed class CompileService
 {
-    public const int ProtocolVersion = 5;
+    public const int ProtocolVersion = 6;
 
     /// <summary>
     /// Version of the generated wrapper's entry-point contract with the Unity
@@ -321,12 +360,19 @@ public sealed class CompileService
     private readonly ImageRegistry _imageRegistry = new();
     private readonly MemberSurfaceRegistry _memberSurfaceRegistry = new();
     private readonly FieldStoreRegistry _fieldStoreRegistry = new();
+    private readonly NewTypeRegistry _newTypeRegistry = new();
 
     // Registrations of compiled-but-not-yet-accepted hot patches, keyed by
     // assembly name; committed into the registries when image/register
     // confirms Unity loaded the patch.
     private readonly object _pendingShimLock = new();
     private readonly Dictionary<string, (string Generation, List<ShimRegistration> Shims, List<FieldStoreRegistration> FieldStores)> _pendingShims =
+        new(StringComparer.Ordinal);
+
+    // Same deferral for play-mode-born new-type files (kept separate from the
+    // shim map so the shim path stays untouched): committed into the
+    // NewTypeRegistry when image/register confirms Unity loaded the patch.
+    private readonly Dictionary<string, (string Generation, List<KeyValuePair<string, NewTypeRegistry.FileEntry>> Entries)> _pendingNewTypes =
         new(StringComparer.Ordinal);
 
     private int _assemblyCounter;
@@ -434,6 +480,21 @@ public sealed class CompileService
         {
             CommitShimRegistrations(pending.Generation, pending.Shims);
             CommitFieldStoreRegistrations(pending.Generation, pending.FieldStores);
+        }
+
+        // Same acceptance gate for play-mode-born new-type files: only now is
+        // the type actually live in the running domain, so later re-edits may
+        // redirect onto it.
+        (string Generation, List<KeyValuePair<string, NewTypeRegistry.FileEntry>> Entries) pendingNewTypes = default;
+        lock (_pendingShimLock)
+        {
+            if (_pendingNewTypes.TryGetValue(request.AssemblyName!, out pendingNewTypes!))
+                _pendingNewTypes.Remove(request.AssemblyName!);
+        }
+        if (pendingNewTypes.Entries != null &&
+            string.Equals(pendingNewTypes.Generation, request.DomainGeneration, StringComparison.Ordinal))
+        {
+            _newTypeRegistry.Commit(pendingNewTypes.Generation, pendingNewTypes.Entries);
         }
 
         return new JsonObject
@@ -625,7 +686,7 @@ public sealed class CompileService
 
     private static JsonObject HotDiffMethodJson(HotDiffMethod method)
     {
-        return new JsonObject
+        var json = new JsonObject
         {
             ["declaringType"] = method.DeclaringType,
             ["name"] = method.Name,
@@ -634,7 +695,359 @@ public sealed class CompileService
             ["isCtor"] = method.IsCtor,
             ["added"] = method.Added,
         };
+        // A newly added Unity message drives via the runtime (pump or proxy)
+        // rather than a detour; surface the driver kind so analyze/hotDiff
+        // explains why an added message is hot.
+        if (method.MessageDriverKind.Length > 0)
+            json["messageDriverKind"] = method.MessageDriverKind;
+        return json;
     }
+
+    private static Dictionary<string, HashSet<string>> ForceDetourMap(ForceDetourDto[]? forceDetours)
+    {
+        var map = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
+        foreach (ForceDetourDto force in forceDetours ?? Array.Empty<ForceDetourDto>())
+        {
+            if (string.IsNullOrWhiteSpace(force.Path))
+                continue;
+            string key = NormalizePathKey(force.Path!);
+            if (!map.TryGetValue(key, out HashSet<string>? methods))
+                map[key] = methods = new HashSet<string>(StringComparer.Ordinal);
+            foreach (string methodKey in force.MethodKeys ?? Array.Empty<string>())
+            {
+                if (!string.IsNullOrWhiteSpace(methodKey))
+                    methods.Add(methodKey);
+            }
+        }
+        return map;
+    }
+
+    private sealed class ForcedMethodKey
+    {
+        public string DeclaringType = "";
+        public string Name = "";
+        public int ParameterCount;
+        public bool IsStatic;
+    }
+
+    private static ForcedMethodKey? ParseForcedMethodKey(string key)
+    {
+        string[] parts = key.Split('|');
+        if (parts.Length != 4)
+            return null;
+        if (!int.TryParse(parts[2], NumberStyles.Integer, CultureInfo.InvariantCulture, out int parameterCount))
+            return null;
+        return new ForcedMethodKey
+        {
+            DeclaringType = parts[0],
+            Name = parts[1],
+            ParameterCount = parameterCount,
+            IsStatic = string.Equals(parts[3], "s", StringComparison.Ordinal),
+        };
+    }
+
+    private static void ApplyForcedDetours(
+        string path,
+        string newText,
+        CSharpParseOptions parseOptions,
+        HotDiffFileResult diff,
+        HashSet<string> methodKeys)
+    {
+        if (methodKeys.Count == 0)
+            return;
+
+        CompilationUnitSyntax root;
+        try
+        {
+            root = CSharpSyntaxTree.ParseText(newText, parseOptions, path: path)
+                .GetCompilationUnitRoot();
+        }
+        catch (Exception ex)
+        {
+            diff.Hot = false;
+            diff.Reasons.Add("inline caller refresh could not parse " + path + ": " + ex.Message);
+            return;
+        }
+
+        var existing = new HashSet<string>(
+            diff.ChangedMethods.Select(m => ForceKey(m.DeclaringType, m.Name, m.ParamTypeNames.Length, m.IsStatic)),
+            StringComparer.Ordinal);
+
+        foreach (string rawKey in methodKeys)
+        {
+            ForcedMethodKey? key = ParseForcedMethodKey(rawKey);
+            if (key == null)
+            {
+                diff.Hot = false;
+                diff.Reasons.Add("inline caller refresh received malformed method key: " + rawKey);
+                return;
+            }
+
+            var matches = new List<(TypeDeclarationSyntax Host, MemberDeclarationSyntax Member, HotDiffMethod Method)>();
+            foreach (TypeDeclarationSyntax type in root.DescendantNodes().OfType<TypeDeclarationSyntax>())
+            {
+                string metadataName = HotDiff.MetadataName(type);
+                if (!string.Equals(metadataName, key.DeclaringType, StringComparison.Ordinal))
+                    continue;
+
+                foreach (MemberDeclarationSyntax member in type.Members)
+                {
+                    HotDiffMethod? method = ForcedMethodForMember(metadataName, member, key);
+                    if (method != null)
+                        matches.Add((type, member, method));
+                }
+            }
+
+            if (matches.Count == 0)
+            {
+                diff.Hot = false;
+                diff.Reasons.Add("inline caller refresh could not find " + rawKey + " in " + path);
+                return;
+            }
+            if (matches.Count > 1)
+            {
+                diff.Hot = false;
+                diff.Reasons.Add("inline caller refresh found ambiguous overloads for " + rawKey + " in " + path);
+                return;
+            }
+
+            var (host, memberDecl, forcedMethod) = matches[0];
+            string? gate = ForcedDetourGate(host, memberDecl, forcedMethod);
+            if (gate != null)
+            {
+                diff.Hot = false;
+                diff.Reasons.Add(gate);
+                return;
+            }
+
+            string forceKey = ForceKey(
+                forcedMethod.DeclaringType,
+                forcedMethod.Name,
+                forcedMethod.ParamTypeNames.Length,
+                forcedMethod.IsStatic);
+            if (existing.Add(forceKey))
+                diff.ChangedMethods.Add(forcedMethod);
+            if (!diff.PatchedTypes.Contains(forcedMethod.DeclaringType, StringComparer.Ordinal))
+                diff.PatchedTypes.Add(forcedMethod.DeclaringType);
+        }
+
+        diff.PatchedTypes = diff.PatchedTypes.Distinct(StringComparer.Ordinal).OrderBy(t => t, StringComparer.Ordinal).ToList();
+    }
+
+    private static string ForceKey(string declaringType, string name, int parameterCount, bool isStatic) =>
+        declaringType + "|" + name + "|" + parameterCount + (isStatic ? "|s" : "|i");
+
+    /// <summary>Release inline caller-refresh, instance arm (Option A): for each
+    /// CHANGED instance method eligible for the self-shim redirect, inject a
+    /// uniquely-named clone into its type in the new-side tree and a synthetic
+    /// ADDED diff entry, so the existing M2 shim pipeline emits a static
+    /// self-shim while the original method keeps its normal detour. Returns the
+    /// clone specs so <c>PatchBatchContext.Build</c> can gate them on the access
+    /// caps and wire the original method's in-batch call sites to the shim.
+    /// <para>Static callees already redirect unconditionally (cheap table
+    /// entry); the instance arm runs only in refresh compiles (force detours
+    /// present), where alone a same-batch caller exists to inline into — a
+    /// normal edit has no in-batch caller, so the extra shim would be dead
+    /// weight.</para>
+    /// Mutates <paramref name="batchFiles"/> trees and diffs in place.</summary>
+    private static List<InlineRedirectClone> BuildInlineRedirectClones(
+        List<(string Path, SyntaxTree Tree, HotDiffFileResult Diff)> batchFiles,
+        CSharpParseOptions parseOptions)
+    {
+        var clones = new List<InlineRedirectClone>();
+        for (int i = 0; i < batchFiles.Count; i++)
+        {
+            var (path, tree, diff) = batchFiles[i];
+            var root = (CompilationUnitSyntax)tree.GetRoot();
+
+            var additions = new Dictionary<TypeDeclarationSyntax, List<MethodDeclarationSyntax>>();
+            var pending = new List<(HotDiffMethod Clone, HotDiffMethod Original)>();
+            int counter = 0;
+
+            foreach (HotDiffMethod changed in diff.ChangedMethods.Where(m => !m.Added).ToList())
+            {
+                if (changed.IsCtor || changed.IsStatic || changed.TypeParameterCount != 0)
+                    continue;
+                MethodDeclarationSyntax? decl = PatchBatchContext.FindAddedMethodDeclaration(root, changed);
+                if (decl == null || !IsInlineCloneEligible(decl))
+                    continue;
+                if (decl.Ancestors().OfType<TypeDeclarationSyntax>().FirstOrDefault() is not TypeDeclarationSyntax host)
+                    continue;
+
+                string cloneName = changed.Name + "__LocusInline_" + counter++;
+                MethodDeclarationSyntax clone = decl
+                    .WithIdentifier(SyntaxFactory.Identifier(cloneName))
+                    .WithLeadingTrivia(SyntaxFactory.ElasticCarriageReturnLineFeed)
+                    .WithTrailingTrivia(SyntaxFactory.ElasticCarriageReturnLineFeed);
+
+                if (!additions.TryGetValue(host, out List<MethodDeclarationSyntax>? list))
+                    additions[host] = list = new List<MethodDeclarationSyntax>();
+                list.Add(clone);
+
+                pending.Add((
+                    new HotDiffMethod
+                    {
+                        DeclaringType = changed.DeclaringType,
+                        Name = cloneName,
+                        ParamTypeNames = changed.ParamTypeNames,
+                        IsStatic = false,
+                        IsCtor = false,
+                        Added = true,
+                        TypeParameterCount = 0,
+                    },
+                    changed));
+            }
+
+            if (additions.Count == 0)
+                continue;
+
+            // computeReplacement receives the node with its descendants already
+            // rewritten — add to THAT so a clone in a nested type isn't lost
+            // when its outer type is also rewritten.
+            CompilationUnitSyntax newRoot = root.ReplaceNodes(
+                additions.Keys,
+                (original, rewritten) => ((TypeDeclarationSyntax)rewritten).AddMembers(additions[original].ToArray()));
+            batchFiles[i] = (path, CSharpSyntaxTree.Create(newRoot, parseOptions, path), diff);
+
+            foreach (var (cloneDiff, original) in pending)
+            {
+                diff.ChangedMethods.Add(cloneDiff);
+                clones.Add(new InlineRedirectClone { FilePath = path, Original = original, Clone = cloneDiff });
+            }
+        }
+        return clones;
+    }
+
+    /// <summary>An instance method whose changed body may be re-emitted as a
+    /// static self-shim: it must have a body, carry no method type parameters,
+    /// not be virtual/override/abstract/extern/partial/static or an explicit
+    /// interface impl (virtual dispatch and bodiless members can't be flattened
+    /// to a dispatch-free shim), and live in a non-interface, non-generic,
+    /// non-ref-struct type (the `((Foo)(object)this)` self-cast needs a boxable
+    /// reference identity for the implicit-receiver case).</summary>
+    private static bool IsInlineCloneEligible(MethodDeclarationSyntax decl)
+    {
+        if (decl.Body == null && decl.ExpressionBody == null)
+            return false;
+        if (decl.TypeParameterList is { Parameters.Count: > 0 })
+            return false;
+        if (decl.ExplicitInterfaceSpecifier != null)
+            return false;
+        foreach (SyntaxToken modifier in decl.Modifiers)
+        {
+            if (modifier.IsKind(SyntaxKind.VirtualKeyword) ||
+                modifier.IsKind(SyntaxKind.OverrideKeyword) ||
+                modifier.IsKind(SyntaxKind.AbstractKeyword) ||
+                modifier.IsKind(SyntaxKind.ExternKeyword) ||
+                modifier.IsKind(SyntaxKind.PartialKeyword) ||
+                modifier.IsKind(SyntaxKind.StaticKeyword))
+            {
+                return false;
+            }
+        }
+        foreach (TypeDeclarationSyntax type in decl.Ancestors().OfType<TypeDeclarationSyntax>())
+        {
+            if (type is InterfaceDeclarationSyntax)
+                return false;
+            if (type.TypeParameterList is { Parameters.Count: > 0 })
+                return false;
+            // Value types are deferred: a `ref self` shim cannot bind a temp
+            // receiver (`new S().M()`) and a by-value self would drop `this`
+            // mutations. Such edits converge via the queued recompile. (Build
+            // re-checks IsValueType at the symbol level for record structs.)
+            if (type is StructDeclarationSyntax)
+                return false;
+        }
+        return true;
+    }
+
+    private static HotDiffMethod? ForcedMethodForMember(
+        string metadataName,
+        MemberDeclarationSyntax member,
+        ForcedMethodKey key)
+    {
+        switch (member)
+        {
+            case MethodDeclarationSyntax method when
+                string.Equals(method.Identifier.Text, key.Name, StringComparison.Ordinal) &&
+                method.ParameterList.Parameters.Count == key.ParameterCount &&
+                method.Modifiers.Any(SyntaxKind.StaticKeyword) == key.IsStatic:
+                return new HotDiffMethod
+                {
+                    DeclaringType = metadataName,
+                    Name = method.Identifier.Text,
+                    ParamTypeNames = HotDiff.ParamTypeNames(method.ParameterList),
+                    ParamTypeSigs = HotDiff.ParamTypeSigs(method.ParameterList),
+                    IsStatic = key.IsStatic,
+                    IsCtor = false,
+                    Added = false,
+                };
+            case ConstructorDeclarationSyntax ctor when
+                string.Equals(key.Name, ".ctor", StringComparison.Ordinal) &&
+                ctor.ParameterList.Parameters.Count == key.ParameterCount &&
+                !key.IsStatic:
+                return new HotDiffMethod
+                {
+                    DeclaringType = metadataName,
+                    Name = ".ctor",
+                    ParamTypeNames = HotDiff.ParamTypeNames(ctor.ParameterList),
+                    ParamTypeSigs = HotDiff.ParamTypeSigs(ctor.ParameterList),
+                    IsStatic = false,
+                    IsCtor = true,
+                    Added = false,
+                };
+            default:
+                return null;
+        }
+    }
+
+    private static string? ForcedDetourGate(
+        TypeDeclarationSyntax host,
+        MemberDeclarationSyntax member,
+        HotDiffMethod method)
+    {
+        string Reason(string why) =>
+            "inline caller refresh cannot re-detour " + method.DeclaringType + "." + method.Name +
+            ": " + why + "; use unity_recompile";
+
+        if (host is InterfaceDeclarationSyntax)
+            return Reason("interface members are not supported");
+
+        for (SyntaxNode? current = host; current != null; current = current.Parent)
+        {
+            if (current is TypeDeclarationSyntax type && (type.TypeParameterList?.Parameters.Count ?? 0) > 0)
+                return Reason("generic type members are not supported");
+        }
+
+        if (HasBurstCompileAttributeText(host.AttributeLists) || HasBurstCompileAttributeText(member.AttributeLists))
+            return Reason("Burst-compiled members are not supported");
+
+        switch (member)
+        {
+            case MethodDeclarationSyntax methodDecl:
+                if (methodDecl.TypeParameterList != null && methodDecl.TypeParameterList.Parameters.Count > 0)
+                    return Reason("generic methods are not supported");
+                if (methodDecl.ExplicitInterfaceSpecifier != null)
+                    return Reason("explicit interface implementations are not supported");
+                if (methodDecl.Body == null && methodDecl.ExpressionBody == null)
+                    return Reason("the method has no body");
+                break;
+            case ConstructorDeclarationSyntax ctor:
+                if (ctor.Modifiers.Any(SyntaxKind.StaticKeyword))
+                    return Reason("static constructors are not supported");
+                if (ctor.Body == null && ctor.ExpressionBody == null)
+                    return Reason("the constructor has no body");
+                break;
+            default:
+                return Reason("only methods and instance constructors are supported");
+        }
+
+        return null;
+    }
+
+    private static bool HasBurstCompileAttributeText(SyntaxList<AttributeListSyntax> attributes) =>
+        attributes.SelectMany(list => list.Attributes)
+            .Any(attribute => attribute.Name.ToString().Contains("BurstCompile", StringComparison.Ordinal));
 
     /// <summary>
     /// Full hot-patch pipeline: diff every file (same classification as
@@ -681,6 +1094,36 @@ public sealed class CompileService
         var syntaxErrors = new StringBuilder();
         var coldFiles = new JsonArray();
         bool anyCold = false;
+        Dictionary<string, HashSet<string>> forceDetours = ForceDetourMap(request.ForceDetours);
+
+        // Play-mode-born new-type files registered by earlier batches of this
+        // generation: a re-edit re-diffs against the original loaded text (not
+        // the empty coordinator baseline) so a body change becomes a detour
+        // onto the FIRST loaded type. reeditFileAssemblies records, per file
+        // that took this path, that first assembly — the detour ORIGINAL side.
+        IReadOnlyDictionary<string, NewTypeRegistry.FileEntry> newTypeBaselines =
+            _newTypeRegistry.SnapshotFor(request.Params?.DomainGeneration);
+        var reeditFileAssemblies = new Dictionary<string, string>(StringComparer.Ordinal);
+        // Feature #5: per-type override of reeditFileAssemblies for sibling types
+        // born into a play-mode-born file after its first batch (they live in
+        // their own assembly). Keyed by the sibling's metadata name.
+        var reeditTypeAssemblies = new Dictionary<string, string>(StringComparer.Ordinal);
+        var fileByPathKey = new Dictionary<string, HotDiffFileDto>(StringComparer.Ordinal);
+        foreach (HotDiffFileDto f in request.Files)
+            if (!string.IsNullOrEmpty(f.Path))
+                fileByPathKey[NormalizePathKey(f.Path!)] = f;
+        // New-type registry commits, collected through the batch and committed
+        // once the image is accepted: NEW play-mode-born files (assembly pinned
+        // after emit) and redirect marks (Redirected=true, assembly already the
+        // first one — left un-pinned). Declared here because the redirect marks
+        // are discovered in the diff loop below.
+        var newTypeRegistrations = new List<KeyValuePair<string, NewTypeRegistry.FileEntry>>();
+        // Play-mode-born re-edits that REMOVED a previously hot-applied Unity
+        // message: the runtime drove it by the shim (not native dispatch), so it
+        // is silenced by CLEARING that driver. Collected through the diff loop and
+        // emitted as clear-marker message drivers after the rewrite (so the
+        // plugin's replace-by-source teardown removes the stale pump).
+        var bornDriverClears = new List<BornDriverClear>();
 
         foreach (HotDiffFileDto file in request.Files)
         {
@@ -695,6 +1138,20 @@ public sealed class CompileService
                 syntaxErrors.Append(diff.SyntaxError);
                 continue;
             }
+            // If this file's types live only in a prior hot-patch assembly,
+            // re-route the diff against the first loaded text (not the empty
+            // coordinator baseline, which re-classifies the whole type as new
+            // every time). RouteBornReedit picks one of: a body / additions /
+            // structural HOT apply onto the first assembly, a clean no-op
+            // (unchanged re-send), or COLD (recompile to converge).
+            if (newTypeBaselines.TryGetValue(NormalizePathKey(file.Path!), out NewTypeRegistry.FileEntry? bornEntry))
+            {
+                diff = RouteBornReedit(
+                    file, bornEntry, request, parseOptions,
+                    reeditFileAssemblies, reeditTypeAssemblies, newTypeRegistrations, bornDriverClears);
+            }
+            if (forceDetours.TryGetValue(NormalizePathKey(file.Path!), out HashSet<string>? methodKeys))
+                ApplyForcedDetours(file.Path!, file.NewText, parseOptions, diff, methodKeys);
             if (!diff.Hot)
             {
                 anyCold = true;
@@ -724,6 +1181,7 @@ public sealed class CompileService
         var trees = new List<SyntaxTree>();
         var methods = new JsonArray();
         var newTypes = new JsonArray();
+        var messageDrivers = new JsonArray();
         var accessAssemblies = new HashSet<string>(StringComparer.Ordinal);
         var shimRegistrations = new List<ShimRegistration>();
         var fieldStoreRegistrations = new List<FieldStoreRegistration>();
@@ -785,13 +1243,25 @@ public sealed class CompileService
         // source declaration would shadow the metadata type that this
         // batch's re-sent earlier fields still bind to — CS0117).
         string storeDiscriminator = assemblyName[(assemblyName.LastIndexOf('_') + 1)..];
+
+        // Release inline caller-refresh (instance arm): in a refresh compile the
+        // force-detoured callers are in this batch, so a CHANGED instance method
+        // they inline must be reachable through a static self-shim. Inject the
+        // clones into batchFiles BEFORE binding so both the Build model and the
+        // per-file rewrite see them; Build gates each on the access caps.
+        List<InlineRedirectClone>? inlineClones =
+            forceDetours.Count > 0 ? BuildInlineRedirectClones(batchFiles, parseOptions) : null;
+
         PatchBatchContext batch = PatchBatchContext.Build(
             batchFiles, references,
             _memberSurfaceRegistry.SnapshotFor(generation),
             _fieldStoreRegistry.SnapshotFor(generation),
             storeDiscriminator,
             allowUnsafe: request.Params?.AllowUnsafe ?? false,
-            runtimeCaps: AccessCaps.FromCells(request.RuntimeCaps?.Cells));
+            runtimeCaps: AccessCaps.FromCells(request.RuntimeCaps?.Cells),
+            inlineClones: inlineClones,
+            reeditFileAssemblies: reeditFileAssemblies,
+            reeditTypeAssemblies: reeditTypeAssemblies);
 
         // B6 fail-closed gate: every batch-declared partial type must
         // account, across its disk parts, for every member the ORIGINAL
@@ -844,14 +1314,64 @@ public sealed class CompileService
                     ["patchDeclaringType"] = map.PatchDeclaringType,
                     ["name"] = map.Name,
                     ["paramTypeNames"] = new JsonArray(map.ParamTypeNames.Select(p => (JsonNode)p).ToArray()),
+                    ["paramTypeSigs"] = new JsonArray(map.ParamTypeSigs.Select(p => (JsonNode)p).ToArray()),
                     ["isStatic"] = map.IsStatic,
                     ["isCtor"] = map.IsCtor,
+                    // The edited file whose rewrite produced this detour. The
+                    // desktop maps a returned inlined MethodKey back to this path
+                    // to queue only the affected file(s) for recompile
+                    // convergence, instead of the whole batch.
+                    ["sourcePath"] = filePath,
                 };
                 if (map.OriginalAssembly != null)
                     method["originalAssembly"] = map.OriginalAssembly;
                 if (map.IsStub)
                     method["isStub"] = true;
                 methods.Add(method);
+            }
+            // M2 message drivers: a newly added Unity message that the engine
+            // never dispatches after load materialized as an ordinary instance
+            // shim above. Hand the runtime the shim coordinates plus the driver
+            // kind so it wires the right driver — a PlayerLoop pump (player_loop)
+            // or a forwarding proxy MonoBehaviour (component_proxy). Joined to the
+            // shim registration by member identity for the authoritative metadata.
+            foreach (HotDiffMethod added in diff.ChangedMethods)
+            {
+                if (!added.Added || added.MessageDriverKind.Length == 0)
+                    continue;
+                string memberKey = MemberSurfaceRegistry.MemberKey(
+                    added.DeclaringType, added.Name, added.ParamTypeNames, added.IsStatic);
+                MemberSurfaceRegistry.ShimEntry? shim = rewrite.ShimRegistrations
+                    .FirstOrDefault(r => r.MemberKey == memberKey)?.Entry;
+                if (shim == null)
+                    continue;
+                var driver = new JsonObject
+                {
+                    ["kind"] = added.MessageDriverKind,
+                    ["declaringType"] = added.DeclaringType,
+                    ["shimType"] = shim.ShimTypeMetadataName,
+                    ["shimMethod"] = shim.ShimMethod,
+                    ["message"] = added.Name,
+                    // The engine-delivered argument type (component_proxy with an
+                    // argument; empty for parameterless callbacks).
+                    ["paramType"] = added.ParamTypeNames.Length > 0 ? added.ParamTypeNames[0] : "",
+                    // Agent-facing caveat (lifecycle timing / approximate order);
+                    // empty when the driver matches native behavior.
+                    ["note"] = added.MessageNote,
+                    ["sourcePath"] = filePath,
+                };
+                // Tier-2: an added message on a play-mode-born type drives instances
+                // that live ONLY in a hot-patch assembly. Pin it so the runtime
+                // resolves declaringType THERE (its default resolver skips
+                // __LocusHotPatch_ assemblies, exactly like the M2 method detour).
+                // ReeditAssemblyFor resolves PER TYPE — a late-born sibling (feature
+                // #5) and its NESTED types live in their OWN assembly, not the file's
+                // first one. Null (the ordinary compiled-type case) → the runtime
+                // uses the default cross-domain resolution, unchanged.
+                string? driverOriginalAssembly = batch.ReeditAssemblyFor(filePath, added.DeclaringType);
+                if (driverOriginalAssembly != null)
+                    driver["originalAssembly"] = driverOriginalAssembly;
+                messageDrivers.Add(driver);
             }
             foreach (PatchNewType newType in rewrite.NewTypes)
             {
@@ -864,10 +1384,68 @@ public sealed class CompileService
                     ["isTopLevel"] = newType.IsTopLevel,
                 });
             }
+
+            // Register a brand-new FILE (empty coordinator baseline) that
+            // introduced a top-level type via load_only, so a later body-only
+            // re-edit redirects onto this assembly instead of re-loading the
+            // type afresh (which would leave live instances on the old body).
+            // Scoped to whole-new files: every type in them anchors to this one
+            // assembly, so the re-edit OriginalAssembly is unambiguous. Mixed
+            // files (a new type added beside compiled types) keep today's
+            // load_only behavior. Committed only once image/register confirms
+            // Unity loaded the patch (below) — if that call is dropped (e.g. a
+            // transport error), the entry is lost and the file's next re-edit
+            // simply falls back to load_only, exactly as before this feature.
+            // An ALREADY-registered file is excluded: its re-edits route through
+            // RouteBornReedit (which re-commits the birth baseline) and must not
+            // re-birth here against the current text — that would erase the
+            // baseline and re-load the live type into a fresh assembly.
+            if (rewrite.NewTypes.Any(t => t.IsTopLevel) &&
+                !newTypeBaselines.ContainsKey(NormalizePathKey(filePath)) &&
+                fileByPathKey.TryGetValue(NormalizePathKey(filePath), out HotDiffFileDto? bornFile) &&
+                string.IsNullOrWhiteSpace(bornFile.OldText))
+            {
+                newTypeRegistrations.Add(new KeyValuePair<string, NewTypeRegistry.FileEntry>(
+                    NormalizePathKey(filePath),
+                    new NewTypeRegistry.FileEntry
+                    {
+                        OriginalText = bornFile.NewText!,
+                        // At birth the loaded text IS the live text — the baseline for
+                        // detecting members removed by a later re-edit.
+                        LastAppliedText = bornFile.NewText!,
+                    }));
+            }
+        }
+
+        // Clear-markers (play-mode-born feature #1 / [P1] fix): a re-edit removed
+        // a Unity message that an earlier hot patch had wired to the runtime pump.
+        // The pump drives that message by the SHIM, not native dispatch, so the
+        // only way to stop it is to clear the driver. Emit a marker carrying the
+        // file as the touched source; the plugin's replace-by-source teardown
+        // clears every driver registered for the file and re-adds only those still
+        // present (this removed one is not). kind="clear"/empty shim keeps it out
+        // of the re-add loop, and a non-empty messageDrivers list keeps the Rust
+        // "nothing detourable" early-return from skipping Unity when the surviving
+        // payload (e.g. a parked field add) is otherwise empty.
+        foreach (BornDriverClear clear in bornDriverClears)
+        {
+            messageDrivers.Add(new JsonObject
+            {
+                ["kind"] = "clear",
+                ["declaringType"] = clear.DeclaringType,
+                ["shimType"] = "",
+                ["shimMethod"] = "",
+                ["message"] = clear.Message,
+                ["paramType"] = "",
+                ["note"] = "",
+                ["sourcePath"] = clear.SourcePath,
+                ["originalAssembly"] = clear.OriginalAssembly,
+            });
         }
 
         if (methods.Count == 0 && newTypes.Count == 0 &&
             fieldStoreRegistrations.Count == 0 &&
+            messageDrivers.Count == 0 &&
             shimRegistrations.All(r => r.Entry.Kind == "tombstone"))
         {
             // Nothing to detour and nothing new to load: pure deletions
@@ -875,9 +1453,20 @@ public sealed class CompileService
             // correct, the members are merely unreachable) and/or pure
             // accessibility narrowing. Commit tombstones so later batches
             // fail deterministically on references; skip the pointless
-            // assembly.
+            // assembly. (A clear-marker keeps messageDrivers non-empty so a
+            // driver-clearing re-edit still ships to Unity, not a no-op.)
             if (!string.IsNullOrEmpty(generation))
+            {
                 CommitShimRegistrations(generation!, shimRegistrations);
+                // A play-mode-born re-edit that only removed a post-birth member /
+                // field produces this empty-patch no-op, but its registry re-commit
+                // (advancing LastAppliedText so the live baseline does not drift) is
+                // still pending — commit it here, since the emit path below is
+                // skipped. No new sibling can reach this branch (a load_only is not
+                // a no-op), so no after-emit assembly pin is owed.
+                if (newTypeRegistrations.Count > 0)
+                    _newTypeRegistry.Commit(generation!, newTypeRegistrations);
+            }
             var verdict = new JsonObject
             {
                 ["hot"] = true,
@@ -944,20 +1533,40 @@ public sealed class CompileService
             registration.Entry.ShimAssembly = assemblyName;
         foreach (FieldStoreRegistration registration in fieldStoreRegistrations)
             registration.Entry.StoreAssembly = assemblyName;
+        // Pin the just-emitted assembly as the detour ORIGINAL side for NEW
+        // play-mode-born files (the same emit-time bookkeeping as shims). Redirect
+        // marks already carry the first assembly (non-empty) and must keep it.
+        foreach (var registration in newTypeRegistrations)
+            if (string.IsNullOrEmpty(registration.Value.OriginalAssembly))
+                registration.Value.OriginalAssembly = assemblyName;
+        // Feature #5: a genuinely-new SIBLING was load_only'd into THIS assembly;
+        // pin it so the sibling's later re-edits redirect onto it. Existing
+        // siblings already carry their (different) assembly and are left alone.
+        foreach (var registration in newTypeRegistrations)
+            if (registration.Value.Siblings != null)
+                foreach (NewTypeRegistry.SiblingType sibling in registration.Value.Siblings.Values)
+                    if (string.IsNullOrEmpty(sibling.Assembly))
+                        sibling.Assembly = assemblyName;
 
         if (request.RegisterImage && !string.IsNullOrEmpty(generation))
         {
             _imageRegistry.Register(generation!, assemblyName, bytes);
             CommitShimRegistrations(generation!, shimRegistrations);
             CommitFieldStoreRegistrations(generation!, fieldStoreRegistrations);
+            if (newTypeRegistrations.Count > 0)
+                _newTypeRegistry.Commit(generation!, newTypeRegistrations);
         }
-        else if ((shimRegistrations.Count > 0 || fieldStoreRegistrations.Count > 0) &&
+        else if ((shimRegistrations.Count > 0 || fieldStoreRegistrations.Count > 0 ||
+                  newTypeRegistrations.Count > 0) &&
                  !string.IsNullOrEmpty(generation))
         {
             lock (_pendingShimLock)
             {
-                _pendingShims[assemblyName] = (generation!, shimRegistrations, fieldStoreRegistrations);
-                // Keep the pending map bounded: entries for other
+                if (shimRegistrations.Count > 0 || fieldStoreRegistrations.Count > 0)
+                    _pendingShims[assemblyName] = (generation!, shimRegistrations, fieldStoreRegistrations);
+                if (newTypeRegistrations.Count > 0)
+                    _pendingNewTypes[assemblyName] = (generation!, newTypeRegistrations);
+                // Keep the pending maps bounded: entries for other
                 // generations can never commit.
                 foreach (string stale in _pendingShims
                              .Where(p => p.Value.Generation != generation)
@@ -966,6 +1575,13 @@ public sealed class CompileService
                 {
                     _pendingShims.Remove(stale);
                 }
+                foreach (string stale in _pendingNewTypes
+                             .Where(p => p.Value.Generation != generation)
+                             .Select(p => p.Key)
+                             .ToList())
+                {
+                    _pendingNewTypes.Remove(stale);
+                }
             }
         }
 
@@ -973,6 +1589,8 @@ public sealed class CompileService
         result["hot"] = true;
         result["methods"] = methods;
         result["newTypes"] = newTypes;
+        if (messageDrivers.Count > 0)
+            result["messageDrivers"] = messageDrivers;
         if (callerScanNote != null)
             result["callerScan"] = callerScanNote;
         if (request.RuntimeCaps != null)
@@ -1051,6 +1669,83 @@ public sealed class CompileService
         }
         result["cells"] = cells;
         return result;
+    }
+
+    public JsonNode HandleCallerQuery(JsonNode? @params)
+    {
+        var request = Deserialize<CallerQueryRequestDto>(@params);
+        if (request.Targets == null || request.Targets.Length == 0)
+            throw new RpcInvalidParamsException("caller/query requires at least one target");
+
+        var projectAssemblies = (request.Params?.ReferencePaths ?? Array.Empty<string>())
+            .Where(CallerScan.IsProjectAssemblyPath)
+            .ToList();
+        if (projectAssemblies.Count == 0)
+        {
+            return new JsonObject
+            {
+                ["success"] = false,
+                ["error"] = "cannot query callers: no project assemblies (Library/ScriptAssemblies) in the reference set",
+            };
+        }
+
+        var targets = new List<CallerScanTarget>();
+        foreach (CallerQueryTargetDto target in request.Targets)
+        {
+            if (string.IsNullOrWhiteSpace(target.DeclaringType))
+                throw new RpcInvalidParamsException("caller/query targets require declaringType");
+            targets.Add(new CallerScanTarget
+            {
+                DeclaringType = target.DeclaringType!,
+                MemberName = target.MemberName ?? "",
+            });
+        }
+
+        CallerScanResult scan = CallerScan.Scan(projectAssemblies, targets);
+        if (scan.Error != null)
+        {
+            return new JsonObject
+            {
+                ["success"] = false,
+                ["error"] = scan.Error,
+            };
+        }
+
+        var targetJson = new JsonArray();
+        foreach (CallerScanTarget target in targets)
+        {
+            string key = CallerScanTarget.Key(target.DeclaringType, target.MemberName);
+            var callers = new JsonArray();
+            if (scan.CallerLocations.TryGetValue(key, out List<CallerScanLocation>? locations))
+            {
+                foreach (CallerScanLocation location in locations
+                    .OrderBy(l => l.File, StringComparer.OrdinalIgnoreCase)
+                    .ThenBy(l => l.CallerMethodKey, StringComparer.Ordinal))
+                {
+                    callers.Add(new JsonObject
+                    {
+                        ["file"] = location.File,
+                        ["methodKey"] = location.CallerMethodKey,
+                        ["declaringType"] = location.DeclaringType,
+                        ["memberName"] = location.MemberName,
+                    });
+                }
+            }
+            targetJson.Add(new JsonObject
+            {
+                ["declaringType"] = target.DeclaringType,
+                ["memberName"] = target.MemberName,
+                ["key"] = key,
+                ["callers"] = callers,
+            });
+        }
+
+        return new JsonObject
+        {
+            ["success"] = true,
+            ["assemblyCount"] = projectAssemblies.Count,
+            ["targets"] = targetJson,
+        };
     }
 
     /// <summary>Run the M3 caller scan for the batch's pending checks.
@@ -1260,6 +1955,425 @@ public sealed class CompileService
 
     private static string NormalizePathKey(string path) =>
         path.Replace('\\', '/').ToLowerInvariant();
+
+    /// <summary>A play-mode-born re-edit that REMOVED a Unity message an earlier
+    /// hot patch wired to the runtime pump: the pump drove it through the shim,
+    /// not native dispatch, so it is silenced by CLEARING the driver (a
+    /// clear-marker), not by an empty-body stub. Carries the file (the
+    /// replace-by-source key) and the first assembly.</summary>
+    private sealed class BornDriverClear
+    {
+        public string SourcePath = "";
+        public string DeclaringType = "";
+        public string Message = "";
+        public string OriginalAssembly = "";
+    }
+
+    /// <summary>Route a re-edit of a play-mode-born file (whose types live only
+    /// in a prior hot-patch assembly). The cumulative diff against the BIRTH text
+    /// drives the patch — body redirects, additions (M2/M4/driver), removals (M5
+    /// tombstone/stub), field add/remove/retype (M4), enum additions (H7e) — all
+    /// pinned to the first assembly so EXISTING instances update. A second diff
+    /// against the LAST APPLIED text catches what the birth diff cannot: a member
+    /// ADDED after birth and now removed (e.g. an Update() added by an earlier
+    /// patch, then deleted), which the birth diff never saw because the member
+    /// was never in OriginalText. SIBLING types added after the first batch
+    /// (feature #5) are folded in via their own per-type baseline and assembly.
+    /// Outcomes:
+    ///   • HOT — the cumulative diff, assemblies pinned per type, post-birth
+    ///     removals folded in (tombstones; removed messages → clear-markers),
+    ///     sibling additions load_only'd and registered, sibling re-edits
+    ///     redirected onto their own assembly;
+    ///   • NO-OP — an unchanged re-send of a never-touched file;
+    ///   • COLD — a shape change (base type / kind / record), a redirected body
+    ///     reverted to its birth version, a removal on a sibling type, or an
+    ///     unresolvable assembly.
+    /// Mutates <paramref name="reeditFileAssemblies"/> /
+    /// <paramref name="reeditTypeAssemblies"/> (detour origins),
+    /// <paramref name="newTypeRegistrations"/> (live-text re-commit) and
+    /// <paramref name="bornDriverClears"/> (removed-message clear-markers).</summary>
+    private HotDiffFileResult RouteBornReedit(
+        HotDiffFileDto file,
+        NewTypeRegistry.FileEntry bornEntry,
+        CompileHotPatchRequestDto request,
+        CSharpParseOptions parseOptions,
+        Dictionary<string, string> reeditFileAssemblies,
+        Dictionary<string, string> reeditTypeAssemblies,
+        List<KeyValuePair<string, NewTypeRegistry.FileEntry>> newTypeRegistrations,
+        List<BornDriverClear> bornDriverClears)
+    {
+        string pathKey = NormalizePathKey(file.Path!);
+        string? generation = request.Params?.DomainGeneration;
+
+        // The redirect target (first assembly) must still be referenceable — the
+        // patch's layout guard resolves the original type there.
+        bool canRedirect =
+            request.ReferenceSessionImages &&
+            _imageRegistry.Contains(generation, bornEntry.OriginalAssembly);
+        if (!canRedirect)
+            return ColdBornReedit("the first hot-patch assembly is no longer resolvable; recompile to converge");
+
+        HotDiffFileResult cumulative = HotDiff.Analyze(bornEntry.OriginalText, file.NewText!, parseOptions);
+
+        // Truly structural — base type / kind / record: HotDiff already classified
+        // the cumulative diff cold (no shim or store can express it).
+        if (!cumulative.Hot)
+            return ColdBornReedit(cumulative.Reasons.DefaultIfEmpty(
+                "the re-edit changes the type's shape; recompile to converge").First());
+
+        // Feature #5: SIBLING types. Fold already-born siblings' body/additive
+        // changes into `cumulative` (redirected onto their OWN assembly), collect
+        // genuinely-new ones (load_only this batch + register), and steer a sibling
+        // TYPE removal / birth-member removal cold (conservative). Post-birth-added
+        // sibling members removed are caught by the file live diff below — exactly
+        // like first-batch types.
+        var newSiblings = new List<string>();
+        HotDiffFileResult? siblingCold = HandleBornSiblings(
+            file, bornEntry, generation, cumulative, parseOptions, reeditTypeAssemblies, newSiblings);
+        if (siblingCold != null)
+            return siblingCold;
+
+        string liveBaseline = string.IsNullOrEmpty(bornEntry.LastAppliedText)
+            ? bornEntry.OriginalText
+            : bornEntry.LastAppliedText;
+        HotDiffFileResult live = HotDiff.Analyze(liveBaseline, file.NewText!, parseOptions);
+
+        HashSet<string> cumulativeKeys = CumulativeMemberKeys(cumulative);
+
+        // Members the LIVE text carried but the new text dropped, that the birth
+        // diff cannot see (post-birth additions never existed in OriginalText): a
+        // removed Unity MESSAGE → clear its driver; a removed plain member →
+        // tombstone. Birth-member removals are already in cumulative.RemovedMembers
+        // (skipped here via cumulativeKeys). SIBLING members are NOT skipped: the
+        // file live diff is the ONLY place a member ADDED after the sibling's birth
+        // and now removed surfaces (the sibling diff is against its FIXED BirthText,
+        // which never had it). They route through the same machinery — a removed
+        // sibling MESSAGE clears via a clear-marker (its driver was registered under
+        // this file path, so ClearSource(file) tears it down regardless of which
+        // assembly the type lives in), and the clear-marker's originalAssembly is
+        // resolved per-type. Defensive: only trust `live` when it is itself hot
+        // (LastAppliedText is always birth + hot changes, so a cold `live` cannot
+        // actually arise here).
+        var removedMagic = new List<HotDiffRemovedMember>();
+        var removedNormal = new List<HotDiffRemovedMember>();
+        bool removedLiveField = false;
+        bool revertToBirth = false;
+        if (live.Hot)
+        {
+            foreach (HotDiffRemovedMember removed in live.RemovedMembers)
+            {
+                string key = MemberSurfaceRegistry.MemberKey(
+                    removed.DeclaringType, removed.Name, removed.ParamTypeNames, removed.IsStatic);
+                if (cumulativeKeys.Contains(key))
+                    continue; // a birth / sib-birth member — the cumulative diff handles it
+                if (removed.IsUnityMagic)
+                    removedMagic.Add(removed);
+                else
+                    removedNormal.Add(removed);
+            }
+
+            // A FIELD added after birth and now removed surfaces only in
+            // live.FieldChanges (Kind="removed"), never RemovedMembers. There is
+            // nothing to emit (the side store is simply abandoned, harmless — no
+            // live instance referenced it), but it must NOT pass as an unchanged
+            // re-send: routing it hot advances LastAppliedText so the baseline does
+            // not drift. A BIRTH / sib-birth field removal is in
+            // cumulative.FieldChanges (layout placeholder) — skip those.
+            var cumulativeFieldKeys = new HashSet<string>(
+                cumulative.FieldChanges.Select(FieldKey), StringComparer.Ordinal);
+            removedLiveField = live.FieldChanges.Any(f =>
+                string.Equals(f.Kind, "removed", StringComparison.Ordinal) &&
+                !cumulativeFieldKeys.Contains(FieldKey(f)));
+
+            // A redirected BODY reverted to its birth version: the live text
+            // changed a member that the new text returns to its birth body (so the
+            // cumulative/sibling diff shows no change for it — its key is absent
+            // from cumulativeKeys, which already folds in the merged sibling diff).
+            // A live detour cannot be un-redirected in place → recompile. Siblings
+            // are NOT excluded: a sibling body revert is exactly the case the
+            // sibling's fixed-BirthText diff misses, and like a first-batch revert
+            // it must go cold (the only removal we cannot do hot).
+            revertToBirth = live.ChangedMethods.Any(m =>
+                !m.Added &&
+                !cumulativeKeys.Contains(MemberSurfaceRegistry.MemberKey(
+                    m.DeclaringType, m.Name, m.ParamTypeNames, m.IsStatic)));
+        }
+        if (revertToBirth)
+            return ColdBornReedit("a redirected method body was reverted to its birth version; recompile to converge");
+
+        bool hasRemovedLiveAdditions = removedMagic.Count > 0 || removedNormal.Count > 0 || removedLiveField;
+        bool cumulativeHasChange = CumulativeHasAnyChange(cumulative);
+
+        // (NO-OP) nothing to apply: an unchanged re-send — the new text equals the
+        // last applied text (an already-born sibling whose body is unchanged folds
+        // to an empty diff), or the birth text of a never-touched file. The
+        // coordinator re-ships every dirty file each convergence batch, so this
+        // MUST stay a clean no-op, never cold (the self-test replay relies on it).
+        // A genuine REVERT was already steered cold above (revertToBirth), and
+        // post-birth removals are folded in below — so an empty diff here is truly
+        // nothing to do. The Redirected flag is deliberately NOT consulted: a
+        // redirected file re-sending its applied text is a no-op, not a revert.
+        if (!cumulativeHasChange && !hasRemovedLiveAdditions)
+            return cumulative; // empty diff contributes nothing
+
+        // (HOT) the cumulative diff drives the patch; fold in post-birth removals.
+        // A play-mode-born type has NO compiled call sites (it lives only in a
+        // dynamic assembly), so the M3 caller scan is vacuous AND would cold on
+        // "no project assemblies". Drop the checks — by construction no compiled
+        // caller of this type can exist to break.
+        cumulative.RequiresCallerCheck.Clear();
+
+        foreach (HotDiffRemovedMember removed in removedNormal)
+            cumulative.RemovedMembers.Add(TombstoneOnly(removed));
+        foreach (HotDiffRemovedMember removed in removedMagic)
+        {
+            // A removed added MESSAGE needs ONLY a clear-marker (stop the pump) —
+            // no tombstone. A tombstone would force the rewriter to emit the
+            // (otherwise unchanged) born type into this patch assembly as a
+            // name-colliding duplicate of the first assembly's type; a pure clear
+            // instead compiles to an empty assembly whose sole job is to carry the
+            // clear-marker to Unity.
+            bornDriverClears.Add(new BornDriverClear
+            {
+                SourcePath = file.Path!,
+                DeclaringType = removed.DeclaringType,
+                Message = removed.Name,
+                // Per-type: a late-born sibling's message (and its nested types)
+                // lived in its OWN assembly (informational — the clear keys off
+                // sourcePath, but keep it consistent with how the driver was pinned).
+                OriginalAssembly = PatchBatchContext.ReeditTypeAssembly(reeditTypeAssemblies, removed.DeclaringType)
+                    ?? bornEntry.OriginalAssembly,
+            });
+        }
+
+        reeditFileAssemblies[file.Path!] = bornEntry.OriginalAssembly;
+        // Re-commit with the new live text and the sibling set. Redirected reflects
+        // whether any patch state REMAINS: a pure driver-clear back to the birth
+        // text leaves none, so a later unchanged re-send is a clean no-op.
+        // Committed on image accept; genuinely-new siblings get their assembly
+        // pinned after emit.
+        newTypeRegistrations.Add(new KeyValuePair<string, NewTypeRegistry.FileEntry>(
+            pathKey,
+            BuildBornRecommit(bornEntry, file.NewText!, cumulativeHasChange, newSiblings)));
+        return cumulative;
+    }
+
+    /// <summary>Feature #5: fold sibling top-level types into a born re-edit.
+    /// Returns a COLD result to abort, or null to proceed (mutating
+    /// <paramref name="cumulative"/>, <paramref name="reeditTypeAssemblies"/> and
+    /// <paramref name="newSiblings"/>):
+    ///   • a registered sibling missing from the new text → COLD (removed type);
+    ///   • a NewType already registered as a sibling → redirect: diff it against
+    ///     its OWN birth text, fold its hot changes into the cumulative diff, and
+    ///     pin its assembly (a sib-BIRTH member removal on it is conservatively
+    ///     COLD; a member added AFTER birth and removed is caught hot by the file
+    ///     live diff in the caller);
+    ///   • a NewType not yet registered → a genuinely-new sibling: leave it in
+    ///     cumulative.NewTypes (load_only this batch) and record it for
+    ///     registration.</summary>
+    private HotDiffFileResult? HandleBornSiblings(
+        HotDiffFileDto file,
+        NewTypeRegistry.FileEntry bornEntry,
+        string? generation,
+        HotDiffFileResult cumulative,
+        CSharpParseOptions parseOptions,
+        Dictionary<string, string> reeditTypeAssemblies,
+        List<string> newSiblings)
+    {
+        if (bornEntry.Siblings != null)
+        {
+            // A registered sibling that VANISHED from the new text is a removed
+            // type — its live instances cannot be cleaned up in place. Recompile.
+            HashSet<string> present = TopLevelTypeMetadataNames(file.NewText!, parseOptions);
+            foreach (string sib in bornEntry.Siblings.Keys)
+                if (!present.Contains(sib))
+                    return ColdBornReedit("a sibling type was removed from a play-mode-born file; recompile to converge");
+        }
+
+        if (cumulative.NewTypes.Count == 0)
+            return null;
+
+        var alreadyBorn = new List<string>();
+        foreach (string nt in cumulative.NewTypes)
+        {
+            // Only TOP-LEVEL types are tracked as siblings. A NESTED new type
+            // (metadata names nest with '+') belongs to its parent — it is
+            // load_only'd WITH the parent and matched via BelongsToType, never
+            // registered on its own (else the next re-edit's top-level-only
+            // presence check would mistake it for a removed sibling and cold).
+            if (nt.Contains('+'))
+                continue;
+            if (bornEntry.Siblings != null && bornEntry.Siblings.ContainsKey(nt))
+            {
+                alreadyBorn.Add(nt);
+            }
+            else
+            {
+                // Genuinely new: load_only this batch (stays in NewTypes), register.
+                newSiblings.Add(nt);
+            }
+        }
+        // Drop already-born siblings AND their nested types from the load_only set
+        // (they redirect via the sibling's own diff — re-loading would strand the
+        // sibling's live instances). Genuinely-new siblings and their nested types
+        // stay, to be load_only'd this batch.
+        cumulative.NewTypes.RemoveAll(nt => alreadyBorn.Any(sib => BelongsToType(nt, sib)));
+
+        // [P2] A remaining NESTED NewType whose top-level parent is NOT a
+        // genuinely-new sibling means a nested type was added to an ALREADY-LOADED
+        // type (a first-batch type, or an already-born sibling — the latter also
+        // colds in the loop below). You cannot add a nested type to a loaded type
+        // in place, and it would otherwise re-load every resend (cumulative.NewTypes
+        // never empties → never a clean no-op). Cold.
+        foreach (string nt in cumulative.NewTypes)
+        {
+            int plus = nt.IndexOf('+');
+            if (plus >= 0 && !newSiblings.Contains(nt.Substring(0, plus)))
+                return ColdBornReedit("a nested type was added to an existing play-mode-born type; recompile to converge");
+        }
+
+        foreach (string sib in alreadyBorn)
+        {
+            NewTypeRegistry.SiblingType entry = bornEntry.Siblings![sib];
+            if (!_imageRegistry.Contains(generation, entry.Assembly))
+                return ColdBornReedit("a sibling type's assembly is no longer resolvable; recompile to converge");
+
+            HotDiffFileResult sibDiff = HotDiff.Analyze(entry.BirthText, file.NewText!, parseOptions);
+            if (!sibDiff.Hot)
+                return ColdBornReedit("a sibling type changed shape; recompile to converge");
+            // Conservative boundary: a member/type REMOVAL or signature change on a
+            // sibling (which surfaces RemovedMembers/RemovedTypes) → recompile,
+            // rather than re-deriving the per-sibling clear-marker / tombstone logic.
+            if (sibDiff.RemovedMembers.Any(r => BelongsToType(r.DeclaringType, sib)) ||
+                sibDiff.RemovedTypes.Any(t => BelongsToType(t.MetadataName, sib)) ||
+                sibDiff.NewTypes.Any(n => BelongsToType(n, sib)))
+            {
+                return ColdBornReedit("a member was removed from, or a nested type added to, a sibling type; recompile to converge");
+            }
+
+            MergeSiblingInto(cumulative, sibDiff, sib);
+            reeditTypeAssemblies[sib] = entry.Assembly;
+        }
+        return null;
+    }
+
+    /// <summary>Merge a sibling's own-baseline diff entries (only those belonging
+    /// to <paramref name="sib"/>) into the file's cumulative diff, so the
+    /// whole-file rewrite redirects/extends the sibling onto its own assembly.</summary>
+    private static void MergeSiblingInto(HotDiffFileResult cumulative, HotDiffFileResult sibDiff, string sib)
+    {
+        cumulative.ChangedMethods.AddRange(sibDiff.ChangedMethods.Where(m => BelongsToType(m.DeclaringType, sib)));
+        cumulative.FieldChanges.AddRange(sibDiff.FieldChanges.Where(f => BelongsToType(f.DeclaringType, sib)));
+        cumulative.EnumAdditions.AddRange(sibDiff.EnumAdditions.Where(e => BelongsToType(e.EnumType, sib)));
+        foreach (string pt in sibDiff.PatchedTypes.Where(p => BelongsToType(p, sib)))
+            if (!cumulative.PatchedTypes.Contains(pt))
+                cumulative.PatchedTypes.Add(pt);
+    }
+
+    /// <summary>True when <paramref name="typeName"/> is the sibling type or one
+    /// of its nested types (metadata names nest with '+').</summary>
+    private static bool BelongsToType(string typeName, string sib) =>
+        string.Equals(typeName, sib, StringComparison.Ordinal) ||
+        typeName.StartsWith(sib + "+", StringComparison.Ordinal);
+
+    /// <summary>Metadata names of every TOP-LEVEL type (class/struct/interface/
+    /// record/enum) declared in <paramref name="text"/>.</summary>
+    private static HashSet<string> TopLevelTypeMetadataNames(string text, CSharpParseOptions parseOptions)
+    {
+        var names = new HashSet<string>(StringComparer.Ordinal);
+        var root = (CompilationUnitSyntax)CSharpSyntaxTree.ParseText(text, parseOptions).GetRoot();
+        foreach (BaseTypeDeclarationSyntax decl in root.DescendantNodes().OfType<BaseTypeDeclarationSyntax>())
+        {
+            if (decl.Ancestors().OfType<BaseTypeDeclarationSyntax>().Any())
+                continue; // nested
+            names.Add(HotDiff.MetadataName(decl));
+        }
+        return names;
+    }
+
+    /// <summary>Build the live-text re-commit for a born file, carrying the
+    /// sibling set forward: existing siblings keep their (pinned) assembly, and
+    /// each genuinely-new sibling is added with this file's birth text and an
+    /// EMPTY assembly to be pinned after emit.</summary>
+    private static NewTypeRegistry.FileEntry BuildBornRecommit(
+        NewTypeRegistry.FileEntry bornEntry, string newText, bool redirected, List<string> newSiblings)
+    {
+        Dictionary<string, NewTypeRegistry.SiblingType>? siblings = null;
+        if (bornEntry.Siblings != null || newSiblings.Count > 0)
+        {
+            siblings = new Dictionary<string, NewTypeRegistry.SiblingType>(StringComparer.Ordinal);
+            if (bornEntry.Siblings != null)
+                foreach (var kv in bornEntry.Siblings)
+                    siblings[kv.Key] = kv.Value; // already pinned; never re-pinned below
+            foreach (string sib in newSiblings)
+                siblings[sib] = new NewTypeRegistry.SiblingType { Assembly = "", BirthText = newText };
+        }
+        return new NewTypeRegistry.FileEntry
+        {
+            OriginalText = bornEntry.OriginalText,
+            OriginalAssembly = bornEntry.OriginalAssembly,
+            Redirected = redirected,
+            LastAppliedText = newText,
+            Siblings = siblings,
+        };
+    }
+
+    /// <summary>Member-identity keys the cumulative (birth) diff already knows
+    /// about — changed (added or not) and removed members. A live-diff removal or
+    /// change whose key is ABSENT was added after birth (removal) or reverted to
+    /// the birth body (change).</summary>
+    private static HashSet<string> CumulativeMemberKeys(HotDiffFileResult diff)
+    {
+        var keys = new HashSet<string>(StringComparer.Ordinal);
+        foreach (HotDiffMethod m in diff.ChangedMethods)
+            keys.Add(MemberSurfaceRegistry.MemberKey(m.DeclaringType, m.Name, m.ParamTypeNames, m.IsStatic));
+        foreach (HotDiffRemovedMember r in diff.RemovedMembers)
+            keys.Add(MemberSurfaceRegistry.MemberKey(r.DeclaringType, r.Name, r.ParamTypeNames, r.IsStatic));
+        return keys;
+    }
+
+    /// <summary>Any hot-applicable change in the cumulative (birth) diff. An
+    /// all-false result with no post-birth removals is the unchanged-re-send
+    /// no-op.</summary>
+    private static bool CumulativeHasAnyChange(HotDiffFileResult diff)
+    {
+        return diff.ChangedMethods.Count > 0
+            || diff.NewTypes.Count > 0
+            || diff.RemovedMembers.Count > 0
+            || diff.RemovedTypes.Count > 0
+            || diff.FieldChanges.Count > 0
+            || diff.EnumAdditions.Count > 0
+            || diff.RequiresCallerCheck.Count > 0;
+    }
+
+    /// <summary>A post-birth-added member removed: tombstone it (so later
+    /// references fail deterministically) but DON'T re-materialize a magic stub —
+    /// a play-mode-born message was driven by the runtime pump (cleared
+    /// separately via a clear-marker), never by native dispatch, so a stub detour
+    /// would target a call the engine never makes.</summary>
+    private static HotDiffRemovedMember TombstoneOnly(HotDiffRemovedMember removed)
+    {
+        return new HotDiffRemovedMember
+        {
+            DeclaringType = removed.DeclaringType,
+            Name = removed.Name,
+            ParamTypeNames = removed.ParamTypeNames,
+            IsStatic = removed.IsStatic,
+            IsUnityMagic = false,
+            StubSource = null,
+        };
+    }
+
+    private static HotDiffFileResult ColdBornReedit(string reason)
+    {
+        var cold = new HotDiffFileResult { Hot = false };
+        cold.Reasons.Add(reason);
+        return cold;
+    }
+
+    /// <summary>Field identity across diffs (declaring type + name + staticness).</summary>
+    private static string FieldKey(HotDiffFieldChange f) =>
+        f.DeclaringType + "|field|" + f.Name + (f.IsStatic ? "|s" : "|i");
 
     /// <summary>When a partial type's instance fields are split across
     /// SEVERAL batch files, the patch type's field order is the source-merge

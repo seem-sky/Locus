@@ -47,6 +47,29 @@ pub async fn unity_sidecar_compiler_set_enabled(
 }
 
 #[tauri::command]
+pub async fn unity_in_process_compile_fallback_get_enabled(
+    config: State<'_, std::sync::Arc<crate::config::AppConfig>>,
+) -> Result<bool, AppError> {
+    Ok(config.unity_in_process_compile_fallback_enabled())
+}
+
+/// Toggle the in-Unity Roslyn fallback used when the sidecar is on but a
+/// compile is unavailable. Off = pure-sidecar (no in-process compile runs);
+/// on = graceful fallback. Useful for A-B testing the sidecar in isolation.
+#[tauri::command]
+pub async fn unity_in_process_compile_fallback_set_enabled(
+    value: bool,
+    config: State<'_, std::sync::Arc<crate::config::AppConfig>>,
+) -> Result<crate::csharp_compile::CsharpCompileStatusPayload, AppError> {
+    config
+        .set_unity_in_process_compile_fallback_enabled(value)
+        .map_err(|error| AppError::new("csharp_compile.persist_failed", error))?;
+
+    crate::csharp_compile::set_in_process_fallback(value);
+    Ok(crate::csharp_compile::status().await)
+}
+
+#[tauri::command]
 pub async fn unity_hot_reload_set_enabled(
     value: bool,
     config: State<'_, std::sync::Arc<crate::config::AppConfig>>,
@@ -56,6 +79,22 @@ pub async fn unity_hot_reload_set_enabled(
         .map_err(|error| AppError::new("unity_hotreload.persist_failed", error))?;
 
     crate::unity_hotreload::set_enabled(value);
+    Ok(crate::csharp_compile::status().await)
+}
+
+/// Experimental (Phase B, default off): toggle whether the Unity plugin may
+/// force-JIT a synthetic caller stub to evaluate a method's inline risk. Persists
+/// to config and updates the live module flag delivered in each hot-patch payload.
+#[tauri::command]
+pub async fn unity_inline_force_evaluate_set_enabled(
+    value: bool,
+    config: State<'_, std::sync::Arc<crate::config::AppConfig>>,
+) -> Result<crate::csharp_compile::CsharpCompileStatusPayload, AppError> {
+    config
+        .set_unity_inline_force_evaluate_enabled(value)
+        .map_err(|error| AppError::new("unity_hotreload.persist_failed", error))?;
+
+    crate::unity_hotreload::set_inline_force_evaluate_enabled(value);
     Ok(crate::csharp_compile::status().await)
 }
 
@@ -100,6 +139,10 @@ pub struct HotReloadPreflight {
     /// "debug" | "release" when readable; `None` when the editor is
     /// unreachable or the value could not be parsed.
     pub code_optimization: Option<String>,
+    /// Whether entering Play Mode reloads the domain (`Some(true)` = Unity's
+    /// default reload, `Some(false)` = DisableDomainReload); `None` when the
+    /// editor is unreachable or the plugin predates the toggle.
+    pub domain_reload_on_play: Option<bool>,
 }
 
 /// Enable-time check the toggle UI runs before turning hot reload on: report
@@ -116,13 +159,15 @@ pub async fn unity_hot_reload_preflight(
         return Ok(HotReloadPreflight {
             connected: false,
             code_optimization: None,
+            domain_reload_on_play: None,
         });
     }
-    let (connected, code_optimization) =
-        crate::unity_hotreload::coordinator::detect_code_optimization(&cwd).await;
+    let (connected, code_optimization, domain_reload_on_play) =
+        crate::unity_hotreload::coordinator::detect_hot_reload_editor_settings(&cwd).await;
     Ok(HotReloadPreflight {
         connected,
         code_optimization,
+        domain_reload_on_play,
     })
 }
 
@@ -149,6 +194,61 @@ pub async fn unity_hot_reload_set_code_optimization_debug(
         .await
         .map_err(|error| AppError::new("unity_hotreload.set_code_optimization_failed", error))?;
     Ok(CodeOptimizationResult { code_optimization })
+}
+
+/// Switch the connected editor's Code Optimization to an explicit level
+/// ("debug" | "release"), driven by the hot-reload popover dropdown. Triggers a
+/// Unity script recompile, exactly like flipping the Editor's status-bar icon.
+#[tauri::command]
+pub async fn unity_hot_reload_set_code_optimization(
+    level: String,
+    workspace: State<'_, std::sync::Arc<crate::workspace::Workspace>>,
+) -> Result<CodeOptimizationResult, AppError> {
+    let cwd = workspace.path.read().await.clone();
+    if cwd.trim().is_empty() {
+        return Err(AppError::new(
+            "unity_hotreload.no_workspace",
+            "No workspace selected",
+        ));
+    }
+    let code_optimization =
+        crate::unity_hotreload::coordinator::set_code_optimization(&cwd, &level)
+            .await
+            .map_err(|error| {
+                AppError::new("unity_hotreload.set_code_optimization_failed", error)
+            })?;
+    Ok(CodeOptimizationResult { code_optimization })
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlayModeReloadResult {
+    pub domain_reload_on_play: bool,
+}
+
+/// Set whether entering Play Mode reloads the domain, driven by the manual
+/// hot-reload popover toggle (EditorSettings.enterPlayModeOptions /
+/// DisableDomainReload). Unlike the Code Optimization switch this does NOT
+/// trigger a Unity recompile. Returns the resulting effective value.
+#[tauri::command]
+pub async fn unity_hot_reload_set_play_mode_reload(
+    domain_reload: bool,
+    workspace: State<'_, std::sync::Arc<crate::workspace::Workspace>>,
+) -> Result<PlayModeReloadResult, AppError> {
+    let cwd = workspace.path.read().await.clone();
+    if cwd.trim().is_empty() {
+        return Err(AppError::new(
+            "unity_hotreload.no_workspace",
+            "No workspace selected",
+        ));
+    }
+    let domain_reload_on_play =
+        crate::unity_hotreload::coordinator::set_play_mode_reload(&cwd, domain_reload)
+            .await
+            .map_err(|error| AppError::new("unity_hotreload.set_play_mode_reload_failed", error))?;
+    Ok(PlayModeReloadResult {
+        domain_reload_on_play,
+    })
 }
 
 #[tauri::command]

@@ -468,7 +468,13 @@ pub fn run() {
                 config.unity_sidecar_compiler_enabled(),
                 app.handle().clone(),
             );
-            unity_hotreload::initialize(config.unity_hot_reload_enabled());
+            csharp_compile::set_in_process_fallback(
+                config.unity_in_process_compile_fallback_enabled(),
+            );
+            unity_hotreload::initialize(
+                config.unity_hot_reload_enabled(),
+                config.unity_inline_force_evaluate_enabled(),
+            );
             code_tools::initialize(config.code_analysis_tools());
             startup_for_setup.mark("setup_config_ready");
 
@@ -1222,6 +1228,7 @@ pub fn run() {
             commands::install_unity_plugin,
             commands::launch_unity_project,
             commands::unity_recompile_run,
+            commands::unity_recompile_probe_run,
             commands::unity_execute_snippet_run,
             commands::send_unity_log,
             commands::select_unity_asset,
@@ -1461,11 +1468,16 @@ pub fn run() {
             commands::csharp_lsp_restart,
             commands::unity_sidecar_compiler_get_status,
             commands::unity_sidecar_compiler_set_enabled,
+            commands::unity_in_process_compile_fallback_get_enabled,
+            commands::unity_in_process_compile_fallback_set_enabled,
             commands::unity_hot_reload_set_enabled,
+            commands::unity_inline_force_evaluate_set_enabled,
             commands::unity_hot_reload_selftest_run,
             commands::unity_hot_reload_access_probe_run,
             commands::unity_hot_reload_preflight,
             commands::unity_hot_reload_set_code_optimization_debug,
+            commands::unity_hot_reload_set_code_optimization,
+            commands::unity_hot_reload_set_play_mode_reload,
             commands::code_analysis_tools_get_config,
             commands::code_analysis_tools_set_config,
             commands::get_view_windows_above_main,

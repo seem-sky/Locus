@@ -18,6 +18,13 @@ public sealed class HotDiffMethod
     /// <summary>Reflection simple type names per parameter ("Int32", "String[]", "List`1", "Int32&" for ref/out/in).</summary>
     public string[] ParamTypeNames = Array.Empty<string>();
 
+    /// <summary>Per-parameter enriched identity tokens parallel to
+    /// <see cref="ParamTypeNames"/>: the type namespace as written in source
+    /// plus closed generic arguments. Used only to disambiguate overloads that
+    /// collapse to the same simple names (distinct parameter namespace or
+    /// generic argument). Defaults to the simple names when nothing enriches.</summary>
+    public string[] ParamTypeSigs = Array.Empty<string>();
+
     public bool IsStatic;
     public bool IsCtor;
 
@@ -29,6 +36,20 @@ public sealed class HotDiffMethod
     /// same-name-same-params generic/non-generic overloads when the shim
     /// declaration is located. Not part of the wire protocol.</summary>
     public int TypeParameterCount;
+
+    /// <summary>For a newly ADDED Unity message Locus can drive without a
+    /// recompile, the driver kind: "player_loop" (Update/LateUpdate/FixedUpdate,
+    /// driven each frame by a PlayerLoop pump) or "component_proxy" (object-level
+    /// events such as OnTriggerEnter, delivered through a proxy MonoBehaviour
+    /// attached to the target object). Empty for every other member. The message
+    /// name is <see cref="Name"/>; the engine-delivered argument type, when the
+    /// kind takes one, is the sole entry of <see cref="ParamTypeNames"/>.</summary>
+    public string MessageDriverKind = "";
+
+    /// <summary>Agent-facing caveat for a driven message whose behavior differs
+    /// from native (lifecycle timing, approximate ordering, side effects). Empty
+    /// when there is nothing to explain. Surfaced in the hot-reload result.</summary>
+    public string MessageNote = "";
 }
 
 /// <summary>A member surface change that is hot only when every call site of
@@ -576,7 +597,8 @@ public static class HotDiff
             else
             {
                 foreach (ConstructorDeclarationSyntax ctor in ctors)
-                    AddMethod(result, metadataName, ".ctor", ParamTypeNames(ctor.ParameterList), isStatic: false, isCtor: true, added: false);
+                    AddMethod(result, metadataName, ".ctor", ParamTypeNames(ctor.ParameterList), isStatic: false, isCtor: true, added: false,
+                        paramTypeSigs: ParamTypeSigs(ctor.ParameterList));
             }
             patched = true;
         }
@@ -1611,6 +1633,8 @@ public static class HotDiff
                 return false;
 
             case MethodDeclarationSyntax method:
+                string messageDriverKind = "";
+                string messageNote = "";
                 if (burstContext || HasBurstCompileAttribute(method))
                 {
                     result.Reasons.Add("Burst-compiled member added: " + metadataName + "." + method.Identifier.Text);
@@ -1623,11 +1647,56 @@ public static class HotDiff
                 }
                 if (UnityMagicMethods.Contains(method.Identifier.Text))
                 {
-                    // Unity discovered the original type's message set at
-                    // load; a new message method would never be called.
-                    result.Reasons.Add("new Unity message method: " + metadataName + "." + method.Identifier.Text +
-                        " (Unity only discovers message methods at a real compile; use unity_recompile)");
-                    return false;
+                    // The engine fixes each type's message set at load, so a
+                    // message added afterwards is never dispatched natively. Locus
+                    // can still drive two families without a recompile, as long as
+                    // the signature is EXACTLY what the engine would call:
+                    //  • Update/LateUpdate/FixedUpdate — parameterless per-frame
+                    //    callbacks driven by a PlayerLoop pump (player_loop);
+                    //  • physics/trigger collisions — forwarded by a proxy
+                    //    MonoBehaviour on the target object (component_proxy).
+                    // Both materialize as ordinary instance shims; the kind is
+                    // recorded so the runtime wires the right driver. Anything else
+                    // with a message name — engine-thread input/animation/audio,
+                    // the OnGUI loop, lifecycle/visibility timing, or a wrong
+                    // signature — has no driver and stays cold.
+                    bool instanceVoidNonGeneric =
+                        !genericContext &&
+                        !method.Modifiers.Any(SyntaxKind.StaticKeyword) &&
+                        (method.TypeParameterList?.Parameters.Count ?? 0) == 0 &&
+                        method.ReturnType is PredefinedTypeSyntax returnType &&
+                        returnType.Keyword.IsKind(SyntaxKind.VoidKeyword);
+                    string[] addedParams = ParamTypeNames(method.ParameterList);
+
+                    if (instanceVoidNonGeneric &&
+                        addedParams.Length == 0 &&
+                        PlayerLoopPumpMessages.Contains(method.Identifier.Text))
+                    {
+                        messageDriverKind = "player_loop";
+                        messageNote = method.Identifier.Text +
+                            " is driven by a PlayerLoop pump; it runs after the native scripts each frame, so its order relative to them is approximate.";
+                    }
+                    else if (instanceVoidNonGeneric &&
+                        DriverMessages.TryGetValue(method.Identifier.Text, out MessageDriverInfo info) &&
+                        ((info.ParamType.Length == 0 && addedParams.Length == 0) ||
+                         (info.ParamType.Length != 0 && addedParams.Length == 1 && addedParams[0] == info.ParamType)))
+                    {
+                        // Physics/GUI/mouse/animator/particle/controller events
+                        // (component_proxy), lifecycle catch-ups (catch_up), or an
+                        // edit-time callback compiled but not runtime-driven (inert).
+                        messageDriverKind = info.Kind;
+                        messageNote = info.Note;
+                    }
+                    else
+                    {
+                        result.Reasons.Add("new Unity message method: " + metadataName + "." + method.Identifier.Text +
+                            " (Unity only discovers message methods at a real compile; use unity_recompile)");
+                        return false;
+                    }
+                    // Falls through to the shared added-method shim path below
+                    // (virtual/base-access guards still apply — a static shim
+                    // cannot express either, so e.g. `virtual void Update()` is
+                    // still cold).
                 }
                 if ((method.TypeParameterList?.Parameters.Count ?? 0) > 0)
                 {
@@ -1668,7 +1737,8 @@ public static class HotDiff
                 AddMethod(
                     result, metadataName, method.Identifier.Text, ParamTypeNames(method.ParameterList),
                     method.Modifiers.Any(SyntaxKind.StaticKeyword), isCtor: false, added: true,
-                    typeParameterCount: method.TypeParameterList?.Parameters.Count ?? 0);
+                    typeParameterCount: method.TypeParameterList?.Parameters.Count ?? 0,
+                    messageDriverKind: messageDriverKind, messageNote: messageNote);
                 return true;
 
             case PropertyDeclarationSyntax property:
@@ -2126,7 +2196,8 @@ public static class HotDiff
                 }
                 AddMethod(
                     result, metadataName, newMethod.Identifier.Text, ParamTypeNames(newMethod.ParameterList),
-                    newMethod.Modifiers.Any(SyntaxKind.StaticKeyword), isCtor: false, added: false);
+                    newMethod.Modifiers.Any(SyntaxKind.StaticKeyword), isCtor: false, added: false,
+                    paramTypeSigs: ParamTypeSigs(newMethod.ParameterList));
                 return true;
             }
 
@@ -2154,7 +2225,8 @@ public static class HotDiff
                 }
                 AddMethod(
                     result, metadataName, ".ctor", ParamTypeNames(newCtor.ParameterList),
-                    isStatic: false, isCtor: true, added: false);
+                    isStatic: false, isCtor: true, added: false,
+                    paramTypeSigs: ParamTypeSigs(newCtor.ParameterList));
                 return true;
             }
 
@@ -2188,7 +2260,8 @@ public static class HotDiff
                     result.Reasons.Add("unsupported operator changed: " + metadataName + ".operator" + newOp.OperatorToken.Text);
                     return false;
                 }
-                AddMethod(result, metadataName, opName, ParamTypeNames(newOp.ParameterList), isStatic: true, isCtor: false, added: false);
+                AddMethod(result, metadataName, opName, ParamTypeNames(newOp.ParameterList), isStatic: true, isCtor: false, added: false,
+                    paramTypeSigs: ParamTypeSigs(newOp.ParameterList));
                 return true;
             }
 
@@ -2220,7 +2293,8 @@ public static class HotDiff
                 string convName = newConv.ImplicitOrExplicitKeyword.IsKind(SyntaxKind.ImplicitKeyword)
                     ? "op_Implicit"
                     : "op_Explicit";
-                AddMethod(result, metadataName, convName, ParamTypeNames(newConv.ParameterList), isStatic: true, isCtor: false, added: false);
+                AddMethod(result, metadataName, convName, ParamTypeNames(newConv.ParameterList), isStatic: true, isCtor: false, added: false,
+                    paramTypeSigs: ParamTypeSigs(newConv.ParameterList));
                 return true;
             }
 
@@ -2452,17 +2526,23 @@ public static class HotDiff
         bool isStatic,
         bool isCtor,
         bool added,
-        int typeParameterCount = 0)
+        int typeParameterCount = 0,
+        string[]? paramTypeSigs = null,
+        string messageDriverKind = "",
+        string messageNote = "")
     {
         result.ChangedMethods.Add(new HotDiffMethod
         {
             DeclaringType = declaringType,
             Name = name,
             ParamTypeNames = paramTypeNames,
+            ParamTypeSigs = paramTypeSigs ?? paramTypeNames,
             IsStatic = isStatic,
             IsCtor = isCtor,
             Added = added,
             TypeParameterCount = typeParameterCount,
+            MessageDriverKind = messageDriverKind,
+            MessageNote = messageNote,
         });
     }
 
@@ -2812,6 +2892,66 @@ public static class HotDiff
         return SimpleTypeName(parsed);
     }
 
+    /// <summary>Enriched per-parameter identity tokens parallel to
+    /// <see cref="ParamTypeNames"/>: each preserves the type's namespace (as
+    /// written) and closed generic arguments so overloads that share simple
+    /// names can be told apart. The Unity resolver mirrors this grammar from
+    /// reflection. Ref/out/in still carry the trailing "&amp;".</summary>
+    internal static string[] ParamTypeSigs(BaseParameterListSyntax? parameters)
+    {
+        if (parameters == null)
+            return Array.Empty<string>();
+
+        return parameters.Parameters
+            .Select(p =>
+            {
+                string name = p.Type != null ? QualifiedTypeName(p.Type) : "";
+                bool byRef = p.Modifiers.Any(m =>
+                    m.IsKind(SyntaxKind.RefKeyword) || m.IsKind(SyntaxKind.OutKeyword) || m.IsKind(SyntaxKind.InKeyword));
+                return byRef ? name + "&" : name;
+            })
+            .ToArray();
+    }
+
+    /// <summary>Like <see cref="SimpleTypeName"/> but keeps the namespace the
+    /// source wrote and the closed generic arguments, in a grammar the Unity
+    /// resolver reproduces from reflection: namespace-qualified name,
+    /// "Name`N&lt;arg,...&gt;" for generics, "[]" for arrays, "&amp;" for byref.
+    /// Used only for overload disambiguation — never emitted as source.</summary>
+    internal static string QualifiedTypeName(TypeSyntax type)
+    {
+        switch (type)
+        {
+            case PredefinedTypeSyntax predefined:
+                return PredefinedName(predefined.Keyword.Text);
+            case NullableTypeSyntax nullable:
+                return "Nullable`1<" + QualifiedTypeName(nullable.ElementType) + ">";
+            case ArrayTypeSyntax array:
+            {
+                string element = QualifiedTypeName(array.ElementType);
+                foreach (ArrayRankSpecifierSyntax rank in array.RankSpecifiers)
+                    element += "[" + new string(',', rank.Rank - 1) + "]";
+                return element;
+            }
+            case GenericNameSyntax generic:
+                return generic.Identifier.Text + "`" + generic.TypeArgumentList.Arguments.Count +
+                    "<" + string.Join(",", generic.TypeArgumentList.Arguments.Select(QualifiedTypeName)) + ">";
+            case IdentifierNameSyntax identifier:
+                return identifier.Identifier.Text == "dynamic" ? "Object" : identifier.Identifier.Text;
+            case QualifiedNameSyntax qualified:
+                return QualifiedTypeName(qualified.Left) + "." + QualifiedTypeName(qualified.Right);
+            case AliasQualifiedNameSyntax alias:
+                return QualifiedTypeName(alias.Name);
+            case TupleTypeSyntax tuple:
+                return "ValueTuple`" + tuple.Elements.Count +
+                    "<" + string.Join(",", tuple.Elements.Select(e => QualifiedTypeName(e.Type))) + ">";
+            case RefTypeSyntax refType:
+                return QualifiedTypeName(refType.Type) + "&";
+            default:
+                return type.ToString().Trim();
+        }
+    }
+
     /// <summary>Simple (arity-stripped) name of a metadata type name's last
     /// segment: "Ns.Outer+Inner`1" → "Inner".</summary>
     private static string SimpleNameOfMetadata(string metadataName)
@@ -2903,5 +3043,83 @@ public static class HotDiff
         "OnTriggerEnter", "OnTriggerEnter2D", "OnTriggerExit", "OnTriggerExit2D",
         "OnTriggerStay", "OnTriggerStay2D", "OnValidate", "OnWillRenderObject",
         "Reset", "Start", "Update",
+    };
+
+    /// <summary>The subset of <see cref="UnityMagicMethods"/> a per-frame
+    /// PlayerLoop pump can drive: the parameterless, void, per-frame callbacks.
+    /// A message added after load is never dispatched natively, but the pump can
+    /// enumerate live instances each frame and call the shim for these three.
+    /// Every other message is out of scope here — it fires from an engine thread
+    /// with engine-supplied arguments (physics/input/animation/audio) or runs in
+    /// its own loop (OnGUI's IMGUI pass) — so adding one stays cold.</summary>
+    internal static readonly HashSet<string> PlayerLoopPumpMessages = new(StringComparer.Ordinal)
+    {
+        "Update", "LateUpdate", "FixedUpdate",
+    };
+
+    /// <summary>How a hot-added Unity message that is NOT a PlayerLoop callback is
+    /// driven, plus an agent-facing caveat. <see cref="ParamType"/> is the EXACT
+    /// reflection simple name of the engine-delivered argument ("" = parameterless).
+    /// <see cref="Kind"/> is the runtime driver: "component_proxy" (a proxy
+    /// MonoBehaviour on the target object forwards the native event),
+    /// "catch_up" (the shim is run once on existing instances now — for lifecycle
+    /// messages whose native timing has already passed), or "inert" (compiled but
+    /// not driven at runtime).</summary>
+    internal readonly struct MessageDriverInfo
+    {
+        public readonly string ParamType;
+        public readonly string Kind;
+        public readonly string Note;
+        public MessageDriverInfo(string paramType, string kind, string note)
+        {
+            ParamType = paramType;
+            Kind = kind;
+            Note = note;
+        }
+    }
+
+    /// <summary>Hot-add drivers for non-PlayerLoop messages (proxy / catch-up /
+    /// inert), keyed by message name. The engine fixes each type's message set at
+    /// load, so these are never dispatched natively; a name absent here only costs
+    /// a false cold. Families deliberately left out stay cold (Awake-at-load is
+    /// catch-up only; OnAudioFilterRead runs on the audio thread; render/visibility
+    /// callbacks depend on Camera/Renderer/SRP timing).</summary>
+    internal static readonly Dictionary<string, MessageDriverInfo> DriverMessages = new(StringComparer.Ordinal)
+    {
+        // ── physics / trigger (batch 1) ──────────────────────────────────
+        { "OnTriggerEnter", new("Collider", "component_proxy", "") },
+        { "OnTriggerStay", new("Collider", "component_proxy", "") },
+        { "OnTriggerExit", new("Collider", "component_proxy", "") },
+        { "OnCollisionEnter", new("Collision", "component_proxy", "") },
+        { "OnCollisionStay", new("Collision", "component_proxy", "") },
+        { "OnCollisionExit", new("Collision", "component_proxy", "") },
+        { "OnTriggerEnter2D", new("Collider2D", "component_proxy", "") },
+        { "OnTriggerStay2D", new("Collider2D", "component_proxy", "") },
+        { "OnTriggerExit2D", new("Collider2D", "component_proxy", "") },
+        { "OnCollisionEnter2D", new("Collision2D", "component_proxy", "") },
+        { "OnCollisionStay2D", new("Collision2D", "component_proxy", "") },
+        { "OnCollisionExit2D", new("Collision2D", "component_proxy", "") },
+        // ── GUI / mouse (batch 2) ────────────────────────────────────────
+        { "OnGUI", new("", "component_proxy", "OnGUI is driven by a proxy; its order relative to other scripts' OnGUI is approximate.") },
+        { "OnMouseDown", new("", "component_proxy", "") },
+        { "OnMouseUp", new("", "component_proxy", "") },
+        { "OnMouseUpAsButton", new("", "component_proxy", "") },
+        { "OnMouseDrag", new("", "component_proxy", "") },
+        { "OnMouseEnter", new("", "component_proxy", "") },
+        { "OnMouseExit", new("", "component_proxy", "") },
+        { "OnMouseOver", new("", "component_proxy", "") },
+        // ── animator / particle / character controller (batch 3) ─────────
+        { "OnAnimatorIK", new("Int32", "component_proxy", "OnAnimatorIK only fires when the Animator layer's IK Pass is enabled.") },
+        { "OnAnimatorMove", new("", "component_proxy", "A proxy takes over this object's root motion (matching native OnAnimatorMove); it is attached only to objects that hot-add it.") },
+        { "OnParticleCollision", new("GameObject", "component_proxy", "") },
+        { "OnParticleTrigger", new("", "component_proxy", "") },
+        { "OnParticleSystemStopped", new("", "component_proxy", "Requires the ParticleSystem Stop Action set to Callback.") },
+        { "OnControllerColliderHit", new("ControllerColliderHit", "component_proxy", "") },
+        // ── lifecycle (best-effort; see note) ────────────────────────────
+        { "OnDestroy", new("", "component_proxy", "OnDestroy added: fires for instances destroyed from now on; instances already destroyed cannot receive it.") },
+        { "Awake", new("", "catch_up", "Awake added: run once now on existing instances (their native Awake already ran at load). Instances created later will NOT get it until a recompile.") },
+        { "Start", new("", "catch_up", "Start added: run once now on existing instances (their native Start already ran before the first frame). Instances created later will NOT get it until a recompile.") },
+        { "OnValidate", new("", "catch_up", "OnValidate is an editor-time callback: run once now on existing instances; it will not re-fire on inspector edits during play until a recompile.") },
+        { "Reset", new("", "inert", "Reset is an edit-time callback (component add / inspector Reset) with no runtime trigger: it is compiled but runs only at the next recompile or component add/reset.") },
     };
 }

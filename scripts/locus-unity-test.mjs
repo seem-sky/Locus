@@ -1,15 +1,18 @@
 import { spawn } from "node:child_process";
-import { createWriteStream, mkdtempSync, readFileSync } from "node:fs";
+import { createWriteStream, mkdirSync, mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { finished } from "node:stream/promises";
 
 const args = process.argv.slice(2);
 const passthrough = [];
 let prepareNative = false;
 let prepareUnityBundle = false;
+let outputDir = "";
 
-for (const arg of args) {
+for (let index = 0; index < args.length; index += 1) {
+  const arg = args[index];
+
   if (arg === "--") {
     continue;
   }
@@ -25,6 +28,12 @@ for (const arg of args) {
     prepareUnityBundle = true;
     continue;
   }
+  const [name, inlineValue] = splitArg(arg);
+  if (name === "--output-dir") {
+    outputDir = resolve(readOptionValue(name, inlineValue, args, index));
+    if (!inlineValue) index += 1;
+    continue;
+  }
   passthrough.push(arg);
 }
 
@@ -36,16 +45,20 @@ if (prepareUnityBundle) {
   await runRequired(bun, ["run", "unity:bundle-native"]);
 }
 
-const driverResult = await runUnityDriver(bun, [
-  "run",
-  "tauri",
-  "dev",
-  "--",
-  "--",
-  "--locus-driver",
-  "unity-test",
-  ...passthrough,
-]);
+const driverResult = await runUnityDriver(
+  bun,
+  [
+    "run",
+    "tauri",
+    "dev",
+    "--",
+    "--",
+    "--locus-driver",
+    "unity-test",
+    ...passthrough,
+  ],
+  outputDir,
+);
 
 if (driverResult.signal) {
   process.kill(process.pid, driverResult.signal);
@@ -72,18 +85,21 @@ Examples:
   bun run locus:test:unity -- --project F:\\Game --suite native-bridge --prepare-native --install-plugin
   bun run locus:test:unity:native -- --project F:\\Game
   bun run locus:test:unity:smoke -- --project F:\\Game
+  bun run locus:test:unity:release -- --project F:\\Game
   bun run locus:test:unity -- --project F:\\Game --suite hot-reload --timeout-ms 1200000
+  bun run locus:test:unity -- --project F:\\Game --suite hot-reload-release --timeout-ms 1200000
   bun run locus:test:unity -- --project F:\\Game --suite execute --timeout-ms 1200000
 
 Driver options:
-  --suite <name>              connect | sidecar | type-index | state-probe | native-bridge | hot-reload | execute | all
+  --suite <name>              connect | sidecar | type-index | state-probe | native-bridge | hot-reload | hot-reload-release | execute | all
+                              hot-reload-release runs Release first, then switches to Debug at runtime and runs again
   --type-index-sample <mode>  sample32 | all, default sample32
   --type-index-full           Shortcut for --type-index-sample all
   --connect-timeout-ms <ms>   Unity launch/connect timeout, default 60000
   --timeout-ms <ms>           Per-suite timeout, default 300000
   --poll-ms <ms>              Connection poll interval, default 500
   --no-progress-timeout-ms <ms>
-                              Fail connection when status does not change, default 20000
+                              Fail connection when status does not change, default 60000
   --install-plugin            Update the Unity project plugin before connecting
   --no-open-unity             Only connect to an already-open editor
   --no-force-edit-mode        Leave the current editor mode before hot-reload tests
@@ -91,7 +107,25 @@ Driver options:
 Wrapper options:
   --prepare-native            Build locus_native.dll before starting Locus
   --prepare-unity-bundle      Rebuild the full locus_unity bundle before starting Locus
+  --output-dir <dir>          Write driver.log into this directory instead of %TEMP%
 `);
+}
+
+function splitArg(arg) {
+  const [name, value = ""] = arg.split(/=(.*)/s, 2);
+  return [name, value];
+}
+
+function readOptionValue(name, inlineValue, values, index) {
+  if (inlineValue) {
+    return inlineValue;
+  }
+  const next = values[index + 1];
+  if (!next) {
+    console.error(`[locus] ${name} requires a value.`);
+    process.exit(2);
+  }
+  return next;
 }
 
 function runRequired(command, commandArgs) {
@@ -114,9 +148,10 @@ function runRequired(command, commandArgs) {
   });
 }
 
-function runUnityDriver(command, commandArgs) {
+function runUnityDriver(command, commandArgs, requestedLogDir) {
   return new Promise((resolve, reject) => {
-    const logDir = mkdtempSync(join(tmpdir(), "locus-unity-test-"));
+    const logDir = requestedLogDir || mkdtempSync(join(tmpdir(), "locus-unity-test-"));
+    mkdirSync(logDir, { recursive: true });
     const logPath = join(logDir, "driver.log");
     const logStream = createWriteStream(logPath, { flags: "w" });
     console.log(`[locus] Unity driver log: ${logPath}`);

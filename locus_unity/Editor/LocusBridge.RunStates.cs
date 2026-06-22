@@ -1173,9 +1173,59 @@ namespace Locus
             }
         }
 
+        // Cached open delegate for ProfilerDriver.lastFrameIndex. Resolving the
+        // PropertyInfo and calling GetValue every sampled frame boxes the int and
+        // allocates an object[] for the (empty) argument list; binding the getter
+        // once to a Func<int> removes both from the per-frame sampling path.
+        private static Func<int> _lastFrameIndexGetter;
+        private static bool _lastFrameIndexGetterResolved;
+
         private static int CurrentProfilerFrameIndex()
         {
+            Func<int> getter = _lastFrameIndexGetter;
+            if (getter == null && !_lastFrameIndexGetterResolved)
+            {
+                _lastFrameIndexGetterResolved = true;
+                getter = _lastFrameIndexGetter = ResolveProfilerDriverIntGetter("lastFrameIndex");
+            }
+
+            if (getter != null)
+            {
+                try
+                {
+                    return getter();
+                }
+                catch
+                {
+                    // A version whose getter throws drops to the reflection path.
+                    _lastFrameIndexGetter = null;
+                }
+            }
+
             return ReadProfilerDriverIntProperty("lastFrameIndex", -1);
+        }
+
+        private static Func<int> ResolveProfilerDriverIntGetter(string propertyName)
+        {
+            try
+            {
+                PropertyInfo property = typeof(ProfilerDriver).GetProperty(
+                    propertyName,
+                    BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic
+                );
+                if (property == null || !property.CanRead || property.PropertyType != typeof(int))
+                    return null;
+
+                MethodInfo getter = property.GetGetMethod(true);
+                if (getter == null)
+                    return null;
+
+                return (Func<int>)Delegate.CreateDelegate(typeof(Func<int>), getter);
+            }
+            catch
+            {
+                return null;
+            }
         }
 
         private static int ReadProfilerDriverIntProperty(string propertyName, int fallback)
@@ -2306,7 +2356,12 @@ namespace Locus
                 case "editing":
                     _isPaused = false;
                     _isPlaying = false;
-                    NativePublishEditorStatusNow();
+                    // Background thread (the executor now runs off the main
+                    // thread): publish the optimistic target status from the
+                    // cached fields without reading Unity APIs. The real
+                    // EditorApplication change is posted to the main thread below,
+                    // and the next heartbeat reconciles from the live editor state.
+                    NativeSetManagedState(ManagedStateReady);
                     PostToMainThread(delegate
                     {
                         try
@@ -2324,7 +2379,12 @@ namespace Locus
                 case "playing":
                     _isPaused = false;
                     _isPlaying = true;
-                    NativePublishEditorStatusNow();
+                    // Background thread (the executor now runs off the main
+                    // thread): publish the optimistic target status from the
+                    // cached fields without reading Unity APIs. The real
+                    // EditorApplication change is posted to the main thread below,
+                    // and the next heartbeat reconciles from the live editor state.
+                    NativeSetManagedState(ManagedStateReady);
                     PostToMainThread(delegate
                     {
                         try
@@ -2342,7 +2402,12 @@ namespace Locus
                 case "playing_paused":
                     _isPaused = true;
                     _isPlaying = true;
-                    NativePublishEditorStatusNow();
+                    // Background thread (the executor now runs off the main
+                    // thread): publish the optimistic target status from the
+                    // cached fields without reading Unity APIs. The real
+                    // EditorApplication change is posted to the main thread below,
+                    // and the next heartbeat reconciles from the live editor state.
+                    NativeSetManagedState(ManagedStateReady);
                     PostToMainThread(delegate
                     {
                         try
@@ -2618,7 +2683,7 @@ namespace Locus
             string requestedEditorStatus,
             string initialState)
         {
-            var completion = new TaskCompletionSource<RunStatesCompletion>();
+            var completion = LocusAsync.CreateTcs<RunStatesCompletion>();
             PostToMainThread(delegate
             {
                 try
@@ -2724,13 +2789,16 @@ namespace Locus
             using (var peStream = new MemoryStream(16 * 1024))
             {
                 EmitResult emitResult;
-                try
+                using (EnterInProcessCompile())
                 {
-                    emitResult = compilation.Emit(peStream);
-                }
-                catch (Exception ex)
-                {
-                    throw new Exception("emit failed: " + ex);
+                    try
+                    {
+                        emitResult = compilation.Emit(peStream, cancellationToken: InProcessCompileReloadToken);
+                    }
+                    catch (Exception ex)
+                    {
+                        throw new Exception("emit failed: " + ex);
+                    }
                 }
 
                 if (!emitResult.Success)
@@ -2779,7 +2847,6 @@ namespace Locus
             sb.AppendLine("using System.Collections.Generic;");
             sb.AppendLine("using UnityEngine;");
             sb.AppendLine("using UnityEngine.SceneManagement;");
-            sb.AppendLine("using UnityEngine.UI;");
             sb.AppendLine("using Unity.Profiling;");
             sb.AppendLine("using UnityEditor;");
             sb.AppendLine("using UnityEditor.Profiling;");

@@ -24,6 +24,11 @@ use tauri::Emitter;
 pub const STATUS_EVENT: &str = "csharp-compile-status";
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
+// Graceful fallback to the in-Unity Roslyn compile when the sidecar is on but
+// a compile is unavailable (sidecar down / transport error). Default true
+// (keeps current behavior). Set false for pure-sidecar / A-B: an unavailable
+// sidecar then surfaces as an error instead of an in-Unity compile.
+static IN_PROCESS_FALLBACK: AtomicBool = AtomicBool::new(true);
 static APP_HANDLE: OnceLock<tauri::AppHandle> = OnceLock::new();
 
 // Session counters for the phase-6 rollout: how often tool calls actually
@@ -69,6 +74,23 @@ pub fn initialize(enabled: bool, app_handle: tauri::AppHandle) {
 
 pub fn is_enabled() -> bool {
     ENABLED.load(Ordering::Relaxed)
+}
+
+pub fn in_process_fallback_enabled() -> bool {
+    IN_PROCESS_FALLBACK.load(Ordering::Relaxed)
+}
+
+/// Set whether a sidecar `Unavailable` falls back to the in-Unity compile.
+pub fn set_in_process_fallback(value: bool) {
+    IN_PROCESS_FALLBACK.store(value, Ordering::Relaxed);
+}
+
+/// True when a sidecar `Unavailable` must NOT fall back to the in-Unity
+/// compile: the sidecar is the active compiler and the operator disabled the
+/// in-process fallback (pure-sidecar / A-B). When the sidecar is off the
+/// in-Unity path is the only path, so this is always false.
+pub fn block_in_process_fallback() -> bool {
+    is_enabled() && !in_process_fallback_enabled()
 }
 
 /// Flip the feature flag. Disabling stops the running sidecar.
@@ -130,7 +152,7 @@ pub struct CsharpCompileStatusPayload {
 
 pub async fn status() -> CsharpCompileStatusPayload {
     let running = manager::current_status().await;
-    let hot_reload = crate::unity_hotreload::counters();
+    let hot_reload = crate::unity_hotreload::coordinator::counters().await;
     let hot_unapplied_changes = crate::unity_hotreload::coordinator::unapplied_change_count().await;
     CsharpCompileStatusPayload {
         enabled: is_enabled(),
@@ -399,10 +421,21 @@ pub struct HotPatchMethod {
     pub name: String,
     #[serde(default)]
     pub param_type_names: Vec<String>,
+    /// Enriched per-parameter identity (namespace + closed generic arguments)
+    /// parallel to `param_type_names`; used by Unity only to disambiguate
+    /// overloads that share simple names. Empty for older sidecars.
+    #[serde(default)]
+    pub param_type_sigs: Vec<String>,
     #[serde(default)]
     pub is_static: bool,
     #[serde(default)]
     pub is_ctor: bool,
+    /// Edited source file (sidecar `sourcePath`) whose rewrite produced this
+    /// detour. Lets the coordinator map a returned inlined `MethodKey` back to a
+    /// single file_key and queue only that file for recompile convergence —
+    /// instead of the whole batch. Empty for older sidecars (→ batch fallback).
+    #[serde(default)]
+    pub source_path: String,
     /// When set, the "original" side of the detour lives in this specific
     /// assembly (an earlier patch's shim being re-edited, M2).
     #[serde(default)]
@@ -411,6 +444,51 @@ pub struct HotPatchMethod {
     /// method being silenced (M5).
     #[serde(default)]
     pub is_stub: bool,
+}
+
+/// A newly ADDED Unity message the engine never dispatches after load (each
+/// type's message set is fixed at load). The patch materializes it as an
+/// ordinary static shim and the plugin wires a driver by `kind`: "player_loop"
+/// (driven each frame by a PlayerLoop pump) or "component_proxy" (forwarded by a
+/// proxy MonoBehaviour attached to the target object).
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HotPatchMessageDriver {
+    /// Driver kind: "player_loop" | "component_proxy" | "catch_up" | "inert", or
+    /// "clear" — a marker (no shim) emitted when a play-mode-born re-edit REMOVED
+    /// a previously hot-applied message: it only carries `source_path` so the
+    /// plugin's replace-by-source teardown drops the stale driver. Clear-markers
+    /// are excluded from the pump-capability gate and the added-message summary.
+    #[serde(default)]
+    pub kind: String,
+    /// Original declaring type (CLR metadata name) whose instances are driven.
+    pub declaring_type: String,
+    /// Static shim class in the patch assembly that holds the new body.
+    pub shim_type: String,
+    /// Shim method name; its leading parameter is the instance.
+    pub shim_method: String,
+    /// Message name (e.g. "Update", "OnTriggerEnter").
+    pub message: String,
+    /// Engine-delivered argument type for component_proxy (e.g. "Collider");
+    /// empty for the parameterless player_loop callbacks.
+    #[serde(default)]
+    pub param_type: String,
+    /// Edited source file that produced this registration. The plugin clears a
+    /// file's driver registrations before re-adding, so a deleted/changed-away
+    /// message stops being driven (replace-by-source, not accumulate).
+    #[serde(default)]
+    pub source_path: String,
+    /// Agent-facing caveat (lifecycle timing / approximate order); empty when the
+    /// driver matches native behavior. Surfaced in the hot-reload summary.
+    #[serde(default)]
+    pub note: String,
+    /// Tier-2: when set, the driven type lives in this specific assembly (a
+    /// play-mode-born type whose only definition is the FIRST hot-patch assembly).
+    /// The plugin then resolves `declaring_type` there, bypassing its usual skip
+    /// of `__LocusHotPatch_` assemblies — mirroring `HotPatchMethod.original_assembly`.
+    /// Absent for ordinary compiled types (the plugin uses default resolution).
+    #[serde(default)]
+    pub original_assembly: Option<String>,
 }
 
 /// A type that only exists in the edited text (TI-C / snippet visibility).
@@ -427,6 +505,59 @@ pub struct HotPatchNewType {
     pub is_public: bool,
     #[serde(default)]
     pub is_top_level: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ForceDetour {
+    pub path: String,
+    pub method_keys: Vec<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CallerQueryTarget {
+    pub declaring_type: String,
+    pub member_name: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CallerLocation {
+    #[serde(default)]
+    pub file: String,
+    #[serde(default)]
+    pub method_key: String,
+    #[serde(default)]
+    pub declaring_type: String,
+    #[serde(default)]
+    pub member_name: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CallerQueryTargetResult {
+    #[serde(default)]
+    pub declaring_type: String,
+    #[serde(default)]
+    pub member_name: String,
+    #[serde(default)]
+    pub key: String,
+    #[serde(default)]
+    pub callers: Vec<CallerLocation>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CallerQueryResult {
+    #[serde(default)]
+    pub success: bool,
+    #[serde(default)]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub assembly_count: u64,
+    #[serde(default)]
+    pub targets: Vec<CallerQueryTargetResult>,
 }
 
 /// C0 runtime capability matrix: how the running editor's Mono enforces
@@ -472,6 +603,7 @@ pub enum HotPatchOutcome {
         assembly_path: Option<String>,
         methods: Vec<HotPatchMethod>,
         new_types: Vec<HotPatchNewType>,
+        message_drivers: Vec<HotPatchMessageDriver>,
         caller_scan_note: Option<String>,
     },
 }
@@ -538,6 +670,7 @@ pub async fn compile_hot_patch(
     baseline_siblings: &[(String, String)],
     extra_reference_paths: &[String],
     runtime_caps: Option<&AccessCaps>,
+    force_detours: &[ForceDetour],
 ) -> Result<HotPatchOutcome, String> {
     let mut request = json!({
         "files": files
@@ -566,12 +699,38 @@ pub async fn compile_hot_patch(
         request["runtimeCaps"] = serde_json::to_value(caps)
             .map_err(|error| format!("runtimeCaps serialization failed: {error}"))?;
     }
+    if !force_detours.is_empty() {
+        request["forceDetours"] = serde_json::to_value(force_detours)
+            .map_err(|error| format!("forceDetours serialization failed: {error}"))?;
+    }
 
     let client = manager::ensure_client().await?;
     let value = client
         .request_with_timeout("compile/hotPatch", request, client::COMPILE_REQUEST_TIMEOUT)
         .await?;
     parse_hot_patch_result(value)
+}
+
+pub async fn query_callers(
+    compile_params: &CompileParams,
+    targets: &[CallerQueryTarget],
+) -> Result<CallerQueryResult, String> {
+    let request = json!({
+        "params": compile_params,
+        "targets": targets,
+    });
+    let client = manager::ensure_client().await?;
+    let value = client
+        .request_with_timeout("caller/query", request, client::DEFAULT_REQUEST_TIMEOUT)
+        .await?;
+    let result: CallerQueryResult = serde_json::from_value(value)
+        .map_err(|error| format!("malformed caller/query response: {error}"))?;
+    if !result.success {
+        return Err(result
+            .error
+            .unwrap_or_else(|| "caller/query failed".to_string()));
+    }
+    Ok(result)
 }
 
 /// Register a sidecar-built hot-patch image only after Unity has accepted and
@@ -737,6 +896,13 @@ fn parse_hot_patch_result(value: Value) -> Result<HotPatchOutcome, String> {
     let new_types: Vec<HotPatchNewType> =
         serde_json::from_value(value.get("newTypes").cloned().unwrap_or_else(|| json!([])))
             .map_err(|e| format!("malformed hot patch newTypes: {e}"))?;
+    let message_drivers: Vec<HotPatchMessageDriver> = serde_json::from_value(
+        value
+            .get("messageDrivers")
+            .cloned()
+            .unwrap_or_else(|| json!([])),
+    )
+    .map_err(|e| format!("malformed hot patch messageDrivers: {e}"))?;
 
     Ok(HotPatchOutcome::Compiled {
         assembly_name,
@@ -744,6 +910,7 @@ fn parse_hot_patch_result(value: Value) -> Result<HotPatchOutcome, String> {
         assembly_path,
         methods,
         new_types,
+        message_drivers,
         caller_scan_note: value
             .get("callerScan")
             .and_then(|v| v.as_str())
@@ -1083,6 +1250,53 @@ mod tests {
                     assembly_path.as_deref(),
                     Some("C:/Temp/__LocusHotPatch.dll")
                 );
+            }
+            other => panic!("expected Compiled, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_hot_patch_result_reads_message_drivers() {
+        let value = json!({
+            "hot": true,
+            "success": true,
+            "assemblyName": "__LocusHotPatch_00000000_00000001",
+            "assemblyB64": "TVo=",
+            "methods": [],
+            "newTypes": [],
+            "messageDrivers": [
+                {
+                    "kind": "player_loop",
+                    "declaringType": "Game.Player",
+                    "shimType": "Game.Player__LocusShims",
+                    "shimMethod": "Update",
+                    "message": "Update",
+                    "paramType": "",
+                    "sourcePath": "Assets/Player.cs"
+                },
+                {
+                    "kind": "component_proxy",
+                    "declaringType": "Game.Mob",
+                    "shimType": "Game.Mob__LocusShims",
+                    "shimMethod": "OnTriggerEnter",
+                    "message": "OnTriggerEnter",
+                    "paramType": "Collider",
+                    "sourcePath": "Assets/Mob.cs"
+                }
+            ],
+        });
+        match parse_hot_patch_result(value).expect("parse") {
+            HotPatchOutcome::Compiled {
+                message_drivers, ..
+            } => {
+                assert_eq!(message_drivers.len(), 2);
+                assert_eq!(message_drivers[0].kind, "player_loop");
+                assert_eq!(message_drivers[0].message, "Update");
+                assert_eq!(message_drivers[0].param_type, "");
+                assert_eq!(message_drivers[1].kind, "component_proxy");
+                assert_eq!(message_drivers[1].declaring_type, "Game.Mob");
+                assert_eq!(message_drivers[1].shim_method, "OnTriggerEnter");
+                assert_eq!(message_drivers[1].param_type, "Collider");
             }
             other => panic!("expected Compiled, got {other:?}"),
         }

@@ -8,7 +8,7 @@
 //! the current disk text against that baseline, so re-patching a method
 //! always re-detours from the original — patches never stack.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::OnceLock;
 
 use tokio::sync::Mutex;
@@ -62,6 +62,25 @@ struct ProjectState {
     /// C0 capability matrix, probed once per domain generation (the probe
     /// assembly and the measured Mono both die with the domain).
     access_probe: Option<AccessProbeCacheEntry>,
+    // ── hot-patch counters (per project; the status card aggregates) ──
+    /// Monotonic this session: total hot patches applied / failed.
+    patches_applied: u64,
+    patch_failures: u64,
+    /// Live detours and their assembly bytes / method+type count. Reset together
+    /// when the domain dies (`on_domain_reloaded`). `cold_queued` is NOT stored
+    /// here — it is `cold_paths.len()`, so it can never drift (the old global
+    /// `store` was last-writer-wins across projects).
+    active_patches: u64,
+    active_patch_bytes: u64,
+    active_patch_code: u64,
+    // ── H6 automatic-convergence control (per project) ──
+    /// Bumped on every apply; an idle watchdog fires only if its generation is
+    /// still current when it wakes.
+    converge_generation: u64,
+    /// A convergence trigger fired during play mode: converge on play-mode exit.
+    convergence_pending: bool,
+    /// A convergence recompile is in flight for this project.
+    convergence_running: bool,
 }
 
 fn projects() -> &'static Mutex<HashMap<String, ProjectState>> {
@@ -113,6 +132,246 @@ fn file_key(file_path: &str) -> String {
         .trim()
         .replace('\\', "/")
         .to_ascii_lowercase()
+}
+
+// ── per-project hot-patch counters & H6 automatic convergence ────────
+//
+// These tallies and the convergence state on `ProjectState` were once
+// module-global atomics shared by every project. That is fine for the status
+// card (which only DISPLAYS them) but was wrong for the convergence control
+// path, which reads them to decide WHEN to recompile: with two editors open,
+// one project's applies, resets and idle activity cross-contaminated the
+// other's convergence — a merged active count tripped the threshold early, a
+// domain reload zeroed a sibling's live count (under-converging it), and one
+// project's activity disarmed the other's idle watchdog. They now live per
+// project; `counters` re-aggregates them (active-project scoped) for the badge,
+// while `total_active_patches` keeps the global view the shared sidecar needs.
+
+const CONVERGE_ACTIVE_THRESHOLD: u64 = 8;
+const CONVERGE_IDLE_SECS: u64 = 10 * 60;
+
+/// Record a successful hot-patch apply against `project_path`: bumps the
+/// monotonic session total and the live-detour tallies (reset together when the
+/// domain dies, in `on_domain_reloaded`).
+async fn record_patch_applied(project_path: &str, assembly_bytes: u64, code_entries: u64) {
+    {
+        let mut projects = projects().lock().await;
+        let state = projects.entry(project_key(project_path)).or_default();
+        state.patches_applied += 1;
+        state.active_patches += 1;
+        state.active_patch_bytes += assembly_bytes;
+        state.active_patch_code += code_entries;
+    }
+    crate::csharp_compile::emit_status_in_background();
+}
+
+/// Record a hot-patch apply/compile failure against `project_path`.
+async fn record_patch_failure(project_path: &str) {
+    {
+        let mut projects = projects().lock().await;
+        let state = projects.entry(project_key(project_path)).or_default();
+        state.patch_failures += 1;
+    }
+    crate::csharp_compile::emit_status_in_background();
+}
+
+/// Hot-patch counters for the settings status card. Scoped to the active project
+/// when the monitor has set one (so a stale/background editor's tallies cannot
+/// inflate the badge), else summed across all — mirroring `unapplied_change_count`'s
+/// active-project discipline. `cold_queued` is the live `cold_paths` depth.
+pub async fn counters() -> super::HotReloadCounters {
+    let active = active_project()
+        .lock()
+        .ok()
+        .and_then(|active| active.clone());
+    let projects = projects().lock().await;
+    let states: Vec<&ProjectState> = match active.as_deref() {
+        Some(key) => projects.get(key).into_iter().collect(),
+        None => projects.values().collect(),
+    };
+    let mut totals = super::HotReloadCounters::default();
+    for state in states {
+        totals.patches_applied += state.patches_applied;
+        totals.patch_failures += state.patch_failures;
+        totals.active_patches += state.active_patches;
+        totals.active_patch_bytes += state.active_patch_bytes;
+        totals.active_patch_code += state.active_patch_code;
+        totals.cold_queued += state.cold_paths.len() as u64;
+    }
+    totals
+}
+
+/// Total live detours across ALL projects, ignoring active-project scope. The
+/// compile sidecar is a single shared process, so its binary must not be swapped
+/// (nor its lost-session gate cleared) while ANY project holds live patches.
+pub async fn total_active_patches() -> u64 {
+    let projects = projects().lock().await;
+    projects.values().map(|state| state.active_patches).sum()
+}
+
+/// Live detours for ONE project — the self-test waits on its own count, not a
+/// global a background editor could hold above zero.
+pub async fn project_active_patches(project_path: &str) -> u64 {
+    let projects = projects().lock().await;
+    projects
+        .get(&project_key(project_path))
+        .map(|state| state.active_patches)
+        .unwrap_or(0)
+}
+
+/// Called by the apply path after each successful hot patch. Arms this project's
+/// idle watchdog and fires an immediate convergence when ITS own live-patch
+/// count crosses the threshold — both keyed per project, so a second editor
+/// neither trips nor disarms this one's convergence.
+async fn note_patch_applied(project_path: &str) {
+    let (generation, over_threshold) = {
+        let mut projects = projects().lock().await;
+        let state = projects.entry(project_key(project_path)).or_default();
+        state.converge_generation += 1;
+        (
+            state.converge_generation,
+            state.active_patches >= CONVERGE_ACTIVE_THRESHOLD,
+        )
+    };
+
+    if over_threshold {
+        let project = project_path.to_string();
+        tauri::async_runtime::spawn(async move {
+            try_converge(&project, "active patch threshold").await;
+        });
+    }
+
+    let project = project_path.to_string();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(CONVERGE_IDLE_SECS)).await;
+        let still_idle_with_patches = {
+            let projects = projects().lock().await;
+            projects
+                .get(&project_key(&project))
+                .map(|state| state.converge_generation == generation && state.active_patches > 0)
+                .unwrap_or(false)
+        };
+        if still_idle_with_patches {
+            try_converge(&project, "idle session").await;
+        }
+    });
+}
+
+/// Called from the connection monitor on an editor play-mode exit. Converges
+/// this project when a trigger was deferred during play or live patches remain.
+pub async fn on_play_mode_exited(project_path: &str) {
+    if !super::is_enabled() {
+        return;
+    }
+    let (was_pending, active) = {
+        let mut projects = projects().lock().await;
+        match projects.get_mut(&project_key(project_path)) {
+            Some(state) => (
+                std::mem::replace(&mut state.convergence_pending, false),
+                state.active_patches,
+            ),
+            None => (false, 0),
+        }
+    };
+    if !was_pending && active == 0 {
+        return;
+    }
+    try_converge(project_path, "left play mode").await;
+}
+
+/// Run the silent convergence recompile for `project_path` unless its editor is
+/// playing (then defer to the play-exit trigger). Reuses the unity_recompile
+/// pipeline, so the cold queue, pending baselines and type index all settle. The
+/// in-flight guard is per project: a second editor converges independently
+/// rather than being silently skipped while this one runs.
+async fn try_converge(project_path: &str, why: &str) {
+    if !super::is_enabled() || !crate::csharp_compile::is_enabled() {
+        return;
+    }
+    {
+        let mut projects = projects().lock().await;
+        let state = projects.entry(project_key(project_path)).or_default();
+        if state.active_patches == 0 && state.cold_paths.is_empty() {
+            return;
+        }
+        if state.convergence_running {
+            return; // one at a time, per project
+        }
+        state.convergence_running = true;
+    }
+
+    let result = async {
+        let (connected, status, _) = crate::unity_bridge::query_unity_status(project_path).await;
+        if !connected {
+            return Err("editor not connected".to_string());
+        }
+        if crate::unity_bridge::is_play_mode_status(status) {
+            let mut projects = projects().lock().await;
+            let state = projects.entry(project_key(project_path)).or_default();
+            state.convergence_pending = true;
+            return Err("editor in play mode; deferred to play-mode exit".to_string());
+        }
+        eprintln!("[HotReload] auto-convergence ({why}): running a silent recompile");
+        crate::unity_bridge::recompile_and_wait(project_path).await
+    }
+    .await;
+
+    {
+        let mut projects = projects().lock().await;
+        if let Some(state) = projects.get_mut(&project_key(project_path)) {
+            state.convergence_running = false;
+        }
+    }
+    match result {
+        Ok(_) => eprintln!("[HotReload] auto-convergence completed ({why})"),
+        Err(error) => eprintln!("[HotReload] auto-convergence skipped ({why}): {error}"),
+    }
+}
+
+/// Reconstruct the `MethodKey` string the Unity plugin builds per detour
+/// (`LocusBridge.HotReload.cs::MethodKey`) from the same fields the desktop
+/// ships, so the inlined-method keys Unity returns can be mapped back to their
+/// source files. MUST stay byte-identical to that plugin function:
+/// `declaringType|name|param,types|s` (`|i` when instance).
+fn unity_method_key(method: &crate::csharp_compile::HotPatchMethod) -> String {
+    format!(
+        "{}|{}|{}|{}",
+        method.declaring_type,
+        method.name,
+        method.param_type_names.join(","),
+        if method.is_static { "s" } else { "i" },
+    )
+}
+
+/// Render each inlined `MethodKey` as `Type.name` with a confidence tag derived
+/// from the parallel `InlineRiskSource` the plugin reported. Three distinct
+/// labels, NOT two — a force-evaluated stub proves Mono *would* inline the callee
+/// in a synthetic context, which is a strong signal but not the same as a real
+/// caller having inlined it, so it is reported as `(high-confidence)`, never
+/// conflated with the runtime-observed `(confirmed)`:
+///   RuntimeInlined → `(confirmed)`        — Mono's own cached bit was already set
+///   StubInlined    → `(high-confidence)`  — force-JIT stub made Mono set the bit
+///   Predicted      → `(predicted)`        — static ≤20-IL heuristic only
+/// When `sources` is absent or shorter (older plugin) the bare name is used —
+/// never panics on a length mismatch.
+fn annotate_inlined_names(keys: &[String], sources: &[String]) -> Vec<String> {
+    keys.iter()
+        .enumerate()
+        .map(|(index, key)| {
+            let mut parts = key.split('|');
+            let base = match (parts.next(), parts.next()) {
+                (Some(ty), Some(name)) if !name.is_empty() => format!("{ty}.{name}"),
+                (Some(ty), _) => ty.to_string(),
+                _ => key.clone(),
+            };
+            match sources.get(index).map(String::as_str) {
+                Some("RuntimeInlined") => format!("{base} (confirmed)"),
+                Some("StubInlined") => format!("{base} (high-confidence)"),
+                Some("Predicted") => format!("{base} (predicted)"),
+                _ => base,
+            }
+        })
+        .collect()
 }
 
 fn normalize_project_file_path(project_path: &str, file_path: &str) -> String {
@@ -364,7 +623,10 @@ async fn is_pending_edit_unapplied(edit: &PendingEdit) -> bool {
 }
 
 pub async fn unapplied_change_count() -> u64 {
-    let active = active_project().lock().ok().and_then(|active| active.clone());
+    let active = active_project()
+        .lock()
+        .ok()
+        .and_then(|active| active.clone());
     let snapshot: Vec<PendingEdit> = {
         let projects = projects().lock().await;
         match active.as_deref() {
@@ -598,7 +860,8 @@ pub async fn on_recompile_converged(project_path: &str) {
     }
     drop(projects);
     on_domain_reloaded(project_path).await;
-    super::set_cold_queue_depth(0);
+    // The cold queue is `cold_paths`, cleared above; on_domain_reloaded emits
+    // the refreshed status (no separate cold-depth counter to zero).
     // A real compile changes the type/member surface, the reference assembly
     // mtimes, and serialized schema — invalidate the cached type index (which
     // also cascades to compile params + serialized schema) so a Unity-initiated
@@ -617,9 +880,27 @@ pub async fn on_domain_reloaded(project_path: &str) {
             for edit in state.pending.values_mut() {
                 edit.applied_text = None;
             }
+            // All detours die with the AppDomain; disk already holds every
+            // hot-applied edit, so the real compile converges naturally. Reset
+            // only THIS project's live-detour tallies (a module-global store(0)
+            // used to zero a sibling editor's live count, under-converging it)
+            // and its deferred-convergence flag — the monotonic session totals
+            // stay.
+            state.active_patches = 0;
+            state.active_patch_bytes = 0;
+            state.active_patch_code = 0;
+            state.convergence_pending = false;
+        }
+        // The shared sidecar's lost-session gate clears once NO project holds
+        // live patches: with nothing left to split against the blanked
+        // registries, hot-apply is safe again. Keyed on the global total (not
+        // this one project) so a sibling whose patches are still split stays
+        // gated.
+        if projects.values().all(|state| state.active_patches == 0) {
+            super::clear_session_registry_lost();
         }
     }
-    super::reset_active_patches();
+    crate::csharp_compile::emit_status_in_background();
     match crate::unity_type_index::drop_hot_patch_types(project_path).await {
         Ok(removed) if removed > 0 => {
             eprintln!("[HotReload] dropped {removed} hot-patch type-index row(s)");
@@ -721,7 +1002,9 @@ pub async fn observe_reload_state(
     let decision = {
         let projects = projects().lock().await;
         let state = projects.get(&project_key(project_path));
-        let survived_exit = state.map(|state| state.pending_survived_exit).unwrap_or(false);
+        let survived_exit = state
+            .map(|state| state.pending_survived_exit)
+            .unwrap_or(false);
         classify_reload(
             state.and_then(|state| state.last_session_id.as_deref()),
             state.and_then(|state| state.last_domain_generation.as_deref()),
@@ -781,8 +1064,7 @@ pub async fn on_editor_exited(project_path: &str) {
         // recompile will load them, so the next new-session sample converges on
         // a moved serial (serial > 0) rather than stranding a stale count. A
         // failed startup compile leaves serial 0, so they correctly stay pending.
-        state.pending_survived_exit =
-            !state.pending.is_empty() || !state.cold_paths.is_empty();
+        state.pending_survived_exit = !state.pending.is_empty() || !state.cold_paths.is_empty();
         state.last_session_id = None;
         state.last_domain_generation = None;
         state.last_converged_serial = None;
@@ -800,6 +1082,26 @@ async fn queue_cold_paths(project_path: &str, keys: &[String]) -> usize {
         state.cold_paths.insert(key.clone());
     }
     state.cold_paths.len()
+}
+
+/// The compile-server sidecar restarted while hot patches were live, losing its
+/// in-memory hot-reload session registries (field stores, session images, member
+/// surfaces). Hot-applying now would let the sidecar's empty field-store registry
+/// mint a fresh store for an already-virtualized field and silently split its
+/// value from the live detours' copy. Route the batch to the `unity_recompile`
+/// convergence path instead — it rebuilds consistent state and clears the
+/// lost-session flag once no project holds live patches (`on_domain_reloaded`).
+/// Returns the agent-facing message and queues the changed files so the
+/// recompile drains them.
+async fn converge_after_session_loss(project_path: &str, changed_keys: &[String]) -> String {
+    let queued = queue_cold_paths(project_path, changed_keys).await;
+    crate::csharp_compile::emit_status_in_background();
+    format!(
+        "Hot reload unavailable: the compile server restarted while patches were live, losing the \
+         hot-reload session state. Applying these edits hot now could split a hot-added field's \
+         value, so they are queued for a real compile ({queued} file(s)). Run unity_recompile to \
+         converge; hot reload resumes cleanly afterward."
+    )
 }
 
 fn base64_decoded_len(value: &str) -> u64 {
@@ -824,6 +1126,742 @@ fn assembly_artifact_len(assembly_b64: &str, assembly_path: Option<&str>) -> u64
         }
     }
     base64_decoded_len(assembly_b64)
+}
+
+/// Decide whether a freshly applied hot patch that declared added Unity messages
+/// must fail closed (route the caller to a recompile) rather than be reported live.
+/// Two hard cases: a plugin that can't drive added messages at all (`pump_supported`
+/// false — an older plugin that ignored `message_drivers`), and a plugin that
+/// reported messages it could NOT wire (`pump_failed_count > 0`). Both become live
+/// natively after a recompile, so the file is not marked applied here. Returns the
+/// agent-facing error when it must fail closed, `Ok(())` when the patch may stand.
+/// A "clear" driver is a MARKER, not a real driver: it tells the plugin to tear
+/// down a file's stale message-pump registrations (replace-by-source) when a
+/// play-mode-born re-edit removed a previously hot-applied Unity message. It
+/// wires nothing, so it must NOT count toward the pump-capability gate/preflight
+/// (an old plugin that cannot drive messages also never registered the one being
+/// cleared — clearing it is a harmless no-op there) nor the summary's added-
+/// message total. It DOES keep `message_drivers` non-empty so the patch still
+/// ships to Unity (where ClearSource runs) instead of being dropped as "nothing
+/// detourable".
+fn is_clear_marker(driver: &crate::csharp_compile::HotPatchMessageDriver) -> bool {
+    driver.kind == "clear"
+}
+
+fn has_real_message_drivers(drivers: &[crate::csharp_compile::HotPatchMessageDriver]) -> bool {
+    drivers.iter().any(|d| !is_clear_marker(d))
+}
+
+fn message_driver_gate(
+    has_message_drivers: bool,
+    pump_supported: bool,
+    pump_failed_count: u64,
+) -> Result<(), String> {
+    if has_message_drivers && !pump_supported {
+        return Err(
+            "This project's Unity plugin can't drive newly added Unity messages \
+             (Update/LateUpdate/FixedUpdate). Update the Locus plugin, or run \
+             unity_recompile to make them live."
+                .to_string(),
+        );
+    }
+    if pump_failed_count > 0 {
+        return Err(format!(
+            "{pump_failed_count} newly added Unity message(s) could not be wired in Unity. \
+             Run unity_recompile to make them live."
+        ));
+    }
+    Ok(())
+}
+
+// Session capability cache: the plugin's last-echoed `pump_supported`, keyed by
+// domain generation (the plugin — and thus its capability — is fixed within a
+// generation; a recompile / domain reload re-learns it). Lets a message-driver
+// patch PREFLIGHT a plugin already known unable to drive added messages and route
+// straight to a recompile, instead of applying method detours we'd immediately fail
+// closed and discard. The post-response gate still backstops the first, unlearned
+// patch (and records the capability for the next one).
+static PUMP_CAPABILITY: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, bool>>,
+> = std::sync::OnceLock::new();
+
+fn remember_pump_capability(domain_generation: &str, supported: bool) {
+    let map =
+        PUMP_CAPABILITY.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    if let Ok(mut guard) = map.lock() {
+        guard.insert(domain_generation.to_string(), supported);
+    }
+}
+
+/// `Some(false)` = known unable to drive added messages, `Some(true)` = known able,
+/// `None` = not learned for this generation yet.
+fn known_pump_capability(domain_generation: &str) -> Option<bool> {
+    PUMP_CAPABILITY.get().and_then(|map| {
+        map.lock()
+            .ok()
+            .and_then(|guard| guard.get(domain_generation).copied())
+    })
+}
+
+/// Build the message-driver portion of the apply summary (appended after the
+/// redirect / new-type counts). The `total` added messages split into `driven`
+/// (total − skipped) and the skipped ones; when the plugin sent the skipped
+/// messages by name (`skipped_messages`, each a "message — reason") they are listed
+/// — capped so a large batch does not flood — else only the count is shown (older
+/// plugins). Each DISTINCT non-empty note is appended once, in first-seen order, so
+/// lifecycle / ordering / side-effect caveats reach the agent without repetition.
+/// Returns "" when there were no added messages.
+fn message_driver_summary(
+    total: usize,
+    skipped_count: u64,
+    skipped_messages: &[String],
+    notes: &[&str],
+) -> String {
+    if total == 0 {
+        return String::new();
+    }
+    let mut out = String::new();
+    let driven = (total as u64).saturating_sub(skipped_count);
+    if driven > 0 {
+        out.push_str(&format!(
+            ", {driven} added Unity message(s) wired to a runtime driver (see notes for timing/order caveats)"
+        ));
+    }
+    if skipped_count > 0 {
+        if skipped_messages.is_empty() {
+            out.push_str(&format!(
+                ", {skipped_count} added Unity message(s) not driven (not an engine message, edit-time only, or no live instance)"
+            ));
+        } else {
+            const MAX_NAMED: usize = 6;
+            let shown = skipped_messages.len().min(MAX_NAMED);
+            let names = skipped_messages[..shown].join("; ");
+            out.push_str(&format!(
+                ", {skipped_count} added Unity message(s) not driven: {names}"
+            ));
+            if skipped_messages.len() > shown {
+                out.push_str(&format!(" (+{} more)", skipped_messages.len() - shown));
+            }
+        }
+    }
+    let mut seen_notes: Vec<&str> = Vec::new();
+    for &note in notes {
+        if !note.is_empty() && !seen_notes.contains(&note) {
+            seen_notes.push(note);
+            out.push_str(&format!(".\n{note}"));
+        }
+    }
+    out
+}
+
+#[derive(Debug)]
+struct AppliedHotPatch {
+    engine: String,
+    inlined_method_keys: Vec<String>,
+    /// Parallel to `inlined_method_keys`: the InlineRiskSource name the plugin
+    /// reported for each ("RuntimeInlined" / "StubInlined" / "Predicted"). Empty
+    /// from older plugins.
+    inlined_sources: Vec<String>,
+    image_register_error: Option<String>,
+    /// Added Unity messages the plugin received but did not drive (not a
+    /// MonoBehaviour, parameter not the real engine type, edit-time-only, or a
+    /// catch-up with no live instance). Surfaced as a note, not an error.
+    pump_skipped_count: u64,
+    /// Each skipped message's "message — reason", when the plugin sent them, so the
+    /// summary can name them instead of showing a bare count. Empty from older
+    /// plugins (then only the count is reported).
+    pump_skipped_messages: Vec<String>,
+}
+
+async fn apply_compiled_hot_patch(
+    project_path: &str,
+    params: &crate::csharp_compile::CompileParams,
+    assembly_name: &str,
+    assembly_b64: &str,
+    assembly_path: Option<&String>,
+    methods: &[crate::csharp_compile::HotPatchMethod],
+    new_types: &[crate::csharp_compile::HotPatchNewType],
+    message_drivers: &[crate::csharp_compile::HotPatchMessageDriver],
+) -> Result<AppliedHotPatch, String> {
+    // Preflight (P1-b): if a prior apply in this domain generation already showed the
+    // plugin cannot drive added messages, do NOT apply method detours we would
+    // immediately fail closed and discard — fail closed now, before the Unity
+    // round-trip, so the caller routes straight to a recompile. The first, unlearned
+    // message-driver patch still hits the post-response gate below (which records the
+    // capability), so this only short-circuits once the answer is known.
+    if has_real_message_drivers(message_drivers)
+        && known_pump_capability(&params.domain_generation) == Some(false)
+    {
+        message_driver_gate(true, false, 0)?;
+    }
+
+    let mut payload = serde_json::json!({
+        "patch_id": assembly_name,
+        "domain_generation": params.domain_generation,
+        // Experimental Phase B gate (default off): ask the plugin to force-JIT a
+        // synthetic caller stub to evaluate inline risk. Older plugins ignore it.
+        "inline_force_evaluate": super::inline_force_evaluate_enabled(),
+        "methods": methods.iter().map(|m| serde_json::json!({
+            "declaring_type": m.declaring_type,
+            "patch_declaring_type": m.patch_declaring_type,
+            "name": m.name,
+            "param_type_names": m.param_type_names,
+            "param_type_sigs": m.param_type_sigs,
+            "is_static": m.is_static,
+            "is_ctor": m.is_ctor,
+            // The edited file this detour came from. The plugin uses it to clear
+            // a file's stale pump registrations before re-adding (replace-by-source).
+            "source_path": m.source_path,
+            // Older plugins ignore the unknown field and then fail
+            // resolution → whole-patch rollback + update hint (the
+            // established compatibility discipline).
+            "original_assembly": m.original_assembly.as_deref().unwrap_or(""),
+        })).collect::<Vec<_>>(),
+        // Newly added Unity messages the engine never discovers after load: the
+        // plugin wires a driver by `kind` (a PlayerLoop pump or a forwarding proxy
+        // MonoBehaviour). A plugin that supports this echoes pump_supported in its
+        // response; if it does not, the caller fails closed to a recompile rather
+        // than reporting a false "live" (see below).
+        "message_drivers": message_drivers.iter().map(|d| serde_json::json!({
+            "kind": d.kind,
+            "declaring_type": d.declaring_type,
+            "shim_type": d.shim_type,
+            "shim_method": d.shim_method,
+            "message": d.message,
+            "param_type": d.param_type,
+            "source_path": d.source_path,
+            // Tier-2: a play-mode-born type's added message drives instances in
+            // the FIRST hot-patch assembly. Older plugins ignore the unknown field
+            // and fall back to default resolution (which can't find a play-mode-born
+            // type) — the same compatibility discipline as the method-map field.
+            "original_assembly": d.original_assembly.as_deref().unwrap_or(""),
+        })).collect::<Vec<_>>(),
+    });
+    if let Some(object) = payload.as_object_mut() {
+        if let Some(path) = assembly_path {
+            object.insert(
+                "assembly_path".to_string(),
+                serde_json::Value::String(path.clone()),
+            );
+        } else {
+            object.insert(
+                "assembly_b64".to_string(),
+                serde_json::Value::String(assembly_b64.to_string()),
+            );
+        }
+    }
+    let payload = payload.to_string();
+
+    let resp = match crate::unity_bridge::send_message_with_timeout(
+        project_path,
+        "hot_patch_loaded",
+        &payload,
+        std::time::Duration::from_secs(30),
+    )
+    .await
+    {
+        Ok(resp) => resp,
+        Err(error) => {
+            record_patch_failure(project_path).await;
+            return Err(format!(
+                "Unity did not accept the hot patch ({error}); use unity_recompile."
+            ));
+        }
+    };
+
+    if !resp.ok {
+        record_patch_failure(project_path).await;
+        let error = resp
+            .error
+            .unwrap_or_else(|| "hot patch rejected".to_string());
+        if error.starts_with("unknown message type") {
+            return Err(
+                "The Unity plugin in this project predates hot reload; update the Locus plugin \
+                 or use unity_recompile."
+                    .to_string(),
+            );
+        }
+        return Err(format!(
+            "Hot patch failed in Unity: {error}\nRun unity_recompile to converge."
+        ));
+    }
+
+    #[derive(serde::Deserialize, Default)]
+    #[serde(default)]
+    struct HotPatchLoadedResponse {
+        detour_engine: String,
+        inlined_method_keys: Vec<String>,
+        inlined_sources: Vec<String>,
+        // Pump capability echo. Absent (→ false) from plugins that predate the
+        // PlayerLoop message pump: such a plugin silently load-onlys an
+        // add-a-message patch without driving it, so we must NOT report it live.
+        pump_supported: bool,
+        pumped_count: u64,
+        pump_skipped_count: u64,
+        // Per-message "message — reason" for each skipped driver (empty from older
+        // plugins). Lets the summary name them rather than show a bare count.
+        pump_skipped_messages: Vec<String>,
+        // Hard wiring failures (type/shim missing, unbindable shim). > 0 means the
+        // patch claimed a driver it could not honor — fail closed to a recompile.
+        pump_failed_count: u64,
+    }
+    let loaded = resp
+        .message
+        .as_deref()
+        .and_then(|message| serde_json::from_str::<HotPatchLoadedResponse>(message).ok())
+        .unwrap_or_default();
+
+    // Learn the plugin's pump capability for this generation so the next
+    // message-driver patch can preflight instead of applying-then-failing-closed.
+    remember_pump_capability(&params.domain_generation, loaded.pump_supported);
+
+    // Fail closed if this patch adds Unity messages the plugin cannot honor: an
+    // older plugin that ignores `message_drivers` and load-onlys the patch, or one
+    // that reported messages it could not wire. A recompile makes them live
+    // natively; returning Err routes the caller to queue_cold_paths instead of
+    // marking the file applied / live.
+    message_driver_gate(
+        has_real_message_drivers(message_drivers),
+        loaded.pump_supported,
+        loaded.pump_failed_count,
+    )?;
+
+    let assembly_bytes = assembly_artifact_len(assembly_b64, assembly_path.map(|p| p.as_str()));
+    let code_entries = methods.len().saturating_add(new_types.len()) as u64;
+    record_patch_applied(project_path, assembly_bytes, code_entries).await;
+    note_patch_applied(project_path).await;
+
+    let image_register_error = match crate::csharp_compile::register_session_image(
+        &params.domain_generation,
+        assembly_name,
+        assembly_b64,
+        assembly_path.map(|p| p.as_str()),
+    )
+    .await
+    {
+        Ok(()) => None,
+        Err(error) => Some(error),
+    };
+
+    let index_types: Vec<crate::unity_type_index::UnityTypeIndexEntry> = new_types
+        .iter()
+        .filter(|t| t.is_top_level && t.is_public)
+        .map(|t| crate::unity_type_index::UnityTypeIndexEntry {
+            simple_name: t.simple_name.clone(),
+            namespace: t.ns.clone(),
+            full_name: if t.ns.is_empty() {
+                t.simple_name.clone()
+            } else {
+                format!("{}.{}", t.ns, t.simple_name)
+            },
+            assembly: assembly_name.to_string(),
+        })
+        .collect();
+    if image_register_error.is_none() && !index_types.is_empty() {
+        if let Err(error) = crate::unity_type_index::append_hot_patch_types(
+            project_path,
+            assembly_name,
+            index_types,
+        )
+        .await
+        {
+            eprintln!("[HotReload] type index increment skipped: {error}");
+        }
+    }
+
+    Ok(AppliedHotPatch {
+        engine: loaded.detour_engine,
+        inlined_method_keys: loaded.inlined_method_keys,
+        inlined_sources: loaded.inlined_sources,
+        image_register_error,
+        pump_skipped_count: loaded.pump_skipped_count,
+        pump_skipped_messages: loaded.pump_skipped_messages,
+    })
+}
+
+const INLINE_REFRESH_MAX_DEPTH: usize = 2;
+const INLINE_REFRESH_MAX_CALLERS_PER_TARGET: usize = 8;
+const INLINE_REFRESH_MAX_METHODS_TOTAL: usize = 16;
+const INLINE_REFRESH_MAX_FILES_TOTAL: usize = 16;
+
+#[derive(Debug, Default)]
+struct InlineCallerRefreshReport {
+    rounds: usize,
+    files: usize,
+    methods: usize,
+    notes: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+struct InlineRefreshFile {
+    path: String,
+    old_text: String,
+    new_text: String,
+    force_methods: BTreeSet<String>,
+}
+
+fn caller_query_target_from_unity_key(
+    key: &str,
+) -> Option<crate::csharp_compile::CallerQueryTarget> {
+    let parts: Vec<&str> = key.split('|').collect();
+    if parts.len() != 4 {
+        return None;
+    }
+    let declaring_type = parts[0].trim();
+    let member_name = parts[1].trim();
+    if declaring_type.is_empty()
+        || member_name.is_empty()
+        || member_name == ".ctor"
+        || declaring_type.contains('<')
+        || member_name.contains('<')
+    {
+        return None;
+    }
+    Some(crate::csharp_compile::CallerQueryTarget {
+        declaring_type: declaring_type.to_string(),
+        member_name: member_name.to_string(),
+    })
+}
+
+fn resolve_caller_source_path(project_path: &str, file: &str) -> String {
+    let normalized = file.replace('\\', "/");
+    let path = std::path::Path::new(file);
+    if path.is_absolute() {
+        return file.to_string();
+    }
+    std::path::Path::new(project_path)
+        .join(normalized.trim_start_matches('/'))
+        .to_string_lossy()
+        .to_string()
+}
+
+fn squash_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+async fn try_inline_caller_refresh(
+    project_path: &str,
+    params: &crate::csharp_compile::CompileParams,
+    extra_references: &[String],
+    access_caps: &crate::csharp_compile::AccessCaps,
+    initial_patch_files: &[(String, String, String)],
+    initial_inlined_keys: &[String],
+) -> InlineCallerRefreshReport {
+    let mut report = InlineCallerRefreshReport::default();
+    let mut frontier: Vec<String> = initial_inlined_keys.to_vec();
+    let mut seen_targets = BTreeSet::<String>::new();
+    let mut refreshed_methods = BTreeSet::<String>::new();
+    let mut refreshed_files = BTreeSet::<String>::new();
+    // Carry the WHOLE initial batch — every changed file with its diff — into the
+    // refresh compile, not just the inlined callees' own source files. A
+    // force-detoured caller is recompiled here, so the compilation must see every
+    // sibling the (still un-converged) batch introduced: e.g. an enum value or a
+    // type/member appended in ANOTHER file of the same batch. Subsetting to the
+    // inlined methods' files dropped those siblings, so the caller refresh failed
+    // to compile (CS0117: 'Type' has no definition for the appended member) — which
+    // silently defeated the un-inline and fell back to a queued recompile. The
+    // full set is self-consistent (the main apply just compiled it); the extra
+    // files only carry references — only the queried callers are force-detoured.
+    let mut carry_files = {
+        let mut files = BTreeMap::<String, InlineRefreshFile>::new();
+        for (path, old_text, new_text) in initial_patch_files {
+            files.insert(
+                file_key(path),
+                InlineRefreshFile {
+                    path: path.clone(),
+                    old_text: old_text.clone(),
+                    new_text: new_text.clone(),
+                    force_methods: BTreeSet::new(),
+                },
+            );
+        }
+        files
+    };
+
+    for depth in 0..INLINE_REFRESH_MAX_DEPTH {
+        // A sidecar restart during refresh blanks the session registries; a
+        // force-detoured caller recompiled against them could split a virtualized
+        // field. Stop here and let the next hot reload converge via recompile.
+        if super::session_registry_lost() {
+            report.notes.push(
+                "caller refresh stopped: compile-server session lost to a restart".to_string(),
+            );
+            break;
+        }
+        let targets: Vec<crate::csharp_compile::CallerQueryTarget> = frontier
+            .iter()
+            .filter(|key| seen_targets.insert((*key).clone()))
+            .filter_map(|key| caller_query_target_from_unity_key(key))
+            .collect();
+        if targets.is_empty() {
+            break;
+        }
+
+        let query = match crate::csharp_compile::query_callers(params, &targets).await {
+            Ok(query) => query,
+            Err(error) => {
+                report.notes.push(format!(
+                    "caller refresh skipped: caller index unavailable ({error})"
+                ));
+                break;
+            }
+        };
+
+        let mut force_by_file: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        let mut method_limit_hit = false;
+        for target in &query.targets {
+            if method_limit_hit {
+                break;
+            }
+            if target.callers.len() > INLINE_REFRESH_MAX_CALLERS_PER_TARGET {
+                report.notes.push(format!(
+                    "caller refresh skipped {} caller(s) for {}.{} (limit {})",
+                    target.callers.len(),
+                    target.declaring_type,
+                    target.member_name,
+                    INLINE_REFRESH_MAX_CALLERS_PER_TARGET
+                ));
+                continue;
+            }
+            for caller in &target.callers {
+                if caller.file.trim().is_empty() || caller.method_key.trim().is_empty() {
+                    continue;
+                }
+                if refreshed_methods.len() >= INLINE_REFRESH_MAX_METHODS_TOTAL {
+                    if !method_limit_hit {
+                        report.notes.push(format!(
+                            "caller refresh stopped at {} method(s) (limit {})",
+                            refreshed_methods.len(),
+                            INLINE_REFRESH_MAX_METHODS_TOTAL
+                        ));
+                    }
+                    method_limit_hit = true;
+                    break;
+                }
+                let absolute = resolve_caller_source_path(project_path, &caller.file);
+                let fkey = file_key(&absolute);
+                // Respect the file budget BEFORE claiming the method: a method
+                // skipped for the file cap must not be recorded as refreshed,
+                // or it would wrongly consume the method budget and suppress a
+                // later, in-budget refresh of the same method.
+                if !refreshed_files.contains(&fkey)
+                    && refreshed_files.len() >= INLINE_REFRESH_MAX_FILES_TOTAL
+                {
+                    report.notes.push(format!(
+                        "caller refresh stopped at {} file(s) (limit {})",
+                        refreshed_files.len(),
+                        INLINE_REFRESH_MAX_FILES_TOTAL
+                    ));
+                    continue;
+                }
+                let method_id = format!("{}::{}", fkey, caller.method_key);
+                if !refreshed_methods.insert(method_id) {
+                    continue;
+                }
+                refreshed_files.insert(fkey);
+                force_by_file
+                    .entry(absolute)
+                    .or_default()
+                    .insert(caller.method_key.clone());
+            }
+        }
+
+        if force_by_file.is_empty() {
+            break;
+        }
+
+        let forced_file_count = force_by_file.len();
+        let forced_method_count: usize = force_by_file.values().map(BTreeSet::len).sum();
+        let mut round_files = carry_files.clone();
+        for (path, methods) in force_by_file {
+            let current = match tokio::fs::read_to_string(&path).await {
+                Ok(text) => text,
+                Err(error) => {
+                    report.notes.push(format!(
+                        "caller refresh skipped {}: failed to read source ({error})",
+                        display_project_path(project_path, &path)
+                    ));
+                    continue;
+                }
+            };
+            let key = file_key(&path);
+            let entry = round_files.entry(key).or_insert_with(|| InlineRefreshFile {
+                path: path.clone(),
+                old_text: current.clone(),
+                new_text: current,
+                force_methods: BTreeSet::new(),
+            });
+            entry.force_methods.extend(methods);
+        }
+
+        let files: Vec<(String, String, String)> = round_files
+            .values()
+            .map(|file| {
+                (
+                    file.path.clone(),
+                    file.old_text.clone(),
+                    file.new_text.clone(),
+                )
+            })
+            .collect();
+        let force_detours: Vec<crate::csharp_compile::ForceDetour> = round_files
+            .values()
+            .filter(|file| !file.force_methods.is_empty())
+            .map(|file| crate::csharp_compile::ForceDetour {
+                path: file.path.clone(),
+                method_keys: file.force_methods.iter().cloned().collect(),
+            })
+            .collect();
+
+        if files.is_empty() || force_detours.is_empty() {
+            break;
+        }
+
+        let baseline_siblings = discover_partial_siblings(project_path, &files).await;
+        let outcome = match crate::csharp_compile::compile_hot_patch(
+            params,
+            &files,
+            &baseline_siblings,
+            extra_references,
+            Some(access_caps),
+            &force_detours,
+        )
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                report
+                    .notes
+                    .push(format!("caller refresh compile unavailable: {error}"));
+                break;
+            }
+        };
+
+        match outcome {
+            crate::csharp_compile::HotPatchOutcome::Compiled {
+                assembly_name,
+                assembly_b64,
+                assembly_path,
+                methods,
+                new_types,
+                message_drivers,
+                ..
+            } => {
+                if methods.is_empty() {
+                    report
+                        .notes
+                        .push("caller refresh produced no detourable methods".to_string());
+                    break;
+                }
+                match apply_compiled_hot_patch(
+                    project_path,
+                    params,
+                    &assembly_name,
+                    &assembly_b64,
+                    assembly_path.as_ref(),
+                    &methods,
+                    &new_types,
+                    &message_drivers,
+                )
+                .await
+                {
+                    Ok(applied) => {
+                        report.rounds = depth + 1;
+                        report.files += forced_file_count;
+                        report.methods += forced_method_count;
+                        carry_files = round_files;
+                        if let Some(error) = applied.image_register_error {
+                            report.notes.push(format!(
+                                "caller refresh image registration failed: {error}; run unity_recompile before the next hot reload"
+                            ));
+                            break;
+                        }
+                        frontier = applied.inlined_method_keys;
+                        if frontier.is_empty() {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        report.notes.push(format!(
+                            "caller refresh patch failed: {}",
+                            squash_line(&error)
+                        ));
+                        break;
+                    }
+                }
+            }
+            crate::csharp_compile::HotPatchOutcome::Cold { files } => {
+                let reasons: Vec<String> = files
+                    .iter()
+                    .map(|(path, reasons)| {
+                        format!(
+                            "{}: {}",
+                            display_project_path(project_path, path),
+                            reasons.join("; ")
+                        )
+                    })
+                    .collect();
+                report.notes.push(format!(
+                    "caller refresh stopped at cold verdict: {}",
+                    reasons.join(" | ")
+                ));
+                break;
+            }
+            crate::csharp_compile::HotPatchOutcome::Noop { .. } => {
+                report
+                    .notes
+                    .push("caller refresh found no effective caller detours".to_string());
+                break;
+            }
+            crate::csharp_compile::HotPatchOutcome::CompileError(message) => {
+                report.notes.push(format!(
+                    "caller refresh compile error: {}",
+                    squash_line(&message)
+                ));
+                break;
+            }
+        }
+    }
+
+    if !frontier.is_empty() && report.rounds >= INLINE_REFRESH_MAX_DEPTH {
+        report.notes.push(format!(
+            "caller refresh stopped at recursion depth {}",
+            INLINE_REFRESH_MAX_DEPTH
+        ));
+    }
+    report
+}
+
+async fn queue_inlined_method_files(
+    project_path: &str,
+    changed_keys: &[String],
+    methods: &[crate::csharp_compile::HotPatchMethod],
+    inlined_method_keys: &[String],
+) -> usize {
+    if inlined_method_keys.is_empty() {
+        return 0;
+    }
+    let method_key_to_file: BTreeMap<String, String> = methods
+        .iter()
+        .filter(|method| !method.source_path.is_empty())
+        .map(|method| (unity_method_key(method), file_key(&method.source_path)))
+        .collect();
+    let mut inlined_files: BTreeSet<String> = BTreeSet::new();
+    let mut unmapped = false;
+    for key in inlined_method_keys {
+        match method_key_to_file.get(key) {
+            Some(file) if !file.is_empty() => {
+                inlined_files.insert(file.clone());
+            }
+            _ => unmapped = true,
+        }
+    }
+    if unmapped || inlined_files.is_empty() {
+        queue_cold_paths(project_path, changed_keys).await
+    } else {
+        let files: Vec<String> = inlined_files.into_iter().collect();
+        queue_cold_paths(project_path, &files).await
+    }
 }
 
 pub async fn pending_paths(project_path: &str) -> Vec<String> {
@@ -871,6 +1909,11 @@ struct HotReloadProbeResponse {
     detour_ok: bool,
     #[serde(default)]
     code_optimization: String,
+    /// Whether entering Play Mode reloads the domain. `None` when the plugin
+    /// predates the toggle (the field is absent), so the UI shows "unknown"
+    /// rather than mistaking a missing field for "no reload".
+    #[serde(default)]
+    domain_reload_on_play: Option<bool>,
     #[serde(default)]
     error: String,
 }
@@ -903,13 +1946,11 @@ async fn run_probe(project_path: &str) -> Result<(), String> {
     let probe: HotReloadProbeResponse = serde_json::from_str(&message)
         .map_err(|error| format!("Unity probe response parse failed: {error}"))?;
 
-    if probe.code_optimization != "debug" {
-        return Err(
-            "Hot reload requires Unity Editor Code Optimization = Debug (currently Release; \
-             switch it in the Unity status bar or Preferences > General), or use unity_recompile."
-                .to_string(),
-        );
-    }
+    // Code Optimization is informational now (Release-first). The editor may be
+    // in Release, where Mono inlines some small methods past the detour; the
+    // apply path detects those per method and converges them with a recompile,
+    // so the probe no longer blocks on Release. The detour self-test below is
+    // the real capability gate.
     if !probe.detour_ok {
         return Err(format!(
             "The detour engine self-test failed in this editor ({}); use unity_recompile.",
@@ -962,14 +2003,24 @@ pub async fn detect_code_optimization(project_path: &str) -> (bool, Option<Strin
     }
 }
 
-/// Switch the connected editor to Code Optimization = Debug (the toggle-time
-/// auto-fix the user confirmed). Triggers a script recompile in Unity, exactly
-/// like flipping the status-bar bug icon. Returns the resulting value.
-pub async fn set_code_optimization_debug(project_path: &str) -> Result<String, String> {
+fn normalize_code_optimization(value: &str) -> Option<&'static str> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "debug" => Some("debug"),
+        "release" => Some("release"),
+        _ => None,
+    }
+}
+
+async fn send_code_optimization_request(
+    project_path: &str,
+    message_type: &str,
+    payload: &str,
+    desired: &str,
+) -> Result<String, String> {
     let resp = crate::unity_bridge::send_message_with_timeout(
         project_path,
-        "hot_reload_set_debug",
-        "",
+        message_type,
+        payload,
         std::time::Duration::from_secs(15),
     )
     .await
@@ -981,16 +2032,18 @@ pub async fn set_code_optimization_debug(project_path: &str) -> Result<String, S
         let error = resp
             .error
             .unwrap_or_else(|| "Unity rejected the Code Optimization change".to_string());
+        if error == "domain_reload_interrupted" {
+            return Ok(desired.to_string());
+        }
         if error.starts_with("unknown message type") {
-            return Err(
+            return Err(format!(
                 "The Unity plugin in this project predates the Code Optimization auto-switch. \
                  Update the Locus plugin (reopen the project from Locus), or set Code \
-                 Optimization to Debug yourself from the Unity status bar."
-                    .to_string(),
-            );
+                 Optimization to {desired} yourself from the Unity status bar."
+            ));
         }
         return Err(format!(
-            "Unity could not switch Code Optimization to Debug: {error}"
+            "Unity could not switch Code Optimization to {desired}: {error}"
         ));
     }
 
@@ -998,10 +2051,119 @@ pub async fn set_code_optimization_debug(project_path: &str) -> Result<String, S
     let parsed: HotReloadProbeResponse = serde_json::from_str(&message)
         .map_err(|error| format!("Code Optimization response parse failed: {error}"))?;
     Ok(if parsed.code_optimization.is_empty() {
-        "debug".to_string()
+        desired.to_string()
     } else {
         parsed.code_optimization
     })
+}
+
+/// Switch the connected editor to the requested Code Optimization. Triggers a
+/// script recompile in Unity, exactly like flipping the status-bar bug icon.
+/// Returns the resulting value reported by Unity.
+pub async fn set_code_optimization(project_path: &str, desired: &str) -> Result<String, String> {
+    let desired = normalize_code_optimization(desired)
+        .ok_or_else(|| "Code Optimization must be 'debug' or 'release'".to_string())?;
+    match send_code_optimization_request(
+        project_path,
+        "hot_reload_set_code_optimization",
+        desired,
+        desired,
+    )
+    .await
+    {
+        Ok(value) => Ok(value),
+        Err(error) if desired == "debug" && error.contains("predates") => {
+            send_code_optimization_request(project_path, "hot_reload_set_debug", "", desired).await
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Switch the connected editor to Code Optimization = Debug (the optional
+/// toggle-time auto-fix the user confirmed).
+pub async fn set_code_optimization_debug(project_path: &str) -> Result<String, String> {
+    set_code_optimization(project_path, "debug").await
+}
+
+// ── Enter-Play-Mode domain reload (manual popover toggle) ────────────
+
+/// One probe, both editor settings the hot-reload popover surfaces: Code
+/// Optimization and the Play-Mode domain-reload flag. Mirrors
+/// `detect_code_optimization`'s lenient contract — an unreachable editor →
+/// `(false, None, None)`; a connected editor whose probe could not be parsed
+/// (an older plugin) → `(true, None, None)`. Both settings are read off the
+/// single `hot_reload_probe` round-trip so the popover never double-probes.
+pub async fn detect_hot_reload_editor_settings(
+    project_path: &str,
+) -> (bool, Option<String>, Option<bool>) {
+    let resp = match crate::unity_bridge::send_message_with_timeout(
+        project_path,
+        "hot_reload_probe",
+        "",
+        std::time::Duration::from_secs(10),
+    )
+    .await
+    {
+        Ok(resp) => resp,
+        Err(_) => return (false, None, None),
+    };
+
+    if !resp.ok {
+        return (true, None, None);
+    }
+
+    let message = resp.message.unwrap_or_default();
+    match serde_json::from_str::<HotReloadProbeResponse>(&message) {
+        Ok(probe) => (
+            true,
+            if probe.code_optimization.is_empty() {
+                None
+            } else {
+                Some(probe.code_optimization)
+            },
+            probe.domain_reload_on_play,
+        ),
+        _ => (true, None, None),
+    }
+}
+
+/// Set whether entering Play Mode reloads the managed domain
+/// (EditorSettings.enterPlayModeOptions / DisableDomainReload). Unlike a Code
+/// Optimization switch this does NOT trigger a recompile — it only flips the
+/// editor setting. Returns the resulting effective value reported by Unity.
+pub async fn set_play_mode_reload(project_path: &str, domain_reload: bool) -> Result<bool, String> {
+    let payload = serde_json::json!({ "domain_reload_on_play": domain_reload }).to_string();
+    let resp = crate::unity_bridge::send_message_with_timeout(
+        project_path,
+        "hot_reload_set_play_mode_reload",
+        &payload,
+        std::time::Duration::from_secs(10),
+    )
+    .await
+    .map_err(|error| {
+        format!("Could not reach the Unity editor to change Play Mode domain reload: {error}")
+    })?;
+
+    if !resp.ok {
+        let error = resp
+            .error
+            .unwrap_or_else(|| "Unity rejected the Play Mode domain-reload change".to_string());
+        if error.starts_with("unknown message type") {
+            return Err(
+                "The Unity plugin in this project predates the Play Mode domain-reload toggle. \
+                 Update the Locus plugin (reopen the project from Locus)."
+                    .to_string(),
+            );
+        }
+        return Err(format!(
+            "Unity could not change Play Mode domain reload: {error}"
+        ));
+    }
+
+    let message = resp.message.unwrap_or_default();
+    let parsed: HotReloadProbeResponse = serde_json::from_str(&message)
+        .map_err(|error| format!("Play Mode domain-reload response parse failed: {error}"))?;
+    Ok(parsed.domain_reload_on_play.unwrap_or(domain_reload))
 }
 
 // ── access probe (C0 runtime capability matrix) ─────────────────────
@@ -1300,6 +2462,15 @@ pub async fn hot_reload(
         );
     }
 
+    // A prior request already saw the sidecar restart with patches live: its
+    // session registries are gone, so a hot apply could split a virtualized
+    // field's value. Converge through unity_recompile instead of compiling
+    // against the blank registry (which would also fail confusingly on any
+    // cross-patch reference the lost ImageRegistry can no longer resolve).
+    if super::session_registry_lost() {
+        return Ok(converge_after_session_loss(project_path, &changed_keys).await);
+    }
+
     let params = crate::csharp_compile::params::get_params(project_path)
         .await
         .map_err(|error| {
@@ -1328,18 +2499,24 @@ pub async fn hot_reload(
     let baseline_siblings = discover_partial_siblings(project_path, &files).await;
 
     let started = std::time::Instant::now();
-    let outcome = crate::csharp_compile::compile_hot_patch(
+    let outcome = match crate::csharp_compile::compile_hot_patch(
         &params,
         &files,
         &baseline_siblings,
         &extra_references,
         Some(&access_caps),
+        &[],
     )
     .await
-    .map_err(|error| {
-        super::record_patch_failure();
-        format!("Compile server unavailable ({error}); use unity_recompile.")
-    })?;
+    {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            record_patch_failure(project_path).await;
+            return Err(format!(
+                "Compile server unavailable ({error}); use unity_recompile."
+            ));
+        }
+    };
 
     match outcome {
         crate::csharp_compile::HotPatchOutcome::Cold { files: cold_files } => {
@@ -1352,7 +2529,7 @@ pub async fn hot_reload(
                 lines.push(format!("  {}: {}", path, reasons.join("; ")));
             }
             let queued = queue_cold_paths(project_path, &changed_keys).await;
-            super::set_cold_queue_depth(queued as u64);
+            crate::csharp_compile::emit_status_in_background();
             lines.push(format!(
                 "Run unity_recompile to apply them ({queued} file(s) queued). Hot-applied edits \
                  from earlier patches stay live until then."
@@ -1388,9 +2565,13 @@ pub async fn hot_reload(
             assembly_path,
             methods,
             new_types,
+            message_drivers,
             caller_scan_note,
         } => {
-            if methods.is_empty() && new_types.is_empty() {
+            // A patch that ONLY adds a new Unity PlayerLoop message has no
+            // detour and no new type, but it must still be loaded so the pump
+            // shim is in the domain and can be driven — so it is not a no-op.
+            if methods.is_empty() && new_types.is_empty() && message_drivers.is_empty() {
                 // Compiled-but-nothing-detourable means the batch ONLY adds
                 // new surface (methods / enum members): the patch is not
                 // loaded, because nothing in the running domain can reach it
@@ -1404,115 +2585,89 @@ pub async fn hot_reload(
                 );
             }
 
-            // New-types-only patches skip the detour message: loading the
-            // assembly is enough... except nothing would load it. Ship it
-            // through the same pipe message with an empty method list NOT
-            // allowed (Unity rejects) — so require methods OR load via
-            // execute path. Simplest correct path: send hot_patch_loaded
-            // whenever there are methods; for pure new-type patches send it
-            // too — Unity loads the assembly and applies zero detours.
-            let mut payload = serde_json::json!({
-                "patch_id": assembly_name,
-                "domain_generation": params.domain_generation,
-                "methods": methods.iter().map(|m| serde_json::json!({
-                    "declaring_type": m.declaring_type,
-                    "patch_declaring_type": m.patch_declaring_type,
-                    "name": m.name,
-                    "param_type_names": m.param_type_names,
-                    "is_static": m.is_static,
-                    "is_ctor": m.is_ctor,
-                    // Older plugins ignore the unknown field and then fail
-                    // resolution → whole-patch rollback + update hint (the
-                    // established compatibility discipline).
-                    "original_assembly": m.original_assembly.as_deref().unwrap_or(""),
-                })).collect::<Vec<_>>(),
-            });
-            if let Some(object) = payload.as_object_mut() {
-                if let Some(path) = &assembly_path {
-                    object.insert(
-                        "assembly_path".to_string(),
-                        serde_json::Value::String(path.clone()),
-                    );
-                } else {
-                    object.insert(
-                        "assembly_b64".to_string(),
-                        serde_json::Value::String(assembly_b64.clone()),
-                    );
-                }
+            // The sidecar can have crashed and respawned during this very call's
+            // get_params / probe / compile (after the gate above), blanking the
+            // registries — so this freshly built assembly may carry a new,
+            // value-splitting field store. Re-check before shipping it to Unity.
+            if super::session_registry_lost() {
+                return Ok(converge_after_session_loss(project_path, &changed_keys).await);
             }
-            let payload = payload.to_string();
 
-            let resp = match crate::unity_bridge::send_message_with_timeout(
+            let applied = match apply_compiled_hot_patch(
                 project_path,
-                "hot_patch_loaded",
-                &payload,
-                std::time::Duration::from_secs(30),
+                &params,
+                &assembly_name,
+                &assembly_b64,
+                assembly_path.as_ref(),
+                &methods,
+                &new_types,
+                &message_drivers,
             )
             .await
             {
-                Ok(resp) => resp,
+                Ok(applied) => applied,
                 Err(error) => {
-                    super::record_patch_failure();
-                    // The patch never applied: queue the files so the
-                    // convergence pass (and the status card) covers them.
-                    let queued = queue_cold_paths(project_path, &changed_keys).await;
-                    super::set_cold_queue_depth(queued as u64);
-                    return Err(format!(
-                        "Unity did not accept the hot patch ({error}); use unity_recompile."
-                    ));
+                    queue_cold_paths(project_path, &changed_keys).await;
+                    crate::csharp_compile::emit_status_in_background();
+                    return Err(error);
                 }
             };
-
-            if !resp.ok {
-                super::record_patch_failure();
-                let queued = queue_cold_paths(project_path, &changed_keys).await;
-                super::set_cold_queue_depth(queued as u64);
-                let error = resp
-                    .error
-                    .unwrap_or_else(|| "hot patch rejected".to_string());
-                if error.starts_with("unknown message type") {
-                    return Err(
-                        "The Unity plugin in this project predates hot reload; update the Locus \
-                         plugin or use unity_recompile."
-                            .to_string(),
-                    );
-                }
-                return Err(format!(
-                    "Hot patch failed in Unity: {error}\nRun unity_recompile to converge."
-                ));
-            }
 
             mark_changed_keys_applied(project_path, &changed_current_texts).await;
 
-            let image_register_error = match crate::csharp_compile::register_session_image(
-                &params.domain_generation,
-                &assembly_name,
-                &assembly_b64,
-                assembly_path.as_deref(),
-            )
-            .await
-            {
-                Ok(()) => None,
-                Err(error) => Some(error),
+            let engine = applied.engine;
+            let inlined_method_keys = applied.inlined_method_keys;
+            let inlined_sources = applied.inlined_sources;
+            let image_register_error = applied.image_register_error;
+            let pump_skipped_count = applied.pump_skipped_count;
+            let pump_skipped_messages = applied.pump_skipped_messages;
+
+            // Phase D rollout observability: count the force-evaluate-attributable
+            // classifications (StubInlined = the force-JIT stub moved Mono's bit;
+            // without the feature these fall to the static heuristic). An upper
+            // bound on the over-refresh the feature adds — logged so a gray rollout
+            // can weigh that cost against the tighter "is it live" reporting it buys.
+            let stub_inlined = inlined_sources
+                .iter()
+                .filter(|source| source.as_str() == "StubInlined")
+                .count();
+            if stub_inlined > 0 {
+                eprintln!(
+                    "[HotReload] inline force-evaluate: {stub_inlined}/{} inlined method(s) classified via the force-JIT stub this apply",
+                    inlined_method_keys.len()
+                );
+            }
+
+            // Route inlined methods to the same convergence path Locus uses for
+            // any non-hot-safe change, but queue only the source file(s) whose
+            // methods Unity reported as inlined. Fall back to the batch if a
+            // method key cannot be mapped.
+            if !inlined_method_keys.is_empty() {
+                queue_inlined_method_files(
+                    project_path,
+                    &changed_keys,
+                    &methods,
+                    &inlined_method_keys,
+                )
+                .await;
+                crate::csharp_compile::emit_status_in_background();
+            }
+
+            let inline_refresh = if !inlined_method_keys.is_empty() {
+                Some(
+                    try_inline_caller_refresh(
+                        project_path,
+                        &params,
+                        &extra_references,
+                        &access_caps,
+                        &files,
+                        &inlined_method_keys,
+                    )
+                    .await,
+                )
+            } else {
+                None
             };
-
-            let assembly_bytes = assembly_artifact_len(&assembly_b64, assembly_path.as_deref());
-            let code_entries = methods.len().saturating_add(new_types.len()) as u64;
-            super::record_patch_applied(assembly_bytes, code_entries);
-            // H6: arm the convergence scheduler (threshold / idle / play exit).
-            super::note_patch_applied(project_path);
-
-            let engine = resp
-                .message
-                .as_deref()
-                .and_then(|message| serde_json::from_str::<serde_json::Value>(message).ok())
-                .and_then(|value| {
-                    value
-                        .get("detour_engine")
-                        .and_then(|v| v.as_str())
-                        .map(String::from)
-                })
-                .unwrap_or_default();
 
             let stub_count = methods.iter().filter(|m| m.is_stub).count();
             let mut summary = format!(
@@ -1523,6 +2678,40 @@ pub async fn hot_reload(
             );
             if !new_types.is_empty() {
                 summary.push_str(&format!(", {} new type(s) loaded", new_types.len()));
+            }
+            let real_driver_count = message_drivers
+                .iter()
+                .filter(|d| !is_clear_marker(d))
+                .count();
+            if real_driver_count > 0 {
+                // Hard failures already fail closed above, so the remainder is driven
+                // (pump/proxy/once-off catch-up) or benign-skipped. Report each
+                // skipped message by name (when the plugin sent them), and surface
+                // each distinct caveat note once so the agent understands why a driven
+                // message may not match native behavior.
+                let notes: Vec<&str> = message_drivers
+                    .iter()
+                    .filter(|d| !is_clear_marker(d))
+                    .map(|d| d.note.as_str())
+                    .collect();
+                summary.push_str(&message_driver_summary(
+                    real_driver_count,
+                    pump_skipped_count,
+                    &pump_skipped_messages,
+                    &notes,
+                ));
+            }
+            // Clear-markers (feature #1): a play-mode-born re-edit removed a Unity
+            // message an earlier patch had wired to the pump. The behavior stops
+            // immediately (the plugin cleared the driver by source file).
+            let cleared_count = message_drivers
+                .iter()
+                .filter(|d| is_clear_marker(d))
+                .count();
+            if cleared_count > 0 {
+                summary.push_str(&format!(
+                    ".\n{cleared_count} removed Unity message(s) stopped (runtime driver cleared)"
+                ));
             }
             if !engine.is_empty() {
                 summary.push_str(&format!(" (engine: {engine})"));
@@ -1543,37 +2732,59 @@ pub async fn hot_reload(
                     ".\nSidecar image registration failed: {error}. Run unity_recompile before the next hot reload."
                 ));
             }
-            summary.push_str(
-                ".\nChanges are live in the running Editor — no recompile, no domain reload, \
-                 state preserved. The files are on disk, so the next unity_recompile or domain \
-                 reload makes them permanent automatically.",
-            );
-
-            // TI-C: layer new public top-level types into the cached type
-            // index so auto-usings resolve them immediately.
-            let index_types: Vec<crate::unity_type_index::UnityTypeIndexEntry> = new_types
-                .iter()
-                .filter(|t| t.is_top_level && t.is_public)
-                .map(|t| crate::unity_type_index::UnityTypeIndexEntry {
-                    simple_name: t.simple_name.clone(),
-                    namespace: t.ns.clone(),
-                    full_name: if t.ns.is_empty() {
-                        t.simple_name.clone()
-                    } else {
-                        format!("{}.{}", t.ns, t.simple_name)
-                    },
-                    assembly: assembly_name.clone(),
-                })
-                .collect();
-            if image_register_error.is_none() && !index_types.is_empty() {
-                if let Err(error) = crate::unity_type_index::append_hot_patch_types(
-                    project_path,
-                    &assembly_name,
-                    index_types,
-                )
-                .await
+            if let Some(refresh) = &inline_refresh {
+                if refresh.methods > 0 {
+                    summary.push_str(&format!(
+                        ".\nInline caller refresh patched {} caller method(s) across {} file(s) in {} round(s); unity_recompile is still queued for convergence.",
+                        refresh.methods, refresh.files, refresh.rounds
+                    ));
+                }
+                for note in &refresh.notes {
+                    summary.push_str(&format!("\nInline caller refresh: {note}."));
+                }
+            }
+            if inlined_method_keys.is_empty() {
+                summary.push_str(
+                    ".\nChanges are live in the running Editor — no recompile, no domain reload, \
+                     state preserved. The files are on disk, so the next unity_recompile or domain \
+                     reload makes them permanent automatically.",
+                );
+            } else {
+                // Release-first honesty: Mono inlined some originals, so the detour
+                // is bypassed at their inlined call sites and those edits are NOT
+                // live yet. Report tersely — names (tagged by the confidence the
+                // plugin reported) + the one action that matters. (Keep the exact
+                // phrase "inlined in Release"; the self-test keys on it.)
+                let names = annotate_inlined_names(&inlined_method_keys, &inlined_sources);
+                let playing = {
+                    let (connected, status, _) =
+                        crate::unity_bridge::query_unity_status(project_path).await;
+                    connected && crate::unity_bridge::is_play_mode_status(status)
+                };
+                let action = if playing {
+                    "exit Play Mode or run unity_recompile (exit reloads the domain, dropping \
+                     play-mode state), or switch Code Optimization to Debug"
+                } else {
+                    "run unity_recompile, or switch Code Optimization to Debug"
+                };
+                if inline_refresh
+                    .as_ref()
+                    .map(|refresh| refresh.methods > 0)
+                    .unwrap_or(false)
                 {
-                    eprintln!("[HotReload] type index increment skipped: {error}");
+                    summary.push_str(&format!(
+                        ".\n{} method(s) inlined in Release; project caller refresh was attempted for: {}. To converge fully: {}.",
+                        names.len(),
+                        names.join(", "),
+                        action,
+                    ));
+                } else {
+                    summary.push_str(&format!(
+                        ".\n{} method(s) inlined in Release — NOT live yet: {}. To apply: {}.",
+                        names.len(),
+                        names.join(", "),
+                        action,
+                    ));
                 }
             }
 
@@ -1585,6 +2796,128 @@ pub async fn hot_reload(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn message_driver_gate_passes_when_supported_and_clean() {
+        // No added messages → always Ok, regardless of support / failures.
+        assert!(message_driver_gate(false, false, 0).is_ok());
+        // Added messages, plugin supports them, none failed → Ok.
+        assert!(message_driver_gate(true, true, 0).is_ok());
+    }
+
+    #[test]
+    fn message_driver_gate_fails_closed_when_plugin_cannot_drive() {
+        // Drivers sent but the plugin predates pump support → fail closed.
+        let err = message_driver_gate(true, false, 0).unwrap_err();
+        assert!(err.contains("can't drive"), "{err}");
+        assert!(err.contains("unity_recompile"), "{err}");
+    }
+
+    #[test]
+    fn clear_markers_excluded_from_pump_capability_gate() {
+        fn driver(kind: &str) -> crate::csharp_compile::HotPatchMessageDriver {
+            serde_json::from_value(serde_json::json!({
+                "kind": kind,
+                "declaringType": "Born.Widget",
+                "shimType": "",
+                "shimMethod": "",
+                "message": "Update",
+                "sourcePath": "Widget.cs",
+            }))
+            .unwrap()
+        }
+        // A clear-marker is not a real driver: an old plugin (pump_supported=false)
+        // that never wired the message also has nothing to clear, so a clear-ONLY
+        // patch must NOT fail closed on the pump-capability gate.
+        let clear_only = vec![driver("clear")];
+        assert!(!has_real_message_drivers(&clear_only));
+        assert!(message_driver_gate(has_real_message_drivers(&clear_only), false, 0).is_ok());
+        // A real driver alongside a clear-marker still trips the gate on an old plugin.
+        let mixed = vec![driver("player_loop"), driver("clear")];
+        assert!(has_real_message_drivers(&mixed));
+        assert!(message_driver_gate(has_real_message_drivers(&mixed), false, 0).is_err());
+    }
+
+    #[test]
+    fn message_driver_gate_fails_closed_on_reported_wiring_failures() {
+        // pump_failed_count > 0 fails closed even when the plugin supports driving.
+        let err = message_driver_gate(true, true, 2).unwrap_err();
+        assert!(err.contains('2'), "{err}");
+        assert!(err.contains("could not be wired"), "{err}");
+    }
+
+    #[test]
+    fn pump_capability_cache_roundtrips_and_overwrites() {
+        // Unique key so the process-global cache can't collide with other tests.
+        let gen = "test-gen-pump-capability-roundtrip";
+        assert_eq!(known_pump_capability(gen), None); // not learned yet
+        remember_pump_capability(gen, false);
+        assert_eq!(known_pump_capability(gen), Some(false)); // learned: unsupported → preflight fails closed
+        remember_pump_capability(gen, true);
+        assert_eq!(known_pump_capability(gen), Some(true)); // re-learned: supported
+    }
+
+    #[test]
+    fn message_driver_summary_reports_driven_and_named_skips() {
+        let skipped = vec![
+            "OnTriggerEnter — parameter is not UnityEngine.Collider (a same-named custom type) — left as a plain method".to_string(),
+            "Awake — no live instance to catch up (new instances need a recompile)".to_string(),
+        ];
+        // A note duplicated across drivers must appear once; the empty note is dropped.
+        let notes = vec![
+            "Update runs after native scripts.",
+            "Update runs after native scripts.",
+            "",
+        ];
+        let s = message_driver_summary(3, 2, &skipped, &notes); // 3 total, 2 skipped → 1 driven
+        assert!(
+            s.contains("1 added Unity message(s) wired to a runtime driver"),
+            "{s}"
+        );
+        assert!(s.contains("2 added Unity message(s) not driven"), "{s}");
+        assert!(s.contains("OnTriggerEnter"), "{s}");
+        assert!(s.contains("Awake"), "{s}");
+        assert_eq!(
+            s.matches("Update runs after native scripts.").count(),
+            1,
+            "{s}"
+        );
+    }
+
+    #[test]
+    fn message_driver_summary_all_driven_has_no_skip_clause() {
+        let s = message_driver_summary(2, 0, &[], &["", ""]);
+        assert!(
+            s.contains("2 added Unity message(s) wired to a runtime driver"),
+            "{s}"
+        );
+        assert!(!s.contains("not driven"), "{s}");
+    }
+
+    #[test]
+    fn message_driver_summary_falls_back_to_count_without_names() {
+        // Older plugin: count > 0 but no names → the generic reason clause, no driven.
+        let s = message_driver_summary(1, 1, &[], &[""]);
+        assert!(
+            s.contains("1 added Unity message(s) not driven (not an engine message"),
+            "{s}"
+        );
+        assert!(!s.contains("wired to a runtime driver"), "{s}");
+    }
+
+    #[test]
+    fn message_driver_summary_caps_named_skips() {
+        let skipped: Vec<String> = (0..9).map(|i| format!("OnMsg{i} — reason")).collect();
+        let s = message_driver_summary(9, 9, &skipped, &[]);
+        assert!(s.contains("OnMsg0") && s.contains("OnMsg5"), "{s}"); // first 6 shown
+        assert!(!s.contains("OnMsg6"), "{s}"); // 7th onward capped
+        assert!(s.contains("(+3 more)"), "{s}");
+    }
+
+    #[test]
+    fn message_driver_summary_empty_when_no_messages() {
+        assert_eq!(message_driver_summary(0, 0, &[], &[]), "");
+    }
 
     #[test]
     fn partial_decl_names_are_grep_grade() {
@@ -1610,6 +2943,57 @@ mod tests {
             &mut none,
         );
         assert!(none.is_empty(), "{none:?}");
+    }
+
+    #[test]
+    fn inlined_names_annotate_by_reported_confidence() {
+        let keys = vec![
+            "Game.Foo|Bar|Int32|s".to_string(),
+            "Game.Foo|Baz||i".to_string(),
+            "Game.Foo|Qux|String|s".to_string(),
+        ];
+        let sources = vec![
+            "RuntimeInlined".to_string(),
+            "StubInlined".to_string(),
+            "Predicted".to_string(),
+        ];
+        let names = annotate_inlined_names(&keys, &sources);
+        assert_eq!(names[0], "Game.Foo.Bar (confirmed)");
+        assert_eq!(names[1], "Game.Foo.Baz (high-confidence)");
+        assert_eq!(names[2], "Game.Foo.Qux (predicted)");
+
+        // Older plugin: no sources → bare names, no panic on the length gap.
+        let bare = annotate_inlined_names(&keys, &[]);
+        assert_eq!(bare, vec!["Game.Foo.Bar", "Game.Foo.Baz", "Game.Foo.Qux"]);
+
+        // Unknown/empty source string also falls back to the bare name.
+        let unknown = annotate_inlined_names(&keys[..1], &["Mystery".to_string()]);
+        assert_eq!(unknown, vec!["Game.Foo.Bar"]);
+    }
+
+    #[test]
+    fn inline_method_keys_roundtrip_to_caller_query_targets() {
+        let method = crate::csharp_compile::HotPatchMethod {
+            declaring_type: "Game.Runtime.Foo+Bar".to_string(),
+            patch_declaring_type: "__LocusHotPatch.Foo_Bar".to_string(),
+            name: "Answer".to_string(),
+            param_type_names: vec!["Int32".to_string(), "String".to_string()],
+            param_type_sigs: vec!["System.Int32".to_string(), "System.String".to_string()],
+            is_static: true,
+            is_ctor: false,
+            source_path: r"F:\Game\Assets\Foo.cs".to_string(),
+            original_assembly: Some("Assembly-CSharp".to_string()),
+            is_stub: false,
+        };
+
+        let key = unity_method_key(&method);
+        assert_eq!(key, "Game.Runtime.Foo+Bar|Answer|Int32,String|s");
+
+        let target = caller_query_target_from_unity_key(&key).expect("target");
+        assert_eq!(target.declaring_type, "Game.Runtime.Foo+Bar");
+        assert_eq!(target.member_name, "Answer");
+        assert!(caller_query_target_from_unity_key("Game.Foo|.ctor||i").is_none());
+        assert!(caller_query_target_from_unity_key("Game.Foo|<Generated>||s").is_none());
     }
 
     #[tokio::test]
@@ -1726,7 +3110,7 @@ mod tests {
     async fn baseline_is_captured_once_and_cleared_on_convergence() {
         // Isolated project key for this test.
         let project = r"C:\HotReloadTest\Baseline";
-        super::super::initialize(true);
+        super::super::initialize(true, false);
         crate::csharp_compile::initialize_enabled_for_tests(true);
 
         note_cs_written(
@@ -1757,7 +3141,7 @@ mod tests {
             assert!(state.cold_paths.is_empty());
         }
 
-        super::super::initialize(false);
+        super::super::initialize(false, false);
         crate::csharp_compile::initialize_enabled_for_tests(false);
     }
 
@@ -1765,7 +3149,10 @@ mod tests {
     fn classify_reload_distinguishes_compile_from_bare_reload() {
         use ReloadDecision::*;
         // First sample: seed only (pending may be uncompiled — never clear).
-        assert_eq!(classify_reload(None, None, None, "s1", "g1", 0, false), Seed);
+        assert_eq!(
+            classify_reload(None, None, None, "s1", "g1", 0, false),
+            Seed
+        );
         // Nothing moved (steady state / transient pipe blip).
         assert_eq!(
             classify_reload(Some("s1"), Some("g1"), Some(0), "s1", "g1", 0, false),
@@ -1807,7 +3194,10 @@ mod tests {
         // First sample with no baseline only seeds, even if the serial looks
         // advanced — documents the race the monitor avoids by seeding a baseline
         // on connect before any edit can be the first sample.
-        assert_eq!(classify_reload(None, None, None, "s1", "g2", 5, false), Seed);
+        assert_eq!(
+            classify_reload(None, None, None, "s1", "g2", 5, false),
+            Seed
+        );
 
         // ── Edits that survived the previous editor's exit ──
         // Relaunch's startup recompile loaded them (serial advanced past 0):
@@ -2048,9 +3438,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn active_patch_counters_are_isolated_per_project() {
+        // P2-a: the live-detour tallies and convergence state are per project, so
+        // two open editors never cross-contaminate (they were once module-global
+        // atomics shared by every project). Distinct keys keep this test isolated
+        // from the others sharing the process-global map.
+        let a = r"C:\HotReloadTest\CrosstalkA";
+        let b = r"C:\HotReloadTest\CrosstalkB";
+
+        record_patch_applied(a, 128, 3).await;
+        record_patch_applied(b, 64, 1).await;
+        record_patch_applied(b, 64, 1).await;
+        assert_eq!(project_active_patches(a).await, 1);
+        assert_eq!(project_active_patches(b).await, 2);
+
+        // The crux: a domain reload in A drops A's detours but must leave B's live
+        // count untouched. The old global `ACTIVE_PATCHES.store(0)` zeroed everyone,
+        // so B believed it had no active patch and under-converged.
+        on_domain_reloaded(a).await;
+        assert_eq!(
+            project_active_patches(a).await,
+            0,
+            "A's detours die with its domain"
+        );
+        assert_eq!(
+            project_active_patches(b).await,
+            2,
+            "B's active patches must survive A's domain reload"
+        );
+
+        // The monotonic session total is independent of the live-detour reset, and
+        // the active byte/code tallies reset alongside the patch count.
+        let (applied_a, bytes_a) = {
+            let projects = projects().lock().await;
+            let state = projects.get(&project_key(a)).expect("state");
+            (state.patches_applied, state.active_patch_bytes)
+        };
+        assert_eq!(
+            applied_a, 1,
+            "patches_applied is monotonic across the reload"
+        );
+        assert_eq!(bytes_a, 0, "active bytes reset with the domain");
+
+        on_recompile_converged(a).await;
+        on_recompile_converged(b).await;
+    }
+
+    #[tokio::test]
     async fn relative_project_paths_are_tracked_against_project_root() {
         let project = r"C:\HotReloadTest\Relative";
-        super::super::initialize(true);
+        super::super::initialize(true, false);
         crate::csharp_compile::initialize_enabled_for_tests(true);
 
         note_cs_written(project, r"Assets\Scripts\B.cs", "old".to_string()).await;
@@ -2064,7 +3501,7 @@ mod tests {
         }
 
         on_recompile_converged(project).await;
-        super::super::initialize(false);
+        super::super::initialize(false, false);
         crate::csharp_compile::initialize_enabled_for_tests(false);
     }
 }

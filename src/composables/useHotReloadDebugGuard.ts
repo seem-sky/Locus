@@ -1,76 +1,111 @@
-import { ref } from "vue";
+import { computed, ref } from "vue";
 import {
   unityHotReloadPreflight,
-  unityHotReloadSetCodeOptimizationDebug,
+  unityHotReloadSetCodeOptimization,
+  unityHotReloadSetPlayModeReload,
 } from "../services/csharpLsp";
 import { normalizeAppError } from "../services/errors";
 
 /**
- * Enable-time gate shared by both hot-reload toggles (the icon above the chat
- * input and the Settings switch). Hot patches only take effect when the Unity
- * editor's Code Optimization is Debug — Release inlines call sites past the
- * MonoMod redirect, so patches silently do nothing.
+ * Release-first hot reload (shared by the icon above the chat input and the
+ * Settings switch). Enabling NO LONGER blocks on the editor's Code
+ * Optimization: hot reload works in Release, where Mono inlines only some
+ * small methods — those converge via an automatic recompile instead of the
+ * live detour (see the Rust coordinator / Unity LocusBridge.HotReload).
  *
- * Before turning the feature on we probe the connected editor. On a positive
- * "release" we surface a modal; confirming switches the editor to Debug and
- * then runs the caller's `enable` step. When the editor is unreachable or the
- * value can't be read, we enable directly — the execution-time probe still
- * guards real hot reloads, so there is nothing to block on yet.
+ * We still read the connected editor's optimization so the UI can show an
+ * OPTIONAL, dismissible "switch to Debug" hint (Debug avoids the occasional
+ * convergence recompile), mirroring the reference plugin's suggestion rather
+ * than the old hard gate.
  *
- * `enable` is the caller's own "turn it on" routine (it owns the
- * `unityHotReloadSetEnabled(true)` call and its component's status/error
- * state), so each call site keeps its existing behaviour and only the gate is
- * shared.
+ * `enable` is the caller's own "turn it on" routine; it runs unconditionally.
  */
 export function useHotReloadDebugGuard(enable: () => Promise<void>) {
-  const promptVisible = ref(false);
-  const adjusting = ref(false);
-  const adjustError = ref("");
+  const codeOptimization = ref<string | null>(null);
+  const switching = ref(false);
+  const switchError = ref("");
 
-  async function guardedEnable() {
-    let codeOptimization: string | null = null;
+  // Manual "Reload Domain on entering Play Mode" toggle, read off the SAME
+  // preflight probe as Code Optimization. null = unknown (editor down / old
+  // plugin). Flipping it does NOT recompile — it just edits EditorSettings.
+  const domainReloadOnPlay = ref<boolean | null>(null);
+  const settingPlayModeReload = ref(false);
+  const playModeReloadError = ref("");
+
+  // Only a positively-read "release" shows the hint; unknown (editor down /
+  // old plugin) stays quiet, exactly as the execution path does.
+  const isRelease = computed(() => codeOptimization.value === "release");
+
+  async function refreshOptimization() {
     try {
-      codeOptimization = (await unityHotReloadPreflight()).codeOptimization;
+      const preflight = await unityHotReloadPreflight();
+      codeOptimization.value = preflight.codeOptimization;
+      domainReloadOnPlay.value = preflight.domainReloadOnPlay;
     } catch {
-      // Can't tell (editor down, command failed) → don't block; the
-      // execution-time probe gates the actual hot reload.
-      codeOptimization = null;
+      codeOptimization.value = null;
+      domainReloadOnPlay.value = null;
     }
-    if (codeOptimization === "release") {
-      adjustError.value = "";
-      promptVisible.value = true;
-      return;
-    }
-    await enable();
   }
 
-  async function confirmAdjust() {
-    if (adjusting.value) return;
-    adjusting.value = true;
-    adjustError.value = "";
+  /** Set whether entering Play Mode reloads the domain. On failure re-read the
+   * real EditorSettings state (the editor stays authoritative). */
+  async function setPlayModeReload(domainReload: boolean) {
+    if (settingPlayModeReload.value) return;
+    settingPlayModeReload.value = true;
+    playModeReloadError.value = "";
     try {
-      await unityHotReloadSetCodeOptimizationDebug();
-      promptVisible.value = false;
-      await enable();
+      const result = await unityHotReloadSetPlayModeReload(domainReload);
+      domainReloadOnPlay.value = result.domainReloadOnPlay;
     } catch (error) {
-      adjustError.value = normalizeAppError(error).message;
+      playModeReloadError.value = normalizeAppError(error).message;
+      void refreshOptimization();
     } finally {
-      adjusting.value = false;
+      settingPlayModeReload.value = false;
     }
   }
 
-  function cancelAdjust() {
-    if (adjusting.value) return;
-    promptVisible.value = false;
-    adjustError.value = "";
+  async function enableHotReload() {
+    await enable();
+    // Refresh the hint in the background once it's on (non-blocking).
+    void refreshOptimization();
+  }
+
+  /** Switch the connected editor to an explicit Code Optimization level.
+   * Triggers a Unity recompile; on failure we re-read the real state. */
+  async function setOptimization(level: "debug" | "release") {
+    if (switching.value) return;
+    switching.value = true;
+    switchError.value = "";
+    try {
+      const result = await unityHotReloadSetCodeOptimization(level);
+      codeOptimization.value = result.codeOptimization;
+    } catch (error) {
+      switchError.value = normalizeAppError(error).message;
+      // The switch may have partially landed (e.g. a recompile interrupted the
+      // probe) — re-read so the UI reflects the editor's actual level.
+      void refreshOptimization();
+    } finally {
+      switching.value = false;
+    }
+  }
+
+  // Back-compat: the Settings switch still offers a one-shot "switch to Debug".
+  async function switchToDebug() {
+    await setOptimization("debug");
   }
 
   return {
-    promptVisible,
-    adjusting,
-    adjustError,
-    guardedEnable,
-    confirmAdjust,
-    cancelAdjust,
+    codeOptimization,
+    isRelease,
+    switching,
+    switchError,
+    refreshOptimization,
+    enableHotReload,
+    setOptimization,
+    switchToDebug,
+    domainReloadOnPlay,
+    settingPlayModeReload,
+    playModeReloadError,
+    setPlayModeReload,
   };
 }

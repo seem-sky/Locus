@@ -576,6 +576,11 @@ fn background_hook_marker_path(project_path: &str) -> PathBuf {
         .join("BackgroundHook.enabled")
 }
 
+fn native_background_hook_markers_present(project_path: &str) -> bool {
+    native_bridge_marker_path(project_path).is_file()
+        && background_hook_marker_path(project_path).is_file()
+}
+
 /// Transient native-broker errors meaning "the managed executor is briefly
 /// unavailable (mid domain reload) — retry" rather than a real failure. Flows
 /// that intentionally span a reload (e.g. recompile) treat a broker `ok:false`
@@ -639,8 +644,7 @@ pub(crate) async fn send_message_with_transient_retry(
     let mut attempt = 1;
     loop {
         let resp = send_message_with_timeout(project_path, msg_type, message, timeout).await?;
-        let Some(error) = transient_broker_error_from_response(&resp).map(ToOwned::to_owned)
-        else {
+        let Some(error) = transient_broker_error_from_response(&resp).map(ToOwned::to_owned) else {
             return Ok(resp);
         };
         if attempt >= SHORT_MESSAGE_TRANSIENT_RETRY_ATTEMPTS {
@@ -659,8 +663,7 @@ async fn send_message_without_timeout_with_transient_retry(
     let mut attempt = 1;
     loop {
         let resp = send_message_without_timeout(project_path, msg_type, message).await?;
-        let Some(error) = transient_broker_error_from_response(&resp).map(ToOwned::to_owned)
-        else {
+        let Some(error) = transient_broker_error_from_response(&resp).map(ToOwned::to_owned) else {
             return Ok(resp);
         };
         if attempt >= SHORT_MESSAGE_TRANSIENT_RETRY_ATTEMPTS {
@@ -1118,7 +1121,20 @@ fn normalized_project_path_for_launch(project_path: &str) -> PathBuf {
     dunce::canonicalize(trimmed).unwrap_or_else(|_| Path::new(trimmed).to_path_buf())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnityLaunchCodeOptimization {
+    Debug,
+    Release,
+}
+
 pub async fn launch_project(project_path: &str) -> Result<UnityLaunchResult, String> {
+    launch_project_with_options(project_path, None).await
+}
+
+pub async fn launch_project_with_options(
+    project_path: &str,
+    code_optimization: Option<UnityLaunchCodeOptimization>,
+) -> Result<UnityLaunchResult, String> {
     if !is_unity_project(project_path) {
         return Err("Current working directory is not a Unity project".to_string());
     }
@@ -1135,6 +1151,15 @@ pub async fn launch_project(project_path: &str) -> Result<UnityLaunchResult, Str
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
+    match code_optimization {
+        Some(UnityLaunchCodeOptimization::Debug) => {
+            command.arg("-debugCodeOptimization");
+        }
+        Some(UnityLaunchCodeOptimization::Release) => {
+            command.arg("-releaseCodeOptimization");
+        }
+        None => {}
+    }
 
     #[cfg(target_os = "windows")]
     {
@@ -1387,6 +1412,34 @@ fn process_hint_from_response(
     })
 }
 
+fn inactive_background_hook_status() -> UnityBackgroundHookStatus {
+    if background_hook::enabled() {
+        UnityBackgroundHookStatus {
+            enabled: true,
+            supported: cfg!(target_os = "windows"),
+            state: UnityBackgroundHookState::Inactive,
+            patched: false,
+            process_id: None,
+            editor_process_path: None,
+            symbol_count: 0,
+            error: None,
+            updated_at_ms: unix_now_ms(),
+        }
+    } else {
+        background_hook::status()
+    }
+}
+
+fn should_defer_background_hook_to_native(
+    status: &UnityConnectionStatus,
+    project_path: &str,
+) -> bool {
+    background_hook::enabled()
+        && native_bridge_enabled()
+        && !status.connected
+        && native_background_hook_markers_present(project_path)
+}
+
 async fn sync_background_hook_for_status(status: &mut UnityConnectionStatus, project_path: &str) {
     // The in-process native hook (when active) owns the patch and survives
     // domain reloads; the cross-process path then stands down.
@@ -1406,23 +1459,14 @@ async fn sync_background_hook_for_status(status: &mut UnityConnectionStatus, pro
             return;
         }
 
-        status.background_hook = if background_hook::enabled() {
-            UnityBackgroundHookStatus {
-                enabled: true,
-                supported: cfg!(target_os = "windows"),
-                state: UnityBackgroundHookState::Inactive,
-                patched: false,
-                process_id: None,
-                editor_process_path: None,
-                symbol_count: 0,
-                error: None,
-                updated_at_ms: unix_now_ms(),
-            }
-        } else {
-            background_hook::status()
-        };
+        status.background_hook = inactive_background_hook_status();
         return;
     };
+
+    if should_defer_background_hook_to_native(status, project_path) {
+        status.background_hook = inactive_background_hook_status();
+        return;
+    }
 
     let Some(editor_process_path) = status.editor_process_path.clone() else {
         status.background_hook = UnityBackgroundHookStatus {
@@ -1751,6 +1795,9 @@ pub async fn ensure_background_hook_for_project(
     if let Some(native) = native_owned_background_hook(project_path).await {
         return Ok(native);
     }
+    if native_bridge_enabled() && native_background_hook_markers_present(project_path) {
+        return Ok(inactive_background_hook_status());
+    }
     let process_info = query_current_project_editor_process(project_path).await;
     let process_id = process_info.process_id.ok_or_else(|| {
         process_info
@@ -2004,7 +2051,9 @@ pub async fn query_unity_status_with_timeout(
 }
 
 pub async fn exit_play_mode(project_path: &str) -> Result<(), String> {
-    let resp = send_message(project_path, "exit_play_mode", "").await?;
+    let resp =
+        send_message_with_timeout(project_path, "exit_play_mode", "", Duration::from_secs(45))
+            .await?;
     if !resp.ok {
         return Err(resp
             .error
@@ -2273,7 +2322,7 @@ async fn sidecar_compile_for_run_states(
 ) -> SidecarCompileAttempt {
     let params = match sidecar_compile_params(project_path).await {
         Ok(params) => params,
-        Err(reason) => return SidecarCompileAttempt::Unavailable(reason),
+        Err(reason) => return sidecar_unavailable(reason),
     };
 
     let cache_key = run_states_compile_cache_key(project_path, &params, prepared_request);
@@ -2337,7 +2386,7 @@ async fn sidecar_compile_for_run_states(
         } else {
             format!("run_states compilation exception: {}", failure.message)
         }),
-        Err(error) => SidecarCompileAttempt::Unavailable(error),
+        Err(error) => sidecar_unavailable(error),
     }
 }
 
@@ -2480,6 +2529,21 @@ pub async fn compile_run_states(
 /// Returns `Ok(Some(augmented))` to send, `Ok(None)` to send the original
 /// request (sidecar unavailable), or `Err` with a deterministic compile
 /// error in the Unity-side wording (View Script errors carry no prefix).
+/// View/Skill precompile counterpart of `sidecar_unavailable`: a graceful
+/// fallback sends the raw source (`Ok(None)` → Unity compiles in-process),
+/// unless the operator disabled the in-process fallback, in which case the
+/// unavailability is returned as an error so no in-Unity compile runs.
+fn sidecar_augment_unavailable(reason: String) -> Result<Option<serde_json::Value>, String> {
+    if crate::csharp_compile::block_in_process_fallback() {
+        Err(format!(
+            "sidecar compile unavailable and in-process fallback disabled: {reason}"
+        ))
+    } else {
+        crate::csharp_compile::note_fallback(&reason);
+        Ok(None)
+    }
+}
+
 async fn augment_view_script_request_with_sidecar(
     project_path: &str,
     request: &serde_json::Value,
@@ -2499,10 +2563,7 @@ async fn augment_view_script_request_with_sidecar(
 
     let params = match sidecar_compile_params(project_path).await {
         Ok(params) => params,
-        Err(reason) => {
-            crate::csharp_compile::note_fallback(&reason);
-            return Ok(None);
-        }
+        Err(reason) => return sidecar_augment_unavailable(reason),
     };
 
     let source_path = request
@@ -2539,10 +2600,7 @@ async fn augment_view_script_request_with_sidecar(
             }
         }
         Ok(Err(failure)) => Err(failure.message),
-        Err(error) => {
-            crate::csharp_compile::note_fallback(&error);
-            Ok(None)
-        }
+        Err(error) => sidecar_augment_unavailable(error),
     }
 }
 
@@ -2560,10 +2618,7 @@ async fn augment_skill_package_request_with_sidecar(
 
     let params = match sidecar_compile_params(project_path).await {
         Ok(params) => params,
-        Err(reason) => {
-            crate::csharp_compile::note_fallback(&reason);
-            return Ok(None);
-        }
+        Err(reason) => return sidecar_augment_unavailable(reason),
     };
 
     match crate::csharp_compile::compile_skill_package(&params, request).await {
@@ -2588,10 +2643,7 @@ async fn augment_skill_package_request_with_sidecar(
             }
         }
         Ok(Err(failure)) => Err(failure.message),
-        Err(error) => {
-            crate::csharp_compile::note_fallback(&error);
-            Ok(None)
-        }
+        Err(error) => sidecar_augment_unavailable(error),
     }
 }
 
@@ -3380,13 +3432,26 @@ async fn sidecar_compile_params(
 /// Compile a prepared unity_execute snippet in the sidecar. Error texts
 /// mirror the Unity-side `HandleExecuteCode` wording exactly ("async snippet
 /// compilation exception: " + the combined two-mode compile error).
+/// Map a sidecar "unavailable" (sidecar down / transport error) to either a
+/// graceful in-Unity fallback (`Unavailable`) or a hard error (`CompileError`)
+/// when the operator disabled the in-process fallback (pure-sidecar / A-B).
+fn sidecar_unavailable(reason: String) -> SidecarCompileAttempt {
+    if crate::csharp_compile::block_in_process_fallback() {
+        SidecarCompileAttempt::CompileError(format!(
+            "sidecar compile unavailable and in-process fallback disabled: {reason}"
+        ))
+    } else {
+        SidecarCompileAttempt::Unavailable(reason)
+    }
+}
+
 async fn sidecar_compile_for_execute(
     project_path: &str,
     prepared_code: &str,
 ) -> SidecarCompileAttempt {
     let params = match sidecar_compile_params(project_path).await {
         Ok(params) => params,
-        Err(reason) => return SidecarCompileAttempt::Unavailable(reason),
+        Err(reason) => return sidecar_unavailable(reason),
     };
 
     let compile_started = std::time::Instant::now();
@@ -3430,7 +3495,7 @@ async fn sidecar_compile_for_execute(
                 failure.message
             ))
         }
-        Err(error) => SidecarCompileAttempt::Unavailable(error),
+        Err(error) => sidecar_unavailable(error),
     }
 }
 
@@ -4261,6 +4326,136 @@ pub async fn recompile_and_wait(project_path: &str) -> Result<String, String> {
     }
 }
 
+/// C# source written by [`run_recompile_probe`]. `__CLASS__`/`__STAMP__` are
+/// substituted per run so each probe file is unique and harmless (a plain,
+/// inert type in its own namespace — no `MonoBehaviour`, no side effects).
+const RECOMPILE_PROBE_TEMPLATE: &str = "// Auto-generated by the Locus recompile probe — safe to delete.\nnamespace Locus.RecompileProbe\n{\n    internal static class __CLASS__\n    {\n        public const long Stamp = __STAMP__L;\n    }\n}\n";
+
+/// One-shot "does a recompile actually converge?" probe for the test page.
+///
+/// Writes a throwaway, harmless `.cs` into the project's `Assets`, drives a real
+/// [`recompile_and_wait`] (so it exercises the exact background-hook / foreground
+/// path normal convergence uses), then deletes the file and converges the
+/// deletion. Returns a line-oriented report (`PASS`/`FAIL`/`WARN` prefixes so the
+/// UI can colour them). The probe file is always cleaned up, even when the
+/// recompile fails.
+pub async fn run_recompile_probe(project_path: &str) -> Result<String, String> {
+    if !is_unity_connected(project_path).await {
+        return Err("Unity Editor is not connected — cannot run the recompile probe.".to_string());
+    }
+
+    let assets_dir = std::path::Path::new(project_path).join("Assets");
+    if !assets_dir.is_dir() {
+        return Err(format!(
+            "No Assets directory under the project: {}",
+            assets_dir.display()
+        ));
+    }
+
+    let stamp = unix_now_ms();
+    let class_name = format!("LocusRecompileProbe_{stamp}");
+    let file_name = format!("{class_name}.cs");
+    let probe_path = assets_dir.join(&file_name);
+    let meta_path = assets_dir.join(format!("{file_name}.meta"));
+    let source = RECOMPILE_PROBE_TEMPLATE
+        .replace("__CLASS__", &class_name)
+        .replace("__STAMP__", &stamp.to_string());
+
+    let mut report: Vec<String> = Vec::new();
+    report.push(format!("Recompile probe · project {project_path}"));
+
+    // Surface the hook regime up front. This also patches when possible,
+    // mirroring what recompile_and_wait does internally a moment later.
+    let hook_effective = background_hook_effective_for_project(project_path).await;
+    report.push(format!("Background hook: {}", describe_background_hook()));
+
+    // 1) Write the throwaway source.
+    if let Err(error) = std::fs::write(&probe_path, source) {
+        return Err(format!(
+            "Failed to write probe file {}: {error}",
+            probe_path.display()
+        ));
+    }
+    report.push(format!("PASS wrote probe source Assets/{file_name}"));
+
+    // 2) The actual test: drive a real recompile and time it.
+    let started = std::time::Instant::now();
+    let recompile = recompile_and_wait(project_path).await;
+    let secs = started.elapsed().as_secs_f64();
+    let recompile_ok = recompile.is_ok();
+    match &recompile {
+        Ok(message) => report.push(format!(
+            "PASS recompile converged in {secs:.1}s — {message}"
+        )),
+        Err(error) => report.push(format!(
+            "FAIL recompile did not converge after {secs:.1}s — {error}"
+        )),
+    }
+    if recompile_ok {
+        if hook_effective {
+            report.push(
+                "→ Converged via the background hook; Unity did not need the foreground."
+                    .to_string(),
+            );
+        } else {
+            report.push(
+                "→ Background hook inactive: recompile_and_wait pulled Unity to the foreground to converge. A background-triggered convergence would stall here until Unity is focused."
+                    .to_string(),
+            );
+        }
+    }
+
+    // 3) Delete the probe source (+ the .meta Unity generated for it). Always
+    // attempted, even when the recompile above failed.
+    let mut cleanup_errors: Vec<String> = Vec::new();
+    for path in [&probe_path, &meta_path] {
+        if path.exists() {
+            if let Err(error) = std::fs::remove_file(path) {
+                cleanup_errors.push(format!("{}: {error}", path.display()));
+            }
+        }
+    }
+    if cleanup_errors.is_empty() {
+        report.push("PASS deleted probe file (.cs + .meta)".to_string());
+    } else {
+        report.push(format!("FAIL probe cleanup: {}", cleanup_errors.join("; ")));
+    }
+
+    // 4) Converge the deletion so the assembly drops the probe type. Best-effort.
+    let cleanup_started = std::time::Instant::now();
+    match recompile_and_wait(project_path).await {
+        Ok(_) => report.push(format!(
+            "PASS cleanup recompile converged in {:.1}s",
+            cleanup_started.elapsed().as_secs_f64()
+        )),
+        Err(error) => report.push(format!("WARN cleanup recompile skipped — {error}")),
+    }
+
+    Ok(report.join("\n"))
+}
+
+/// Human-readable one-liner for the current background-hook patch state, used in
+/// the recompile-probe report so the user can see which regime they are in.
+fn describe_background_hook() -> String {
+    let status = background_hook::status();
+    match status.state {
+        background_hook::UnityBackgroundHookState::Patched => {
+            format!("active (patched, {} symbol(s))", status.symbol_count)
+        }
+        background_hook::UnityBackgroundHookState::Inactive => {
+            "inactive (not patched yet)".to_string()
+        }
+        background_hook::UnityBackgroundHookState::Disabled => "disabled in settings".to_string(),
+        background_hook::UnityBackgroundHookState::Unsupported => {
+            "unsupported on this OS".to_string()
+        }
+        background_hook::UnityBackgroundHookState::Failed => format!(
+            "failed — {}",
+            status.error.unwrap_or_else(|| "unknown error".to_string())
+        ),
+    }
+}
+
 #[derive(serde::Deserialize)]
 struct ReloadStateMessage {
     #[serde(default)]
@@ -4277,14 +4472,10 @@ struct ReloadStateMessage {
 /// mid-reload, a plugin predating the message) returns None and the caller
 /// retries on the next poll.
 async fn fetch_reload_state(project_path: &str) -> Option<(String, String, i64)> {
-    let resp = send_message_with_timeout(
-        project_path,
-        "get_reload_state",
-        "",
-        Duration::from_secs(4),
-    )
-    .await
-    .ok()?;
+    let resp =
+        send_message_with_timeout(project_path, "get_reload_state", "", Duration::from_secs(4))
+            .await
+            .ok()?;
     if !resp.ok {
         return None;
     }
@@ -4342,7 +4533,10 @@ pub async fn start_unity_monitor(
                 if last_play_mode == Some(true) && !playing {
                     let play_exit_project = project_path.clone();
                     tokio::spawn(async move {
-                        crate::unity_hotreload::on_play_mode_exited(&play_exit_project).await;
+                        crate::unity_hotreload::coordinator::on_play_mode_exited(
+                            &play_exit_project,
+                        )
+                        .await;
                     });
                 }
                 last_play_mode = Some(playing);
@@ -4526,10 +4720,11 @@ pub async fn stop_unity_monitor(monitor: &UnityMonitorHandle) {
 mod tests {
     use super::{
         cache_unity_connection_status, cached_running_connection_status_for_transient_failure,
-        is_transient_broker_error, pipe_response_transient_broker_error,
-        read_project_unity_version, relative_asset_paths, requested_run_states_editor_status,
-        rewrite_run_states_output_for_size, PipeResponse, UnityBackgroundHookState,
-        UnityBackgroundHookStatus, UnityConnectionStatus, UnityEditorProcessState,
+        is_transient_broker_error, native_background_hook_markers_present,
+        pipe_response_transient_broker_error, read_project_unity_version, relative_asset_paths,
+        requested_run_states_editor_status, rewrite_run_states_output_for_size, PipeResponse,
+        UnityBackgroundHookState, UnityBackgroundHookStatus, UnityConnectionStatus,
+        UnityEditorProcessState,
     };
     use serde_json::json;
 
@@ -4623,6 +4818,23 @@ mod tests {
             "stale",
         )
         .is_none());
+    }
+
+    #[test]
+    fn native_background_hook_markers_require_native_and_hook_markers() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project_path = temp.path().to_string_lossy().to_string();
+
+        assert!(!native_background_hook_markers_present(&project_path));
+
+        super::sync_native_bridge_marker(&project_path, true).expect("write native marker");
+        assert!(!native_background_hook_markers_present(&project_path));
+
+        super::sync_background_hook_marker(&project_path, true).expect("write hook marker");
+        assert!(native_background_hook_markers_present(&project_path));
+
+        super::sync_background_hook_marker(&project_path, false).expect("remove hook marker");
+        assert!(!native_background_hook_markers_present(&project_path));
     }
 
     #[test]
