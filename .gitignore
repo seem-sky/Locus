@@ -15,6 +15,7 @@ codex-artifacts/
 tmp/
 debug/
 target-check/
+src-tauri/target-headroom-test*/
 
 node_modules
 dist
