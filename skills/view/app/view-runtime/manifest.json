@@ -301,7 +301,7 @@
     },
     {
       "path": "src/language/zh.json",
-      "bytes": 226345
+      "bytes": 230406
     },
     {
       "path": "src/services/asset.ts",

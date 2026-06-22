@@ -13304,7 +13304,7 @@ impl AgentInstance {
                     )
                     .await
                 {
-                    ToolConfirmDecision::Allow => {}
+                    ToolConfirmDecision::Allow { .. } => {}
                     ToolConfirmDecision::Deny { feedback } => {
                         if self.is_cancel_requested() {
                             return Self::interrupted_tool_result();

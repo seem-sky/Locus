@@ -3,64 +3,37 @@ description: CodeGraph MCP — required for complex edits, optional for simple t
 alwaysApply: true
 ---
 <!-- CODEGRAPH_START -->
-## CodeGraph 优先，grep 辅助
+## CodeGraph
 
-本项目已配置 CodeGraph MCP（`codegraph_*` 工具）。**默认优先使用 CodeGraph**：任何结构性问题（符号定位、调用关系、影响范围、追踪 A→B、谁调用谁）一律走 `codegraph_*`。`grep` 只用于**字面量**搜索（日志文案、注释、字符串常量、正则匹配文件内容），**不得用于符号/调用查询**。
+This project has a CodeGraph MCP server (`codegraph_*` tools) configured. CodeGraph is a tree-sitter-parsed knowledge graph of every symbol, edge, and file. Reads are sub-millisecond and return structural information grep cannot.
 
-若 MCP 不可用，先运行 `codegraph status`；若未初始化，运行 `codegraph init -i` 并让用户重启 Cursor。
+### When to prefer codegraph over native search
 
-### 何时优先 CodeGraph（默认）
+Use codegraph for **structural** questions — what calls what, what would break, where is X defined, what is X's signature. Use native grep/read only for **literal text** queries (string contents, comments, log messages) or after you already have a specific file open.
 
-满足**任一**即先用 CodeGraph，再视情况补 `read`：
+| Question | Tool |
+|---|---|
+| "Where is X defined?" / "Find symbol named X" | `codegraph_search` |
+| "What calls function Y?" | `codegraph_callers` |
+| "What does Y call?" | `codegraph_callees` |
+| "How does X reach/become Y? / trace the flow from X to Y" | `codegraph_trace` (one call = the whole path, incl. callback/React/JSX dynamic hops) |
+| "What would break if I changed Z?" | `codegraph_impact` |
+| "Show me Y's signature / source / docstring" | `codegraph_node` |
+| "Give me focused context for a task/area" | `codegraph_context` |
+| "See several related symbols' source at once" | `codegraph_explore` |
+| "What files exist under path/" | `codegraph_files` |
+| "Is the index healthy?" | `codegraph_status` |
 
-| 信号 | 首选 |
-|------|------|
-| 找符号定义 / 签名 | `codegraph_search` |
-| 谁调用了 Y / Y 调用谁 | `codegraph_callers` / `codegraph_callees` |
-| 改 X 会破坏什么（爆炸半径） | `codegraph_impact`（upstream） |
-| 追踪「A 如何到 B」 | `codegraph_trace` → **一次** `codegraph_explore` |
-| 回答架构 / 流程 / 模块理解 | `codegraph_context` → 必要时 **一次** `codegraph_explore` |
-| 一次看多个相关符号源码 | `codegraph_explore` |
+### Rules of thumb
 
-**复杂修改**（多文件 / 跨模块 / 重构 / 架构变更 / 编辑具名 API）**修改前必须**先 CodeGraph：
+- **Answer directly — don't delegate exploration.** For "how does X work" / architecture questions, answer with 2-3 codegraph calls: `codegraph_context` first, then ONE `codegraph_explore` for the source of the symbols it surfaces. For a specific **flow** ("how does X reach Y") start with `codegraph_trace` from→to — one call returns the whole path with dynamic hops bridged — then ONE `codegraph_explore` for the bodies; don't rebuild the path with `codegraph_search` + `codegraph_callers`. Codegraph IS the pre-built index, so spawning a separate file-reading sub-task/agent — or running a grep + read loop — repeats work codegraph already did and costs more for the same answer.
+- **Trust codegraph results.** They come from a full AST parse. Do NOT re-verify them with grep — that's slower, less accurate, and wastes context.
+- **Don't grep first** when looking up a symbol by name. `codegraph_search` is faster and returns kind + location + signature in one call.
+- **Don't chain `codegraph_search` + `codegraph_node`** when you just want context — `codegraph_context` is one call.
+- **Don't loop `codegraph_node` over many symbols** — one `codegraph_explore` call returns several symbols' source grouped in a single capped call, while each separate node/Read call re-reads the whole context and costs far more.
+- **Index lag — check the staleness banner, don't guess a wait.** When a codegraph response starts with "⚠️ Some files referenced below were edited since the last index sync…", the listed files are pending re-index — Read those specific files for accurate content. Files NOT in that banner are fresh and codegraph is authoritative for them. `codegraph_status` also lists pending files under "Pending sync".
 
-1. `codegraph_search` 确认目标位置
-2. `codegraph_impact` 评估爆炸半径
-3. 向用户说明影响面后做最小编辑
+### If `.codegraph/` doesn't exist
 
-### 何时可用 grep（字面量）
-
-仅限**字面文本**搜索：日志文案、注释、字符串常量、用户提供的报错片段、配置文本。`grep` 不能回答"谁调用了 X"、"X 在哪定义"、"改 X 会影响谁"——这些一律走 CodeGraph。
-
-### 禁止（NEVER）
-
-- **NEVER** 在**复杂修改**场景下，未跑 `codegraph_impact` 就改具名函数、方法、类或对外 API
-- **NEVER** 用 `grep` 替代 `codegraph_search` / `codegraph_callers` / `codegraph_callees` / `codegraph_trace` / `codegraph_impact` 做**任何**结构查询
-- **NEVER** 用 `codegraph_search` + 多次 `codegraph_node` 代替 `codegraph_context` / `codegraph_explore`
-- **NEVER** 为同一结构性问题启动子 Agent 或大量 Read 重扫——索引已存在，用 CodeGraph
-- **NEVER** 在同一轮刚改完文件后立即再查 CodeGraph（索引 debounce ~500ms），用 `read` 读刚改的文件
-- **NEVER** 用 `grep` 去验证 CodeGraph 返回的位置/签名（AST 解析已权威）
-
-### 与 GitNexus 的分工
-
-| 需求 | 优先工具 |
-|------|----------|
-| 定义、签名、谁调用谁、改 X 会破坏什么 | **CodeGraph**（复杂修改时必选） |
-| 执行流、业务流程、进程级 trace | **GitNexus** |
-| 高风险重构 | `codegraph_impact` +（若索引陈旧）`gitnexus_impact` |
-
-### 工具速查
-
-| 问题 | 工具 |
-|------|------|
-| X 在哪定义？ | `codegraph_search` |
-| 谁调用 Y？ | `codegraph_callers` |
-| Y 调用谁？ | `codegraph_callees` |
-| A 如何到 B？ | `codegraph_trace` |
-| 改 Z 会破坏什么？ | `codegraph_impact` |
-| 某任务的聚焦上下文 | `codegraph_context` |
-| 多个符号源码一次看完 | `codegraph_explore` |
-| 索引是否健康？ | `codegraph_status` |
-
-字面量搜索（日志文案、注释、字符串常量）仍可用 grep；**复杂任务中的符号与关系一律走 CodeGraph**。
+The MCP server returns "not initialized." Ask the user: *"I notice this project doesn't have CodeGraph initialized. Want me to run `codegraph init -i` to build the index?"*
 <!-- CODEGRAPH_END -->
