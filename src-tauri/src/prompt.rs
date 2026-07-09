@@ -3,7 +3,18 @@ pub mod commit {
 }
 
 pub mod plan {
+    /// Sticky plan-mode reminder for the main agent. `{plan_file_info}` is
+    /// replaced at injection time with the exists/create block for the
+    /// session's plan file.
     pub const PLAN_REMINDER: &str = include_str!("../../prompt/plan-reminder.md");
+    /// Read-only reminder for subagents spawned while the parent session is
+    /// in plan mode (no plan file, no exit_plan_mode).
+    pub const PLAN_REMINDER_SUBAGENT: &str =
+        include_str!("../../prompt/plan-reminder-subagent.md");
+    /// One-shot notice injected on the first user message after leaving plan
+    /// mode. `{plan_file_block}` carries the plan file reference when one
+    /// exists.
+    pub const PLAN_EXITED: &str = include_str!("../../prompt/plan-exited.md");
 }
 
 pub mod workflow {
@@ -89,6 +100,7 @@ pub mod tools {
     pub const CODEGRAPH_STATUS: &str = include_str!("../../tools/codegraph_status.json");
     pub const CODEGRAPH_SYNC: &str = include_str!("../../tools/codegraph_sync.json");
     pub const CODEGRAPH_TRACE: &str = include_str!("../../tools/codegraph_trace.json");
+    pub const EXIT_PLAN_MODE: &str = include_str!("../../tools/exit_plan_mode.json");
 }
 
 #[derive(serde::Deserialize)]
@@ -199,6 +211,7 @@ mod tests {
             ("codegraph_status", tools::CODEGRAPH_STATUS),
             ("codegraph_sync", tools::CODEGRAPH_SYNC),
             ("codegraph_trace", tools::CODEGRAPH_TRACE),
+            ("exit_plan_mode", tools::EXIT_PLAN_MODE),
         ];
 
         for (name, json_str) in tool_prompts {

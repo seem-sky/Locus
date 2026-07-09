@@ -18,6 +18,7 @@ import RichChatInput from "./RichChatInput.vue";
 import BaseButton from "../ui/BaseButton.vue";
 import { forwardWheelToElement } from "../../composables/chatWheelPassthrough";
 import { useThrottledStreamingText } from "../../composables/streamingRenderThrottle";
+import type { StreamingTextSource } from "../../composables/streamingTextChunks";
 import {
   captureScrollAnchor,
   captureLiveScrollAnchor,
@@ -64,6 +65,7 @@ const props = withDefaults(defineProps<{
   isThinking: boolean;
   thinkingDuration?: number;
   liveRenderParts?: AssistantRenderPart[];
+  livePartStreams?: ReadonlyMap<string, StreamingTextSource> | null;
   activeToolCalls: ToolCallDisplay[];
   pendingQuestion?: PendingQuestion | null;
   pendingToolConfirms?: PendingToolConfirm[];
@@ -97,6 +99,7 @@ const props = withDefaults(defineProps<{
   thinkingText: "",
   thinkingDuration: 0,
   isCompacting: false,
+  livePartStreams: null,
   pendingQuestion: null,
   pendingToolConfirms: () => [],
   queuedFollowUp: null,
@@ -557,9 +560,18 @@ watch(
 
 watch(() => props.messages.length, () => reconcileViewport());
 watch(displayedStreamingText, () => reconcileViewport());
-watch(() => props.thinkingText, () => reconcileViewport());
+// The transient thinking block renders as a fixed-height chip, so only its
+// appearance/disappearance affects layout — not each streamed delta.
+watch(() => !!props.thinkingText, () => reconcileViewport());
 watch(() => props.isThinking, () => reconcileViewport());
-watch(() => props.activeToolCalls, () => reconcileViewport(), { deep: true });
+// Reconcile on tool-call identity/status changes only. A deep watch here would
+// re-traverse every tool call (including large streamed output strings) and
+// force a synchronous layout read on each output delta; growth-driven height
+// changes are already covered by the transcript ResizeObserver.
+watch(
+  () => props.activeToolCalls.map((toolCall) => `${toolCall.id}:${toolCall.status}`).join(","),
+  () => reconcileViewport(),
+);
 watch(
   () => props.isStreaming,
   (nextStreaming, previousStreaming) => {
@@ -646,6 +658,7 @@ onUnmounted(() => {
       :thinking-order="thinkingOrder"
       :thinking-duration="thinkingDuration"
       :live-render-parts="liveRenderParts"
+      :live-part-streams="livePartStreams"
       :active-tool-calls="activeToolCalls"
       :empty-title="emptyTitle"
       :empty-hint="emptyHint"

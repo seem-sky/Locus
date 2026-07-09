@@ -19,15 +19,18 @@ describe("Markdown table styles", () => {
     expect(sanitizer).toContain("ALLOW_DATA_ATTR: true");
     expect(sanitizer).toContain("ADD_ATTR: [\"draggable\"]");
     expect(renderer).toContain("import { sanitizeRenderedMarkdownHtml } from \"../composables/markdownSanitize\";");
-    expect(renderer).toContain("return sanitizeRenderedMarkdownHtml(html);");
-    expect(renderer).toContain("return sanitizeRenderedMarkdownHtml(escapeHtml(props.content));");
+    // Math sentinels expand only after the document sanitize pass; the
+    // resolver must wrap the sanitizer, never the other way around.
+    expect(renderer).toContain("return resolveMathSentinels(sanitizeRenderedMarkdownHtml(html));");
+    expect(renderer).toContain("return sanitizeRenderedMarkdownHtml(escapeMarkdownHtml(props.content));");
     expect(renderer).toContain('v-html="renderedHtml"');
   });
 
   it("wraps rendered tables and constrains cell styling in MarkdownRenderer", () => {
     const source = read("src/components/MarkdownRenderer.vue");
+    const engine = read("src/composables/markdownEngine.ts");
 
-    expect(source).toContain('wrapMarkdownTables(html)');
+    expect(engine).toContain('wrapMarkdownTables(html)');
     expect(source).toMatch(/\.markdown-body \.md-table-wrap\s*\{[\s\S]*width:\s*fit-content;[\s\S]*overflow-x:\s*auto;/);
     expect(source).toMatch(/\.markdown-body table\s*\{[\s\S]*width:\s*max-content;[\s\S]*min-width:\s*100%;/);
     expect(source).toMatch(/\.markdown-body th,\s*[\s\S]*\.markdown-body td\s*\{[\s\S]*overflow-wrap:\s*anywhere;[\s\S]*border-right:[\s\S]*!important;[\s\S]*border-bottom:[\s\S]*!important;/);

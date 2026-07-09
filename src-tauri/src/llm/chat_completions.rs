@@ -3,6 +3,7 @@ use serde::Deserialize;
 use std::time::Instant;
 
 use super::openrouter::LlmResponse;
+use super::think_tag_filter::{ThinkTagEmit, ThinkTagFilter};
 use crate::session::models::{ChatMessage, ImageData, MessageRole, ToolCallInfo};
 
 const CHAT_COMPLETIONS_PATH: &str = "/chat/completions";
@@ -58,7 +59,12 @@ where
         thinking_level,
         flavor,
     );
-    let raw_request = serde_json::to_string_pretty(&body).unwrap_or_else(|_| format!("{:?}", body));
+    // Serialize once and send these exact bytes, so debug dumps and rejected-body
+    // diagnostics are byte-for-byte what went on the wire — server-side JSON parse
+    // errors report line/column against the compact wire form (issue #106).
+    let request_bytes = serde_json::to_vec(&body)
+        .map_err(|e| format!("{} request serialization failed: {}", tag, e))?;
+    let raw_request = String::from_utf8_lossy(&request_bytes).into_owned();
 
     eprintln!(
         "[{}] POST model={} messages={} tools={} flavor={:?} replay_reasoning_content={}",
@@ -85,25 +91,72 @@ where
         super::debug::save_request("custom_chat_completions", &api_url, &headers, &raw_request);
     }
 
-    const MAX_RETRIES: u32 = 3;
+    let max_retries = super::retry::max_retries();
     const BASE_DELAY_MS: u64 = 1000;
 
     let mut last_error = String::new();
     let mut response = None;
 
-    for attempt in 0..=MAX_RETRIES {
+    for attempt in 0..=max_retries {
         let mut req = client
             .post(&api_url)
             .header("Content-Type", "application/json")
-            .json(&body);
+            .body(request_bytes.clone());
         if !api_key.is_empty() {
             req = req.header("Authorization", format!("Bearer {}", api_key));
         }
 
         match req.send().await {
             Ok(resp) => {
-                response = Some(resp);
-                break;
+                let status = resp.status();
+                if status.is_success() {
+                    response = Some(resp);
+                    break;
+                }
+
+                // Non-2xx before any stream output exists: decide retry from
+                // the status line. Reading the body both surfaces the server's
+                // error message and drains the connection so the pool can
+                // reuse it across attempts.
+                let retry_after_secs = super::retry::retry_after_secs_from_headers(resp.headers());
+                let error_body = resp.text().await.unwrap_or_default();
+                let mut error = format!("{} API error ({}): {}", tag, status, error_body);
+                if let Some(hint) =
+                    server_json_parse_error_hint(status, &error_body, request_bytes.len())
+                {
+                    error.push_str(&hint);
+                }
+
+                if debug {
+                    eprintln!(
+                        "[DEBUG][{}] API error (status={}):\n{}",
+                        tag, status, error_body
+                    );
+                    if status.is_client_error() {
+                        // A 4xx means the endpoint rejected this request body
+                        // (issue #94), so dump a truncated copy for diagnosis.
+                        // Auth material lives in headers, never in the body.
+                        dump_rejected_request_body(tag, status, &raw_request);
+                    }
+                }
+
+                if super::retry::is_retryable_http_status(status) && attempt < max_retries {
+                    let delay =
+                        super::retry::status_retry_delay_ms(status, retry_after_secs, attempt);
+                    eprintln!(
+                        "[{}] HTTP {} (attempt {}/{}, retrying in {}ms...)",
+                        tag,
+                        status.as_u16(),
+                        attempt + 1,
+                        max_retries + 1,
+                        delay
+                    );
+                    last_error = error;
+                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                    continue;
+                }
+
+                return Err(error);
             }
             Err(e) => {
                 let mut error_chain = format!("Request failed: {}", e);
@@ -114,14 +167,14 @@ where
                 }
 
                 let is_retryable = e.is_connect() || e.is_timeout();
-                if is_retryable && attempt < MAX_RETRIES {
+                if is_retryable && attempt < max_retries {
                     let delay = BASE_DELAY_MS * 2u64.pow(attempt);
                     eprintln!(
                         "[{}] {} (attempt {}/{}, retrying in {}ms...)",
                         tag,
                         error_chain,
                         attempt + 1,
-                        MAX_RETRIES + 1,
+                        max_retries + 1,
                         delay
                     );
                     tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
@@ -134,18 +187,6 @@ where
     }
 
     let response = response.ok_or(last_error)?;
-
-    let status = response.status();
-    if !status.is_success() {
-        let error_body = response.text().await.unwrap_or_default();
-        if debug {
-            eprintln!(
-                "[DEBUG][{}] API error (status={}):\n{}",
-                tag, status, error_body
-            );
-        }
-        return Err(format!("{} API error ({}): {}", tag, status, error_body));
-    }
 
     let mut stream = response.bytes_stream();
     let mut buffer = String::new();
@@ -191,6 +232,7 @@ where
             &on_thinking_delta,
             &on_tool_call_start,
         )? {
+            state.flush_think_filter(&on_text_delta, &on_thinking_delta);
             return finalize_stream_response(
                 tag,
                 model,
@@ -214,6 +256,7 @@ where
         &on_thinking_delta,
         &on_tool_call_start,
     )? {
+        state.flush_think_filter(&on_text_delta, &on_thinking_delta);
         return finalize_stream_response(
             tag,
             model,
@@ -227,6 +270,7 @@ where
         );
     }
 
+    state.flush_think_filter(&on_text_delta, &on_thinking_delta);
     let saw_finish_reason = state.saw_finish_reason;
     finalize_stream_response(
         tag,
@@ -239,6 +283,72 @@ where
         raw_request,
         raw_response,
     )
+}
+
+/// Cap on the request-body preview dumped to stderr when the endpoint
+/// rejects a request with a 4xx (debug mode only).
+const REQUEST_DUMP_MAX_CHARS: usize = 4096;
+
+/// Debug-only stderr dump of the request body a 4xx rejected, truncated to a
+/// few KB. The body carries no credentials (Authorization is a header), so
+/// this is safe to log; it never reaches the user-visible error string.
+fn dump_rejected_request_body(tag: &str, status: reqwest::StatusCode, raw_request: &str) {
+    let truncated: String = raw_request.chars().take(REQUEST_DUMP_MAX_CHARS).collect();
+    let suffix = if truncated.len() < raw_request.len() {
+        format!(
+            "\n... (truncated, {} of {} bytes shown)",
+            truncated.len(),
+            raw_request.len()
+        )
+    } else {
+        String::new()
+    };
+    eprintln!(
+        "[DEBUG][{}] request body rejected with HTTP {}:\n{}{}",
+        tag,
+        status.as_u16(),
+        truncated,
+        suffix
+    );
+}
+
+/// Detect a 4xx whose body blames JSON syntax in the request we sent.
+///
+/// Locus serializes request bodies with serde_json, which cannot emit
+/// syntactically invalid JSON, so such a rejection means the bytes were
+/// corrupted after leaving this process — a proxy, security middlebox, or a
+/// gateway buffer/size limit in front of the endpoint (issue #106). Surface
+/// that context plus the exact request size so users verify with the debug
+/// dump instead of chasing tool-schema ghosts.
+fn server_json_parse_error_hint(
+    status: reqwest::StatusCode,
+    error_body: &str,
+    request_len: usize,
+) -> Option<String> {
+    if !status.is_client_error() {
+        return None;
+    }
+    let lower = error_body.to_ascii_lowercase();
+    const MARKERS: [&str; 6] = [
+        "json parse error",
+        "jsonparseexception",
+        "jsonmappingexception",
+        // Jackson's signature phrasing: "was expecting a colon/comma/...".
+        "was expecting",
+        "invalid json",
+        "malformed json",
+    ];
+    if !MARKERS.iter().any(|marker| lower.contains(marker)) {
+        return None;
+    }
+    Some(format!(
+        "\n[Locus] The endpoint rejected the request body as malformed JSON, but Locus sent \
+         {request_len} bytes serialized by serde_json, which cannot produce invalid JSON. The \
+         body was most likely corrupted in transit (proxy, VPN, security software, or a gateway \
+         buffer/size limit in front of the endpoint). Enable Debug mode in Locus settings (or \
+         set LOCUS_DEBUG=1) to save the exact outgoing request to disk, validate it with a JSON \
+         checker, and replay it with curl to confirm the corruption happens outside Locus."
+    ))
 }
 
 fn detect_flavor(model: &str, base_url: &str) -> ChatCompletionsFlavor {
@@ -628,7 +738,7 @@ fn build_tool_call_values(tool_calls: &[ToolCallInfo]) -> Vec<serde_json::Value>
                 "type": "function",
                 "function": {
                     "name": tc.name,
-                    "arguments": tc.arguments,
+                    "arguments": super::normalize_tool_call_arguments(&tc.name, &tc.arguments),
                 }
             })
         })
@@ -640,6 +750,10 @@ struct ChatStreamState {
     thinking_text: String,
     thinking_started_at: Option<Instant>,
     thinking_duration_secs: u32,
+    /// Reroutes literal `<think>`/`<thinking>` prefixes of the content
+    /// channel into the thinking channel (third-party endpoints that inline
+    /// reasoning as text tags instead of `reasoning_content`).
+    think_filter: ThinkTagFilter,
     reasoning_detail_text_by_key: std::collections::HashMap<String, String>,
     tool_calls_map: std::collections::HashMap<i64, PartialToolCall>,
     finish_reason: String,
@@ -658,6 +772,7 @@ impl ChatStreamState {
             thinking_text: String::new(),
             thinking_started_at: None,
             thinking_duration_secs: 0,
+            think_filter: ThinkTagFilter::new(super::think_tag_filter::strip_enabled()),
             reasoning_detail_text_by_key: std::collections::HashMap::new(),
             tool_calls_map: std::collections::HashMap::new(),
             finish_reason: String::from("stop"),
@@ -733,6 +848,46 @@ impl ChatStreamState {
         }
         if let Some(started_at) = self.thinking_started_at {
             self.thinking_duration_secs = started_at.elapsed().as_secs() as u32;
+        }
+    }
+
+    /// Route one content delta through the think-tag filter: rerouted
+    /// reasoning feeds the thinking channel, the remainder stays content.
+    fn route_content_delta<F, G>(&mut self, raw: &str, on_text_delta: &F, on_thinking_delta: &G)
+    where
+        F: Fn(String) + Send + 'static,
+        G: Fn(String) + Send + 'static,
+    {
+        let emit = self.think_filter.push(raw);
+        self.apply_think_emit(emit, on_text_delta, on_thinking_delta);
+    }
+
+    /// Flush the filter at stream end so an undecided probe prefix or a
+    /// dangling partial close tag still lands in the right channel.
+    fn flush_think_filter<F, G>(&mut self, on_text_delta: &F, on_thinking_delta: &G)
+    where
+        F: Fn(String) + Send + 'static,
+        G: Fn(String) + Send + 'static,
+    {
+        let emit = self.think_filter.finalize();
+        self.apply_think_emit(emit, on_text_delta, on_thinking_delta);
+    }
+
+    fn apply_think_emit<F, G>(&mut self, emit: ThinkTagEmit, on_text_delta: &F, on_thinking_delta: &G)
+    where
+        F: Fn(String) + Send + 'static,
+        G: Fn(String) + Send + 'static,
+    {
+        if emit.is_empty() {
+            return;
+        }
+        if !emit.thinking.is_empty() {
+            self.push_thinking(&emit.thinking, on_thinking_delta);
+        }
+        if !emit.content.is_empty() {
+            self.finish_thinking_timing();
+            self.full_text.push_str(&emit.content);
+            on_text_delta(emit.content);
         }
     }
 }
@@ -909,9 +1064,7 @@ fn apply_stream_chunk<F, G, H>(
             state.push_reasoning_details(reasoning_details, on_thinking_delta);
         }
         if let Some(ref content) = choice.delta.content {
-            state.finish_thinking_timing();
-            state.full_text.push_str(content);
-            on_text_delta(content.clone());
+            state.route_content_delta(content, on_text_delta, on_thinking_delta);
         }
         if let Some(ref tcs) = choice.delta.tool_calls {
             for tc in tcs {
@@ -1258,11 +1411,49 @@ mod tests {
     use super::{
         apply_stream_chunk, build_api_messages, build_request_body, collect_tool_calls,
         detect_flavor, drain_sse_buffer, finalize_stream_response, first_incomplete_tool_call,
-        summarize_recent_raw_chunk, ChatCompletionsFlavor, ChatStreamState, PartialToolCall,
-        StreamChunk,
+        server_json_parse_error_hint, summarize_recent_raw_chunk, ChatCompletionsFlavor,
+        ChatStreamState, PartialToolCall, StreamChunk, ThinkTagFilter,
     };
     use crate::session::models::{ChatMessage, ImageData, MessageRole, ToolCallInfo};
     use std::collections::HashMap;
+
+    #[test]
+    fn json_parse_error_hint_fires_on_client_error_with_parser_markers() {
+        // Verbatim shape of the issue #106 rejection (Spring/Jackson gateway).
+        let issue_106_body = r#"{"error":{"message":"JSON parse error: Unexpected character (',' (code 44)): was expecting a colon to separate field name and value","code":"400"}}"#;
+        let hint = server_json_parse_error_hint(
+            reqwest::StatusCode::BAD_REQUEST,
+            issue_106_body,
+            104_213,
+        )
+        .expect("Jackson-style parse error must produce a hint");
+        assert!(hint.contains("104213 bytes"));
+
+        assert!(server_json_parse_error_hint(
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+            "request contained malformed JSON",
+            10,
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn json_parse_error_hint_stays_quiet_otherwise() {
+        // Ordinary 4xx rejections must not accuse the network path.
+        assert!(server_json_parse_error_hint(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"model not found"}}"#,
+            10,
+        )
+        .is_none());
+        // 5xx means the server failed, not that the request bytes were bad.
+        assert!(server_json_parse_error_hint(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            "JSON parse error while reading upstream response",
+            10,
+        )
+        .is_none());
+    }
     use std::sync::{Arc, Mutex};
 
     fn ignore_text(_: String) {}
@@ -1444,6 +1635,25 @@ mod tests {
             false,
         );
         assert!(disabled[0].get("reasoning_content").is_none());
+    }
+
+    #[test]
+    fn generic_messages_replay_empty_tool_call_arguments_as_empty_object() {
+        let mut assistant = assistant_message_with_tool_and_thinking();
+        assistant.tool_calls.as_mut().unwrap()[0].arguments = String::new();
+
+        let messages = build_api_messages(
+            "",
+            &[assistant],
+            ChatCompletionsFlavor::Generic,
+            false,
+            false,
+        );
+
+        assert_eq!(
+            messages[0]["tool_calls"][0]["function"]["arguments"],
+            serde_json::json!("{}")
+        );
     }
 
     #[test]
@@ -1713,6 +1923,91 @@ mod tests {
             thinking.lock().expect("thinking mutex poisoned").as_str(),
             "Think more."
         );
+    }
+
+    fn content_chunk(text: &str) -> StreamChunk {
+        serde_json::from_value(serde_json::json!({
+            "choices": [{
+                "delta": { "content": text },
+                "finish_reason": null
+            }]
+        }))
+        .expect("content chunk should parse")
+    }
+
+    #[test]
+    fn inline_think_tag_content_is_rerouted_to_thinking() {
+        let mut state = ChatStreamState::new();
+        state.think_filter = ThinkTagFilter::new(true);
+        let thinking = Arc::new(Mutex::new(String::new()));
+        let text = Arc::new(Mutex::new(String::new()));
+        let captured_thinking = thinking.clone();
+        let captured_text = text.clone();
+        let on_thinking = move |delta: String| {
+            captured_thinking
+                .lock()
+                .expect("thinking mutex poisoned")
+                .push_str(&delta);
+        };
+        let on_text = move |delta: String| {
+            captured_text
+                .lock()
+                .expect("text mutex poisoned")
+                .push_str(&delta);
+        };
+
+        // Open tag split across deltas, reasoning streamed, close tag plus
+        // prose in the final delta — the wire shape vLLM/Ollama relays emit.
+        for delta in ["<thi", "nk>先分析问题", "，再给结论", "</think>\n\n结论如下"] {
+            apply_stream_chunk(content_chunk(delta), &mut state, &on_text, &on_thinking, &ignore_tool);
+        }
+        state.flush_think_filter(&on_text, &on_thinking);
+
+        assert_eq!(state.thinking_text, "先分析问题，再给结论");
+        assert_eq!(state.full_text, "结论如下");
+        assert_eq!(
+            thinking.lock().expect("thinking mutex poisoned").as_str(),
+            "先分析问题，再给结论"
+        );
+        assert_eq!(text.lock().expect("text mutex poisoned").as_str(), "结论如下");
+    }
+
+    #[test]
+    fn unclosed_think_tag_stream_lands_in_thinking_on_flush() {
+        let mut state = ChatStreamState::new();
+        state.think_filter = ThinkTagFilter::new(true);
+
+        apply_stream_chunk(
+            content_chunk("<thinking>reasoning that never closes"),
+            &mut state,
+            &ignore_text,
+            &ignore_thinking,
+            &ignore_tool,
+        );
+        state.flush_think_filter(&ignore_text, &ignore_thinking);
+
+        assert_eq!(state.thinking_text, "reasoning that never closes");
+        assert_eq!(state.full_text, "");
+    }
+
+    #[test]
+    fn ordinary_content_is_untouched_by_think_filter() {
+        let mut state = ChatStreamState::new();
+        state.think_filter = ThinkTagFilter::new(true);
+
+        for delta in ["Hello", " world, `<think>` is a literal here"] {
+            apply_stream_chunk(
+                content_chunk(delta),
+                &mut state,
+                &ignore_text,
+                &ignore_thinking,
+                &ignore_tool,
+            );
+        }
+        state.flush_think_filter(&ignore_text, &ignore_thinking);
+
+        assert_eq!(state.full_text, "Hello world, `<think>` is a literal here");
+        assert_eq!(state.thinking_text, "");
     }
 
     #[test]

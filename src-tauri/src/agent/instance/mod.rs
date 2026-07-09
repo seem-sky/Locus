@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
         Arc, Mutex,
     },
     time::{Duration, Instant},
@@ -237,6 +237,20 @@ pub struct AgentInstance {
     raw_store: RawContextStore,
     workspace_id: Option<String>,
     parent_tool_call: Option<ParentToolCall>,
+    /// Nesting depth in the `task` subagent tree: 0 for a top-level agent,
+    /// parent depth + 1 for each spawned subagent. Checked against the
+    /// configured `subagent_max_depth` before a `task` call may spawn.
+    subagent_depth: u32,
+    /// Live count of `task` subagents running anywhere in this agent tree.
+    /// The top-level instance creates the counter and every descendant shares
+    /// it, so the configured concurrency cap applies tree-wide.
+    subagent_active: Arc<AtomicU32>,
+    /// True when this instance was spawned at the configured maximum subagent
+    /// nesting depth: `task` is removed from its tool surface entirely
+    /// (request tool list, lazy manifest, tool_load/tool_call) instead of
+    /// erroring only at call time. Spawn-time snapshot; `execute_task` keeps
+    /// the live-config depth check as backstop.
+    task_tool_suppressed: bool,
     effort: Option<String>,
     app_knowledge_dir: Arc<Option<std::path::PathBuf>>,
     app_agent_dir: Arc<Option<std::path::PathBuf>>,
@@ -253,6 +267,21 @@ pub struct AgentInstance {
     dev_workflow_gates: Option<DevWorkflowGateStore>,
     /// UI or explicit locale tag (`zh` / `en`) for response-language consistency.
     response_locale: Option<String>,
+    /// Run-scoped view of the session's sticky plan mode. Initialized from
+    /// the session store at run start and flipped live by exit_plan_mode
+    /// approval so enforcement inside the same run follows the transition.
+    plan_runtime: Mutex<Option<PlanRuntime>>,
+}
+
+/// Plan-mode enforcement profile for the current run.
+#[derive(Debug, Clone)]
+enum PlanRuntime {
+    /// Main planning agent: read-only enforcement plus write access to the
+    /// session plan file; exit_plan_mode is offered to the model.
+    Main { plan_file: std::path::PathBuf },
+    /// Subagent spawned while the parent session plans: strictly read-only,
+    /// no plan file, no exit_plan_mode.
+    Subagent,
 }
 
 /// Knowledge document the session is scoped to (the document open next to an
@@ -308,6 +337,46 @@ struct ParentToolCall {
     session_id: String,
     run_id: String,
     tool_call_id: String,
+}
+
+/// RAII slot in the tree-wide subagent concurrency budget: acquired before a
+/// `task` subagent starts and released on drop, so cancel and error unwinds
+/// cannot leak a slot.
+struct SubagentSlotGuard {
+    counter: Arc<AtomicU32>,
+}
+
+impl SubagentSlotGuard {
+    /// Atomically claims a slot unless `limit` subagents are already running.
+    /// Compare-exchange (not fetch_add) so concurrent `task` calls racing for
+    /// the last slot cannot overshoot the limit.
+    fn try_acquire(counter: &Arc<AtomicU32>, limit: u32) -> Option<Self> {
+        let mut current = counter.load(Ordering::Relaxed);
+        loop {
+            if current >= limit {
+                return None;
+            }
+            match counter.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    return Some(SubagentSlotGuard {
+                        counter: counter.clone(),
+                    })
+                }
+                Err(observed) => current = observed,
+            }
+        }
+    }
+}
+
+impl Drop for SubagentSlotGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 struct ParentStreamEvent {
@@ -3067,6 +3136,9 @@ impl AgentInstance {
             raw_store,
             workspace_id,
             parent_tool_call: None,
+            subagent_depth: 0,
+            subagent_active: Arc::new(AtomicU32::new(0)),
+            task_tool_suppressed: false,
             effort: effective_effort,
             app_knowledge_dir,
             app_agent_dir,
@@ -3081,6 +3153,7 @@ impl AgentInstance {
             cancel_rx,
             dev_workflow_gates,
             response_locale: None,
+            plan_runtime: Mutex::new(None),
         }
     }
 
@@ -3281,6 +3354,197 @@ impl AgentInstance {
             return;
         }
         result.output = format!("{context}\n\n{}", result.output);
+    }
+
+    /// Marks this instance as a subagent whose parent session is in plan
+    /// mode: every run gets strict read-only enforcement. Must be called
+    /// before `run`.
+    pub fn mark_plan_readonly_subagent(&self) {
+        self.set_plan_runtime(Some(PlanRuntime::Subagent));
+    }
+
+    fn plan_runtime_snapshot(&self) -> Option<PlanRuntime> {
+        self.plan_runtime
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or(None)
+    }
+
+    fn set_plan_runtime(&self, value: Option<PlanRuntime>) {
+        if let Ok(mut guard) = self.plan_runtime.lock() {
+            *guard = value;
+        }
+    }
+
+    fn is_plan_readonly_subagent(&self) -> bool {
+        matches!(self.plan_runtime_snapshot(), Some(PlanRuntime::Subagent))
+    }
+
+    /// Whether the main planning profile is active (drives exit_plan_mode
+    /// injection into the request tool list and the plan-file write grant).
+    fn plan_mode_main_active(&self) -> bool {
+        matches!(self.plan_runtime_snapshot(), Some(PlanRuntime::Main { .. }))
+    }
+
+    fn resolve_plan_file_path(
+        &self,
+        app_handle: &AppHandle,
+    ) -> Result<std::path::PathBuf, String> {
+        crate::commands::plan_file_path_for_session(app_handle, &self.working_dir, &self.session_id)
+    }
+
+    /// Enters sticky plan mode for this session if `mode` requests it and the
+    /// session is not already planning. Used both at run start and when a
+    /// queued `/plan` message is drained into an active run so enforcement
+    /// follows immediately.
+    fn maybe_enter_plan_mode(
+        &self,
+        app_handle: &AppHandle,
+        store: &SessionStore,
+        run_id: &str,
+        mode: &str,
+    ) -> Result<(), String> {
+        if mode != "plan" || self.is_plan_readonly_subagent() || self.plan_mode_main_active() {
+            return Ok(());
+        }
+        store.set_plan_mode_active(&self.session_id, true)?;
+        self.activate_main_plan_runtime(app_handle)?;
+        emit_stream(
+            app_handle,
+            run_id,
+            StreamEvent::PlanModeChanged {
+                session_id: self.session_id.clone(),
+                active: true,
+                plan_file_path: self
+                    .resolve_plan_file_path(app_handle)
+                    .ok()
+                    .map(|path| path.to_string_lossy().to_string()),
+            },
+        );
+        Ok(())
+    }
+
+    fn activate_main_plan_runtime(&self, app_handle: &AppHandle) -> Result<(), String> {
+        let plan_file = self.resolve_plan_file_path(app_handle)?;
+        if let Some(parent) = plan_file.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("Failed to create plan directory: {}", e))?;
+        }
+        self.set_plan_runtime(Some(PlanRuntime::Main { plan_file }));
+        Ok(())
+    }
+
+    /// Renders the sticky plan-mode reminder with the session plan file
+    /// block. The exists-branch doubles as the re-entry instruction set.
+    fn render_plan_reminder(plan_file: &std::path::Path) -> String {
+        let display = plan_file.to_string_lossy();
+        let info = if plan_file.is_file() {
+            format!(
+                "A plan file already exists at {display} from earlier planning in this session.\nBefore any new planning: read it and evaluate it against the current request — refine it if this continues the same task, or overwrite it if the task is different. Always update the plan file before calling exit_plan_mode."
+            )
+        } else {
+            format!("No plan file exists yet. Create your plan at {display} using the write tool.")
+        };
+        crate::prompt::plan::PLAN_REMINDER.replace("{plan_file_info}", &info)
+    }
+
+    /// One-shot notice for the first user message after leaving plan mode.
+    fn render_plan_exited_notice(&self, app_handle: &AppHandle) -> String {
+        let block = self
+            .resolve_plan_file_path(app_handle)
+            .ok()
+            .filter(|path| path.is_file())
+            .map(|path| {
+                format!(
+                    " The plan file from the planning phase is at {} — refer back to it during implementation.",
+                    path.to_string_lossy()
+                )
+            })
+            .unwrap_or_default();
+        crate::prompt::plan::PLAN_EXITED.replace("{plan_file_block}", &block)
+    }
+
+    /// Compares a tool call's `filePath` argument against the plan file,
+    /// tolerating relative paths, separator style, and case differences.
+    fn args_target_plan_file(
+        &self,
+        args: &serde_json::Value,
+        plan_file: &std::path::Path,
+    ) -> bool {
+        let Some(raw) = args
+            .get("filePath")
+            .or_else(|| args.get("file_path"))
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return false;
+        };
+        let candidate = std::path::Path::new(raw);
+        let resolved = if candidate.is_absolute() {
+            candidate.to_path_buf()
+        } else {
+            std::path::Path::new(&self.working_dir).join(candidate)
+        };
+        Self::normalize_plan_path_for_compare(&resolved)
+            == Self::normalize_plan_path_for_compare(plan_file)
+    }
+
+    /// Unlike `normalize_path_for_compare`, canonicalizes first: the model
+    /// may echo the plan file path with `..` segments or 8.3 short names.
+    fn normalize_plan_path_for_compare(path: &std::path::Path) -> String {
+        let canonical = dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        canonical
+            .to_string_lossy()
+            .replace('\\', "/")
+            .trim_end_matches('/')
+            .to_ascii_lowercase()
+    }
+
+    /// Returns the rejection message when a tool call violates plan-mode
+    /// enforcement. Read-only tools always pass; the main planning agent may
+    /// additionally edit the plan file, fetch the web, and delegate to
+    /// (forced read-only) subagents. unity_recompile stays allowed via
+    /// is_readonly_tool: it validates plan feasibility through compile
+    /// diagnostics without touching sources.
+    fn plan_mode_tool_violation(
+        &self,
+        runtime: &PlanRuntime,
+        tool_name: &str,
+        args: &serde_json::Value,
+    ) -> Option<String> {
+        if Self::is_readonly_tool(tool_name) {
+            return None;
+        }
+        match runtime {
+            PlanRuntime::Main { plan_file } => match tool_name {
+                // Network reads don't mutate the system; planning may need docs.
+                "web_fetch" => None,
+                // Subagents inherit read-only enforcement (see run_subagent_task).
+                "task" => None,
+                // Intercepted before enforcement; listed for completeness.
+                "exit_plan_mode" => None,
+                "write" | "edit" => {
+                    if self.args_target_plan_file(args, plan_file) {
+                        None
+                    } else {
+                        Some(format!(
+                            "Tool '{}' is only allowed for the plan file ({}) in plan mode. Every other file is read-only until the plan is approved via exit_plan_mode.",
+                            tool_name,
+                            plan_file.to_string_lossy()
+                        ))
+                    }
+                }
+                _ => Some(format!(
+                    "Tool '{}' is not allowed in plan mode. Plan mode is read-only apart from the plan file; present your plan with exit_plan_mode to start making changes.",
+                    tool_name
+                )),
+            },
+            PlanRuntime::Subagent => Some(format!(
+                "Tool '{}' is not allowed: the parent session is in plan mode, so this subagent is strictly read-only.",
+                tool_name
+            )),
+        }
     }
 
     pub fn set_knowledge_focus(&mut self, focus: Option<KnowledgeFocusDoc>) {
@@ -3547,11 +3811,19 @@ impl AgentInstance {
 
     async fn allowed_tool_set(&self) -> HashSet<String> {
         let enabled_overrides = self.tool_enabled_overrides();
-        self.configured_tool_set()
+        let mut allowed: HashSet<String> = self
+            .configured_tool_set()
             .await
             .into_iter()
             .filter(|name| self.is_tool_enabled(name, &enabled_overrides))
-            .collect()
+            .collect();
+        // Depth-capped subagents lose `task` entirely: the request tool
+        // list, lazy manifest, tool_load and tool_call all derive from this
+        // set, so the model is never offered a tool it cannot use.
+        if self.task_tool_suppressed {
+            allowed.remove("task");
+        }
+        allowed
     }
 
     async fn allowed_tool_set_for_active_skills(
@@ -3656,6 +3928,11 @@ impl AgentInstance {
         push_unique_tool_name(&mut names, "tool_load");
         if dynamic_mode != crate::config::DynamicToolLoadingMode::Direct {
             push_unique_tool_name(&mut names, "tool_call");
+        }
+        // exit_plan_mode is offered to the model ONLY while the session is in
+        // plan mode; outside plan mode it must not appear in the tool list.
+        if self.plan_mode_main_active() {
+            push_unique_tool_name(&mut names, "exit_plan_mode");
         }
 
         let mut allowed_sorted: Vec<_> = allowed.into_iter().collect();
@@ -5718,7 +5995,7 @@ impl AgentInstance {
             Some(child_def_id),
         )?;
 
-        Ok(AgentInstance::new(
+        let mut child = AgentInstance::new(
             Arc::new(child_def.clone()),
             &child_session_id,
             self.backend.clone(),
@@ -5738,7 +6015,10 @@ impl AgentInstance {
             self.subagent_model_overrides.clone(),
             self.cancel_waiter(),
             self.dev_workflow_gates.clone(),
-        ))
+        );
+        child.subagent_depth = self.subagent_depth + 1;
+        child.subagent_active = self.subagent_active.clone();
+        Ok(child)
     }
 
     async fn call_llm(
@@ -5773,6 +6053,7 @@ impl AgentInstance {
                     None, // reasoning_effort
                     self.debug,
                     on_text_delta,
+                    on_thinking_delta,
                     on_tool_call_start,
                 )
                 .await?;
@@ -6317,14 +6598,14 @@ impl AgentInstance {
         attempt_kind: &str,
         trigger: crate::commands::CompactTrigger,
         iteration: usize,
-    ) -> Result<bool, String> {
+    ) -> Result<Option<u32>, String> {
         let LlmBackend::OpenAiCodex { auth, base_url, .. } = &self.backend else {
-            return Ok(false);
+            return Ok(None);
         };
 
         let messages = store.get_messages_for_prompt(&self.session_id)?;
         if messages.len() < 2 {
-            return Ok(false);
+            return Ok(None);
         }
         let messages_before = messages.len() as u32;
 
@@ -6459,17 +6740,26 @@ impl AgentInstance {
             "the Codex remote compaction summary is an encrypted item that only the Codex API can read",
         );
         let keep_from_msg = &messages[boundary_idx];
-        let restored_files_section =
-            compact::build_post_compact_restored_files_section(&messages, &self.working_dir);
+        let restored_files_section = compact::build_post_compact_restored_files_section(
+            &messages,
+            &self.working_dir,
+            context_limit,
+        );
+        let transcript = compact::export_compact_transcript(&self.session_id, &messages);
         let summary_msg = compact::build_post_compact_message(
             &summary,
             &restored_files_section,
             keep_from_msg.created_at,
-            boundary_idx + 1 < messages.len(),
+            compact::will_retain_user_messages(&messages, context_limit),
+            transcript.as_ref(),
         );
 
-        let (count_before, count_after) =
-            store.compact_messages(&self.session_id, &summary_msg, &keep_from_msg.id)?;
+        let (count_before, count_after) = store.compact_messages(
+            &self.session_id,
+            &summary_msg,
+            &keep_from_msg.id,
+            compact::compact_user_message_token_budget(context_limit),
+        )?;
         store.set_message_response_request_metadata(
             &self.session_id,
             &summary_msg.id,
@@ -6499,7 +6789,7 @@ impl AgentInstance {
             },
         );
 
-        Ok(true)
+        Ok(Some(compacted_context_tokens))
     }
 
     async fn execute_auto_compact(
@@ -6513,7 +6803,7 @@ impl AgentInstance {
         run_id: &str,
         attempt_kind: &str,
         iteration: usize,
-    ) -> Result<bool, String> {
+    ) -> Result<Option<u32>, String> {
         let trigger = compact_trigger(force_compact, attempt_kind);
         // Codex subscription sessions default to the remote compaction endpoint
         // (codex-rs default strategy); the prompt-based flow below stays as the
@@ -6533,8 +6823,8 @@ impl AgentInstance {
                 )
                 .await
             {
-                Ok(true) => return Ok(true),
-                Ok(false) => return Ok(false),
+                Ok(Some(post_tokens)) => return Ok(Some(post_tokens)),
+                Ok(None) => return Ok(None),
                 Err(error) => {
                     eprintln!(
                         "[Agent {}] codex remote compact failed, falling back to prompt-based compact: {}",
@@ -6546,7 +6836,7 @@ impl AgentInstance {
 
         let messages = store.get_messages_for_prompt(&self.session_id)?;
         if messages.len() < 2 {
-            return Ok(false);
+            return Ok(None);
         }
 
         let messages_before = messages.len() as u32;
@@ -6623,19 +6913,27 @@ impl AgentInstance {
                     compact::compact_recent_tail_token_budget(context_limit),
                 );
                 if force_compact
-                    && !compact::has_compactable_messages_before_boundary(&messages, boundary_idx)
+                    && !compact::has_compactable_messages_before_boundary(
+                        &messages,
+                        boundary_idx,
+                        context_limit,
+                    )
                 {
                     boundary_idx = messages.len().saturating_sub(1);
                     while boundary_idx > 0 && messages[boundary_idx].role == MessageRole::Tool {
                         boundary_idx -= 1;
                     }
                 }
-                if !compact::has_compactable_messages_before_boundary(&messages, boundary_idx) {
+                if !compact::has_compactable_messages_before_boundary(
+                    &messages,
+                    boundary_idx,
+                    context_limit,
+                ) {
                     eprintln!(
                         "[Agent {}] emergency {} skipped: no compactable messages before boundary {}",
                         self.id, compact_label, boundary_idx
                     );
-                    return Ok(false);
+                    return Ok(None);
                 }
                 emit_stream(
                     app_handle,
@@ -6652,15 +6950,22 @@ impl AgentInstance {
                 let restored_files_section = compact::build_post_compact_restored_files_section(
                     &messages,
                     &self.working_dir,
+                    context_limit,
                 );
+                let transcript = compact::export_compact_transcript(&self.session_id, &messages);
                 let summary_msg = compact::build_post_compact_message(
                     &summary,
                     &restored_files_section,
                     keep_from_msg.created_at,
-                    boundary_idx + 1 < messages.len(),
+                    compact::will_retain_user_messages(&messages, context_limit),
+                    transcript.as_ref(),
                 );
-                let (count_before, count_after) =
-                    store.compact_messages(&self.session_id, &summary_msg, &keep_from_msg.id)?;
+                let (count_before, count_after) = store.compact_messages(
+                    &self.session_id,
+                    &summary_msg,
+                    &keep_from_msg.id,
+                    compact::compact_user_message_token_budget(context_limit),
+                )?;
                 if matches!(self.backend, LlmBackend::OpenAiCodex { .. }) {
                     crate::llm::codex::reset_cached_session_window(&self.session_id).await;
                 }
@@ -6688,7 +6993,7 @@ impl AgentInstance {
                         messages: compacted_messages,
                     },
                 );
-                return Ok(true);
+                return Ok(Some(compacted_context_tokens));
             }
         };
 
@@ -6696,6 +7001,7 @@ impl AgentInstance {
             && !compact::has_compactable_messages_before_boundary(
                 &messages,
                 compact_plan.boundary_idx,
+                context_limit,
             )
         {
             compact_plan.boundary_idx = messages.len().saturating_sub(1);
@@ -6715,13 +7021,16 @@ impl AgentInstance {
             compact_plan.truncated
         );
 
-        if !compact::has_compactable_messages_before_boundary(&messages, compact_plan.boundary_idx)
-        {
+        if !compact::has_compactable_messages_before_boundary(
+            &messages,
+            compact_plan.boundary_idx,
+            context_limit,
+        ) {
             eprintln!(
                 "[Agent {}] {} skipped: no compactable messages before boundary {}",
                 self.id, compact_label, compact_plan.boundary_idx
             );
-            return Ok(false);
+            return Ok(None);
         }
 
         emit_stream(
@@ -6779,27 +7088,38 @@ impl AgentInstance {
                     self.id, e
                 );
                 let boundary_idx = compact_plan.boundary_idx;
-                if !compact::has_compactable_messages_before_boundary(&messages, boundary_idx) {
+                if !compact::has_compactable_messages_before_boundary(
+                    &messages,
+                    boundary_idx,
+                    context_limit,
+                ) {
                     eprintln!(
                         "[Agent {}] emergency auto-compact skipped after compact error: no compactable messages before boundary {}",
                         self.id, boundary_idx
                     );
-                    return Ok(false);
+                    return Ok(None);
                 }
                 let summary = compact::build_emergency_compact_summary(&messages, boundary_idx, &e);
                 let keep_from_msg = &messages[boundary_idx];
                 let restored_files_section = compact::build_post_compact_restored_files_section(
                     &messages,
                     &self.working_dir,
+                    context_limit,
                 );
+                let transcript = compact::export_compact_transcript(&self.session_id, &messages);
                 let summary_msg = compact::build_post_compact_message(
                     &summary,
                     &restored_files_section,
                     keep_from_msg.created_at,
-                    boundary_idx + 1 < messages.len(),
+                    compact::will_retain_user_messages(&messages, context_limit),
+                    transcript.as_ref(),
                 );
-                let (count_before, count_after) =
-                    store.compact_messages(&self.session_id, &summary_msg, &keep_from_msg.id)?;
+                let (count_before, count_after) = store.compact_messages(
+                    &self.session_id,
+                    &summary_msg,
+                    &keep_from_msg.id,
+                    compact::compact_user_message_token_budget(context_limit),
+                )?;
                 if matches!(self.backend, LlmBackend::OpenAiCodex { .. }) {
                     crate::llm::codex::reset_cached_session_window(&self.session_id).await;
                 }
@@ -6826,7 +7146,7 @@ impl AgentInstance {
                         messages: compacted_messages,
                     },
                 );
-                return Ok(true);
+                return Ok(Some(compacted_context_tokens));
             }
             Err(e) => {
                 eprintln!("[Agent {}] compact LLM call failed: {}", self.id, e);
@@ -6935,17 +7255,26 @@ impl AgentInstance {
         }
 
         let keep_from_msg = &messages[boundary_idx];
-        let restored_files_section =
-            compact::build_post_compact_restored_files_section(&messages, &self.working_dir);
+        let restored_files_section = compact::build_post_compact_restored_files_section(
+            &messages,
+            &self.working_dir,
+            context_limit,
+        );
+        let transcript = compact::export_compact_transcript(&self.session_id, &messages);
         let summary_msg = compact::build_post_compact_message(
             &summary,
             &restored_files_section,
             keep_from_msg.created_at,
-            boundary_idx + 1 < messages.len(),
+            compact::will_retain_user_messages(&messages, context_limit),
+            transcript.as_ref(),
         );
 
-        let (count_before, count_after) =
-            store.compact_messages(&self.session_id, &summary_msg, &keep_from_msg.id)?;
+        let (count_before, count_after) = store.compact_messages(
+            &self.session_id,
+            &summary_msg,
+            &keep_from_msg.id,
+            compact::compact_user_message_token_budget(context_limit),
+        )?;
         if matches!(self.backend, LlmBackend::OpenAiCodex { .. }) {
             crate::llm::codex::reset_cached_session_window(&self.session_id).await;
         }
@@ -6975,7 +7304,7 @@ impl AgentInstance {
             },
         );
 
-        Ok(true)
+        Ok(Some(compacted_context_tokens))
     }
 
     fn wrap_system_reminder(content: &str) -> Option<String> {
@@ -7336,10 +7665,14 @@ impl AgentInstance {
         format!("{prompt}\n\n{reminder}")
     }
 
+    /// Builds the persisted user-message suffix. Plan-mode context is
+    /// injected here and ONLY here: the sticky reminder while planning, the
+    /// subagent variant for plan-scoped children, and the one-shot exited
+    /// notice on the first message after leaving plan mode.
     fn build_user_prompt_suffix(
         &self,
+        app_handle: &AppHandle,
         store: &SessionStore,
-        mode: &str,
         user_intent: Option<&crate::session::models::UserIntentPayload>,
         asset_refs: Option<&[crate::session::models::AssetRefData]>,
     ) -> Option<String> {
@@ -7359,8 +7692,23 @@ impl AgentInstance {
                 parts.push(skill_reminder);
             }
         }
-        if mode == "plan" {
-            parts.push(crate::prompt::plan::PLAN_REMINDER.to_string());
+        match self.plan_runtime_snapshot() {
+            Some(PlanRuntime::Main { plan_file }) => {
+                parts.push(Self::render_plan_reminder(&plan_file));
+            }
+            Some(PlanRuntime::Subagent) => {
+                parts.push(crate::prompt::plan::PLAN_REMINDER_SUBAGENT.to_string());
+            }
+            None => match store.take_plan_exited_notice(&self.session_id) {
+                Ok(true) => parts.push(self.render_plan_exited_notice(app_handle)),
+                Ok(false) => {}
+                Err(error) => {
+                    eprintln!(
+                        "[Agent {}] failed to read plan exited notice: {}",
+                        self.id, error
+                    );
+                }
+            },
         }
 
         if parts.is_empty() {
@@ -7424,9 +7772,12 @@ impl AgentInstance {
                     .transpose()
                     .map_err(|e| format!("Failed to serialize pending user intent: {}", e))?;
                 let effective_mode = Self::pending_input_mode(&input);
+                // A queued /plan message entering an active run must flip
+                // enforcement before its reminder is rendered.
+                self.maybe_enter_plan_mode(app_handle, store, run_id, &effective_mode)?;
                 let user_prompt_suffix = self.build_user_prompt_suffix(
+                    app_handle,
                     store,
-                    &effective_mode,
                     input.user_intent.as_ref(),
                     input.asset_refs.as_deref(),
                 );
@@ -7844,7 +8195,8 @@ impl AgentInstance {
                     "compact",
                     1,
                 )
-                .await?;
+                .await?
+                .is_some();
             if !compacted {
                 eprintln!(
                     "[Agent {}] manual compact finished without changes: session={} run={} messages={}",
@@ -7873,6 +8225,21 @@ impl AgentInstance {
                 },
             );
             return Ok(String::new());
+        }
+
+        // ── Sticky plan mode ─────────────────────────────────────────────
+        // The session store is the source of truth: plan mode persists
+        // across runs until exit_plan_mode is approved or the user turns it
+        // off. A user message tagged mode=="plan" (the /plan command)
+        // enters it. Subagents keep the profile their parent assigned.
+        if !self.is_plan_readonly_subagent() {
+            let plan_state = store.get_plan_mode_state(&self.session_id)?;
+            if plan_state.active {
+                self.activate_main_plan_runtime(app_handle)?;
+            } else {
+                self.set_plan_runtime(None);
+                self.maybe_enter_plan_mode(app_handle, store, &run_id, initial_mode)?;
+            }
         }
 
         if self.is_cancel_requested() {
@@ -7993,8 +8360,8 @@ impl AgentInstance {
             followup_memory_prefix.as_deref(),
         );
         let user_prompt_suffix = self.build_user_prompt_suffix(
+            app_handle,
             store,
-            initial_mode,
             user_intent.as_ref(),
             asset_refs,
         );
@@ -8151,6 +8518,11 @@ impl AgentInstance {
         // call in this run; calibrates the byte-heuristic estimate against the
         // provider's real tokenization for auto-compact decisions.
         let mut estimate_calibration_sample: Option<(u32, u32)> = None;
+        // True while an automatic compact has run without a successful request
+        // afterwards. A prompt-too-long error in that state means the
+        // post-compact floor itself does not fit the provider window, so
+        // scheduling another compact would only burn a summarization call.
+        let mut compact_unverified_since_send = false;
         let final_text;
         let final_thinking_text;
         let final_thinking_duration: u32;
@@ -8226,6 +8598,17 @@ impl AgentInstance {
                 estimate_calibration_sample,
                 persisted_context_tokens,
             );
+            // A no-progress verdict describes the retained floor at the time it
+            // was recorded; once the context has grown a buffer past that
+            // baseline there is new compactable material, so automatic
+            // compaction gets another chance. Compared on the RAW estimate:
+            // baselines are recorded on the same byte-heuristic scale, and the
+            // calibrated value would inflate by the provider tokenizer ratio
+            // after the first post-compact sample, masquerading as growth.
+            compact_tracker.reset_no_progress_if_grown(
+                estimated_input_tokens,
+                compact::auto_compact_buffer(ctx_limit),
+            );
             let is_codex_backend = matches!(self.backend, LlmBackend::OpenAiCodex { .. });
             let should_preflight_compact = if is_codex_backend {
                 compact::should_codex_auto_compact(effective_input_tokens, ctx_limit)
@@ -8253,7 +8636,7 @@ impl AgentInstance {
                 );
             }
 
-            if !compact_tracker.is_circuit_broken() && should_preflight_compact {
+            if !compact_tracker.is_suppressed() && should_preflight_compact {
                 if crate::headroom::context_library_available() && !headroom_every_round {
                     let (compressed, _meta) = self
                         .apply_headroom_round_context_compress(
@@ -8304,12 +8687,30 @@ impl AgentInstance {
                     )
                     .await
                 {
-                    Ok(true) => {
+                    Ok(Some(post_compact_tokens)) => {
                         compact_tracker.record_success();
-                        eprintln!("[Agent {}] preflight auto-compact succeeded", self.id);
+                        compact_unverified_since_send = true;
+                        // The sampled (actual, estimated) pair described the
+                        // pre-compact history; applying it to the compacted
+                        // prompt would overshoot. The persisted post-compact
+                        // usage takes over as the calibration floor.
+                        estimate_calibration_sample = None;
+                        let still_over_threshold = post_compact_tokens > 0
+                            && if is_codex_backend {
+                                compact::should_codex_auto_compact(post_compact_tokens, ctx_limit)
+                            } else {
+                                compact::should_auto_compact(post_compact_tokens, ctx_limit)
+                            };
+                        if still_over_threshold {
+                            compact_tracker.record_no_progress(post_compact_tokens);
+                        }
+                        eprintln!(
+                            "[Agent {}] preflight auto-compact succeeded: post_compact_tokens={}",
+                            self.id, post_compact_tokens
+                        );
                         continue 'agent_loop;
                     }
-                    Ok(false) => {}
+                    Ok(None) => {}
                     Err(e) => {
                         compact_tracker.record_failure();
                         eprintln!("[Agent {}] preflight auto-compact failed: {}", self.id, e);
@@ -8658,13 +9059,32 @@ impl AgentInstance {
                             None,
                         )
                         .await;
-                        if is_prompt_too_long_error(&e) && !compact_tracker.is_circuit_broken() {
+                        if is_prompt_too_long_error(&e) {
+                            if compact_unverified_since_send {
+                                // The provider rejected the very first request
+                                // after an automatic compact: the retained
+                                // floor itself does not fit the window, so
+                                // another compact round cannot shrink it. The
+                                // baseline stays on the raw-estimate scale so
+                                // the growth reset compares like with like.
+                                compact_tracker.record_no_progress(estimated_input_tokens);
+                            }
+                            if !compact_tracker.is_suppressed() {
+                                eprintln!(
+                                    "[Agent {}] prompt-too-long detected on iteration {}, scheduling reactive compact: {}",
+                                    self.id, iteration, e
+                                );
+                                last_llm_error = e;
+                                needs_reactive_compact = true;
+                                break;
+                            }
+                            // Retrying a deterministic over-length request
+                            // cannot succeed; surface the provider error.
                             eprintln!(
-                                "[Agent {}] prompt-too-long detected on iteration {}, scheduling reactive compact: {}",
+                                "[Agent {}] prompt-too-long with automatic compaction suppressed on iteration {}; not retrying: {}",
                                 self.id, iteration, e
                             );
                             last_llm_error = e;
-                            needs_reactive_compact = true;
                             break;
                         }
 
@@ -8710,12 +9130,31 @@ impl AgentInstance {
                         )
                         .await
                     {
-                        Ok(true) => {
+                        Ok(Some(post_compact_tokens)) => {
                             compact_tracker.record_success();
-                            eprintln!("[Agent {}] reactive auto-compact succeeded", self.id);
+                            compact_unverified_since_send = true;
+                            // Same rationale as the preflight path: the sample
+                            // no longer matches the compacted history.
+                            estimate_calibration_sample = None;
+                            let still_over_threshold = post_compact_tokens > 0
+                                && if is_codex_backend {
+                                    compact::should_codex_auto_compact(
+                                        post_compact_tokens,
+                                        ctx_limit,
+                                    )
+                                } else {
+                                    compact::should_auto_compact(post_compact_tokens, ctx_limit)
+                                };
+                            if still_over_threshold {
+                                compact_tracker.record_no_progress(post_compact_tokens);
+                            }
+                            eprintln!(
+                                "[Agent {}] reactive auto-compact succeeded: post_compact_tokens={}",
+                                self.id, post_compact_tokens
+                            );
                             continue 'agent_loop;
                         }
-                        Ok(false) => {}
+                        Ok(None) => {}
                         Err(e) => {
                             compact_tracker.record_failure();
                             eprintln!("[Agent {}] reactive auto-compact failed: {}", self.id, e);
@@ -8725,6 +9164,9 @@ impl AgentInstance {
                 }
                 None => return Err(last_llm_error),
             };
+            // The provider accepted the prompt, so the last compact (if any)
+            // demonstrably made the history fit again.
+            compact_unverified_since_send = false;
 
             {
                 let round = RawRound {
@@ -9847,6 +10289,9 @@ impl AgentInstance {
                 | "unity_yaml_list"
                 | "unity_yaml_search"
                 | "unity_yaml_read"
+                // Deliberate: recompile rebuilds scripts and reloads the
+                // domain but never modifies sources — plan mode keeps it so
+                // plans can be validated against compile diagnostics.
                 | "unity_recompile"
                 | "code_find_references"
                 | "code_goto_definition"
@@ -10424,6 +10869,29 @@ impl AgentInstance {
             self.id, tool_name, global_mode, tool_mode, assessment.reasons
         );
 
+        self.await_tool_confirm_decision(
+            app_handle,
+            tool_call_id,
+            tool_name,
+            assessment.display,
+            args,
+            run_id,
+        )
+        .await
+    }
+
+    /// Emits a ToolConfirm event and blocks until the user answers (or the
+    /// run is cancelled). Shared by the permission confirm flow and the
+    /// plan-approval dialog.
+    async fn await_tool_confirm_decision(
+        &self,
+        app_handle: &AppHandle,
+        tool_call_id: &str,
+        tool_name: &str,
+        display: crate::commands::ToolConfirmDisplay,
+        args: &serde_json::Value,
+        run_id: &str,
+    ) -> ToolConfirmDecision {
         let question_id = uuid::Uuid::new_v4().to_string();
         let (tx, rx) = tokio::sync::oneshot::channel::<String>();
         let wait_target = self.user_wait_target(run_id);
@@ -10448,7 +10916,7 @@ impl AgentInstance {
                 session_id: wait_target.session_id.clone(),
                 question_id: question_id.clone(),
                 tool_call_id: tool_call_id.to_string(),
-                display: assessment.display,
+                display,
             },
         );
 
@@ -10516,6 +10984,111 @@ impl AgentInstance {
                     self.id, tool_name, question_id
                 );
                 ToolConfirmDecision::Deny { feedback: None }
+            }
+        }
+    }
+
+    /// exit_plan_mode: presents the plan file for user approval. Always asks
+    /// — plan approval is the product's core gate and is NOT bypassed by the
+    /// auto permission mode. On approval the sticky session flag and the
+    /// run-local enforcement flip together, the exited notice is armed for
+    /// the next user message, and the tool result echoes the approved plan.
+    async fn execute_exit_plan_mode(
+        &self,
+        app_handle: &AppHandle,
+        store: &SessionStore,
+        tool_call_id: &str,
+        run_id: &str,
+    ) -> ExecutedToolResult {
+        let plan_file = match self.plan_runtime_snapshot() {
+            Some(PlanRuntime::Main { plan_file }) => plan_file,
+            Some(PlanRuntime::Subagent) => {
+                return ExecutedToolResult::from_tool_result(ToolResult {
+                    output: "exit_plan_mode is not available to subagents. Return your findings as your final message instead.".to_string(),
+                    is_error: true,
+                });
+            }
+            None => {
+                return ExecutedToolResult::from_tool_result(ToolResult {
+                    output: "You are not in plan mode. This tool is only for exiting plan mode after writing a plan. If your plan was already approved, continue with implementation.".to_string(),
+                    is_error: true,
+                });
+            }
+        };
+
+        let plan = std::fs::read_to_string(&plan_file).unwrap_or_default();
+        if plan.trim().is_empty() {
+            return ExecutedToolResult::from_tool_result(ToolResult {
+                output: format!(
+                    "No plan file found at {}. Write your plan to this file with the write tool before calling exit_plan_mode.",
+                    plan_file.to_string_lossy()
+                ),
+                is_error: true,
+            });
+        }
+
+        let display = crate::commands::ToolConfirmDisplay::PlanApproval(
+            crate::commands::PlanApprovalConfirmDisplay {
+                plan: plan.clone(),
+                plan_file_path: plan_file.to_string_lossy().to_string(),
+            },
+        );
+        let decision = self
+            .await_tool_confirm_decision(
+                app_handle,
+                tool_call_id,
+                "exit_plan_mode",
+                display,
+                &serde_json::json!({}),
+                run_id,
+            )
+            .await;
+
+        match decision {
+            ToolConfirmDecision::Allow { .. } => {
+                if let Err(error) = store.set_plan_mode_active(&self.session_id, false) {
+                    return ExecutedToolResult::from_tool_result(ToolResult {
+                        output: format!("Failed to persist plan mode exit: {}", error),
+                        is_error: true,
+                    });
+                }
+                self.set_plan_runtime(None);
+                emit_stream(
+                    app_handle,
+                    run_id,
+                    StreamEvent::PlanModeChanged {
+                        session_id: self.session_id.clone(),
+                        active: false,
+                        plan_file_path: Some(plan_file.to_string_lossy().to_string()),
+                    },
+                );
+                ExecutedToolResult::from_tool_result(ToolResult {
+                    output: format!(
+                        "User has approved your plan. You can now start coding. Start with updating your todo list if applicable.\n\nYour plan has been saved to: {}\nYou can refer back to it if needed during implementation.\n\n## Approved Plan:\n{}",
+                        plan_file.to_string_lossy(),
+                        plan
+                    ),
+                    is_error: false,
+                })
+            }
+            ToolConfirmDecision::Deny { feedback } => {
+                let output = match feedback {
+                    Some(feedback) => format!(
+                        "The user rejected the plan and wants changes before implementation can begin. Stay in plan mode, address the feedback, update the plan file, then call exit_plan_mode again.\nUser feedback: {}",
+                        feedback
+                    ),
+                    None => "The user rejected the plan. Stay in plan mode; refine the plan file or ask clarifying questions before requesting approval again.".to_string(),
+                };
+                ExecutedToolResult::from_tool_result(ToolResult {
+                    output,
+                    is_error: true,
+                })
+            }
+            ToolConfirmDecision::PreflightError { output } => {
+                ExecutedToolResult::from_tool_result(ToolResult {
+                    output,
+                    is_error: true,
+                })
             }
         }
     }
@@ -10819,6 +11392,9 @@ impl AgentInstance {
                     .is_allowed_tool_for_active_skills(&canonical, active_skill_tool_names)
                     .await
             {
+                if canonical == "task" && self.task_tool_suppressed {
+                    return self.suppressed_task_tool_result();
+                }
                 return ExecutedToolResult::from_tool_result(ToolResult {
                     output: format!(
                         "tool_call target '{}' is not allowed for this agent.",
@@ -10885,6 +11461,22 @@ impl AgentInstance {
             return result;
         }
 
+        // exit_plan_mode is not part of any agent's configured tool list —
+        // it is injected per-request while planning and intercepted here.
+        if tc.name == "exit_plan_mode" {
+            return self
+                .execute_exit_plan_mode(app_handle, store, &tc.id, run_id)
+                .await;
+        }
+
+        // Depth-capped subagents have `task` filtered from their tool
+        // surface; a call that slips through anyway (hallucinated or from
+        // history) gets the specific depth explanation, not the generic
+        // not-allowed text below.
+        if tc.name == "task" && self.task_tool_suppressed {
+            return self.suppressed_task_tool_result();
+        }
+
         if !self
             .is_allowed_tool_for_active_skills(&tc.name, active_skill_tool_names)
             .await
@@ -10895,35 +11487,47 @@ impl AgentInstance {
             });
         }
 
-        // Plan mode enforcement: block non-readonly tools
-        if mode == "plan" && !Self::is_readonly_tool(&tc.name) {
-            return ExecutedToolResult::from_tool_result(ToolResult {
-                output: format!(
-                    "Tool '{}' is not allowed in plan mode. Plan mode is read-only.",
-                    tc.name
-                ),
-                is_error: true,
-            });
+        // Plan mode enforcement: read-only apart from the plan file. Follows
+        // the live runtime state (not the run's initial mode) so an
+        // exit_plan_mode approval mid-run lifts it immediately.
+        let plan_runtime = self.plan_runtime_snapshot();
+        if let Some(runtime) = plan_runtime.as_ref() {
+            if let Some(error) = self.plan_mode_tool_violation(runtime, &tc.name, args) {
+                return ExecutedToolResult::from_tool_result(ToolResult {
+                    output: error,
+                    is_error: true,
+                });
+            }
         }
 
         if let Some(blocked) = self.workflow_gate_check(&tc.name, args, mode) {
             return blocked;
         }
 
+        // The plan file lives outside the workspace by design; a write/edit
+        // that plan enforcement just granted must not be rejected by the
+        // workspace boundary.
+        let plan_file_write_grant = matches!(tc.name.as_str(), "write" | "edit")
+            && matches!(
+                plan_runtime.as_ref(),
+                Some(PlanRuntime::Main { plan_file }) if self.args_target_plan_file(args, plan_file)
+            );
         let file_workspace_boundary_enabled = app_handle
             .try_state::<Arc<crate::config::AppConfig>>()
             .map(|config| config.file_tool_workspace_boundary_enabled())
             .unwrap_or(false);
-        if let Some(error) = Self::validate_tool_path_requirements(
-            &self.working_dir,
-            &tc.name,
-            args,
-            file_workspace_boundary_enabled,
-        ) {
-            return ExecutedToolResult::from_tool_result(ToolResult {
-                output: error,
-                is_error: true,
-            });
+        if !plan_file_write_grant {
+            if let Some(error) = Self::validate_tool_path_requirements(
+                &self.working_dir,
+                &tc.name,
+                args,
+                file_workspace_boundary_enabled,
+            ) {
+                return ExecutedToolResult::from_tool_result(ToolResult {
+                    output: error,
+                    is_error: true,
+                });
+            }
         }
 
         if let Some(error) = self.validate_knowledge_tool_routing(&tc.name, args) {
@@ -15495,6 +16099,21 @@ impl AgentInstance {
             subagent_type,
             language.tag()
         );
+        child.subagent_depth = self.subagent_depth + 1;
+        child.subagent_active = self.subagent_active.clone();
+        // A child spawned at the depth cap never sees `task` in its tool
+        // surface at all, instead of discovering the limit by erroring.
+        let max_depth = app_handle
+            .try_state::<Arc<crate::config::AppConfig>>()
+            .map(|config| config.subagent_max_depth())
+            .unwrap_or(crate::config::DEFAULT_SUBAGENT_MAX_DEPTH);
+        child.task_tool_suppressed = child.subagent_depth >= max_depth;
+        // Plan mode propagates to children: a subagent spawned while the
+        // parent plans runs strictly read-only (no plan file, no
+        // exit_plan_mode) so `task` cannot become a plan-mode bypass.
+        if self.plan_runtime_snapshot().is_some() {
+            child.mark_plan_readonly_subagent();
+        }
 
         match child
             .run(app_handle, store, &localized_prompt, None, None, "build", None)
@@ -15831,6 +16450,20 @@ impl AgentInstance {
         );
     }
 
+    /// Error result for a `task` call from a subagent whose tool surface had
+    /// `task` removed at spawn time (it sits at the configured maximum
+    /// nesting depth). Names the reason and the setting instead of the
+    /// generic not-allowed text.
+    fn suppressed_task_tool_result(&self) -> ExecutedToolResult {
+        ExecutedToolResult::from_tool_result(ToolResult {
+            output: format!(
+                "Error: the task tool is not available to this agent. It was spawned at subagent depth {}, the configured maximum nesting depth, so it cannot spawn further subagents. Do the work directly with your other tools. (The user can raise 'Subagent max depth' in Locus Settings > General.)",
+                self.subagent_depth
+            ),
+            is_error: true,
+        })
+    }
+
     async fn execute_task(
         &self,
         app_handle: &AppHandle,
@@ -15872,6 +16505,38 @@ impl AgentInstance {
             prompt,
             &parent_asset_refs,
         );
+        let (max_depth, max_concurrent) = app_handle
+            .try_state::<Arc<crate::config::AppConfig>>()
+            .map(|config| (config.subagent_max_depth(), config.subagent_max_concurrent()))
+            .unwrap_or((
+                crate::config::DEFAULT_SUBAGENT_MAX_DEPTH,
+                crate::config::DEFAULT_SUBAGENT_MAX_CONCURRENT,
+            ));
+        if self.subagent_depth >= max_depth {
+            return ExecutedToolResult::from_tool_result(ToolResult {
+                output: format!(
+                    "Error: subagent nesting depth limit reached. This agent is itself a subagent running at depth {} and the maximum nesting depth is {}, so it cannot spawn further subagents with the task tool. Do the work directly with your other tools instead. (The user can change this limit via \"Subagent max depth\" in Locus Settings > General.)",
+                    self.subagent_depth, max_depth
+                ),
+                is_error: true,
+            });
+        }
+        // Hold a concurrency slot for the child's whole lifetime; the guard
+        // drops (and frees the slot) on every exit path below.
+        let _subagent_slot =
+            match SubagentSlotGuard::try_acquire(&self.subagent_active, max_concurrent) {
+                Some(slot) => slot,
+                None => {
+                    let running = self.subagent_active.load(Ordering::Relaxed);
+                    return ExecutedToolResult::from_tool_result(ToolResult {
+                        output: format!(
+                            "Error: subagent concurrency limit reached. {} subagents are already running in this session (limit {}), so this task call was rejected. Issue at most {} task calls per round, or re-issue this call after the running subagents finish. (The user can change this limit via \"Subagent max concurrency\" in Locus Settings > General.)",
+                            running, max_concurrent, max_concurrent
+                        ),
+                        is_error: true,
+                    });
+                }
+            };
 
         match self
             .run_subagent_task(
@@ -20028,5 +20693,258 @@ Search, install, audit, and export a plugin.
         );
         assert!(enriched.starts_with("Implement the fix."));
         assert!(enriched.contains("Assets/Scripts/Foo.cs"));
+    }
+
+    // ── Sticky plan mode ─────────────────────────────────────────────────
+
+    fn main_plan_runtime(plan_file: &str) -> super::PlanRuntime {
+        super::PlanRuntime::Main {
+            plan_file: std::path::PathBuf::from(plan_file),
+        }
+    }
+
+    #[test]
+    fn plan_mode_main_allows_readonly_planfile_webfetch_and_task() {
+        let instance = test_agent_instance("C:/Project".to_string());
+        let runtime = main_plan_runtime("C:/Data/plan/proj/sess.md");
+
+        for tool in [
+            "read",
+            "grep",
+            "list",
+            "ask_user_question",
+            "unity_recompile",
+            "todowrite",
+            "web_fetch",
+            "task",
+            "exit_plan_mode",
+        ] {
+            assert!(
+                instance
+                    .plan_mode_tool_violation(&runtime, tool, &serde_json::json!({}))
+                    .is_none(),
+                "tool '{}' should be allowed in main plan mode",
+                tool
+            );
+        }
+    }
+
+    #[test]
+    fn plan_mode_main_blocks_mutating_tools_and_foreign_writes() {
+        let instance = test_agent_instance("C:/Project".to_string());
+        let runtime = main_plan_runtime("C:/Data/plan/proj/sess.md");
+
+        for tool in ["bash", "unity_execute", "knowledge_create", "view_run"] {
+            assert!(
+                instance
+                    .plan_mode_tool_violation(&runtime, tool, &serde_json::json!({}))
+                    .is_some(),
+                "tool '{}' should be blocked in plan mode",
+                tool
+            );
+        }
+
+        let foreign_write = serde_json::json!({ "filePath": "C:/Project/Assets/Foo.cs" });
+        assert!(instance
+            .plan_mode_tool_violation(&runtime, "write", &foreign_write)
+            .is_some());
+        assert!(instance
+            .plan_mode_tool_violation(&runtime, "edit", &foreign_write)
+            .is_some());
+
+        let plan_write = serde_json::json!({ "filePath": "C:/Data/plan/proj/sess.md" });
+        assert!(instance
+            .plan_mode_tool_violation(&runtime, "write", &plan_write)
+            .is_none());
+        assert!(instance
+            .plan_mode_tool_violation(&runtime, "edit", &plan_write)
+            .is_none());
+    }
+
+    #[test]
+    fn plan_mode_subagent_blocks_every_non_readonly_tool() {
+        let instance = test_agent_instance("C:/Project".to_string());
+        let runtime = super::PlanRuntime::Subagent;
+
+        for tool in ["write", "edit", "bash", "task", "web_fetch", "exit_plan_mode"] {
+            assert!(
+                instance
+                    .plan_mode_tool_violation(&runtime, tool, &serde_json::json!({}))
+                    .is_some(),
+                "tool '{}' should be blocked for plan-mode subagents",
+                tool
+            );
+        }
+        assert!(instance
+            .plan_mode_tool_violation(&runtime, "read", &serde_json::json!({}))
+            .is_none());
+    }
+
+    #[test]
+    fn plan_file_match_tolerates_separators_case_and_relative_paths() {
+        let instance = test_agent_instance("C:/Project".to_string());
+        let plan_file = std::path::PathBuf::from("C:/Data/plan/proj/sess.md");
+
+        assert!(instance.args_target_plan_file(
+            &serde_json::json!({ "filePath": "C:\\Data\\plan\\proj\\SESS.md" }),
+            &plan_file,
+        ));
+        assert!(!instance.args_target_plan_file(
+            &serde_json::json!({ "filePath": "C:/Data/plan/proj/other.md" }),
+            &plan_file,
+        ));
+        assert!(!instance.args_target_plan_file(&serde_json::json!({}), &plan_file));
+
+        // Relative paths resolve against the working dir, so a relative
+        // "plans.md" inside the project never matches the external plan file.
+        assert!(!instance.args_target_plan_file(
+            &serde_json::json!({ "filePath": "plan/proj/sess.md" }),
+            &plan_file,
+        ));
+    }
+
+    #[tokio::test]
+    async fn exit_plan_mode_tool_is_offered_only_while_planning() {
+        let instance = test_agent_instance_with_tools_and_mode(
+            "C:/Project".to_string(),
+            vec!["read".to_string(), "write".to_string()],
+            KnowledgeAccessMode::Full,
+        );
+
+        let names = instance.build_request_tool_names().await;
+        assert!(
+            !names.iter().any(|name| name == "exit_plan_mode"),
+            "exit_plan_mode must not be offered outside plan mode"
+        );
+
+        instance.set_plan_runtime(Some(main_plan_runtime("C:/Data/plan/proj/sess.md")));
+        let names = instance.build_request_tool_names().await;
+        assert!(
+            names.iter().any(|name| name == "exit_plan_mode"),
+            "exit_plan_mode must be offered while the main agent plans"
+        );
+
+        // Subagents plan read-only without the exit tool.
+        instance.set_plan_runtime(Some(super::PlanRuntime::Subagent));
+        let names = instance.build_request_tool_names().await;
+        assert!(!names.iter().any(|name| name == "exit_plan_mode"));
+
+        // Exiting plan mode removes it again mid-run.
+        instance.set_plan_runtime(None);
+        let names = instance.build_request_tool_names().await;
+        assert!(!names.iter().any(|name| name == "exit_plan_mode"));
+    }
+
+    #[tokio::test]
+    async fn task_tool_filtered_out_for_depth_capped_subagents() {
+        // `with_builtins()` does not register `task` (the real app registers
+        // it with the live agent list), so the fixture registers it here.
+        let mut tool_registry = ToolRegistry::with_builtins();
+        tool_registry.register_task_tool(&[(
+            "explorer".to_string(),
+            "codebase exploration".to_string(),
+        )]);
+        let (_, cancel_rx) = tokio::sync::watch::channel(false);
+        let mut instance = AgentInstance::new(
+            Arc::new(AgentDef {
+                id: "test".to_string(),
+                name: "Test".to_string(),
+                description: String::new(),
+                system_prompt: String::new(),
+                env_template: String::new(),
+                tools: vec!["read".to_string(), "task".to_string()],
+                sub_agents: Vec::new(),
+                default: false,
+                default_effort: None,
+                model_recommendation: None,
+                source: "test".to_string(),
+            }),
+            "session-test",
+            crate::agent::instance::LlmBackend::ClaudeCodeCli,
+            false,
+            Arc::new(AgentDefRegistry::load(None, None)),
+            Arc::new(tool_registry),
+            "C:/Project".to_string(),
+            RawContextStore::default(),
+            None,
+            "test-model".to_string(),
+            None,
+            Arc::new(None),
+            Arc::new(None),
+            KnowledgeAccessMode::Full,
+            None,
+            HashMap::new(),
+            cancel_rx,
+        );
+
+        let names = instance.build_request_tool_names().await;
+        assert!(
+            names.iter().any(|name| name == "task"),
+            "fixture must offer task before suppression"
+        );
+
+        instance.subagent_depth = 1;
+        instance.task_tool_suppressed = true;
+
+        let names = instance.build_request_tool_names().await;
+        assert!(
+            !names.iter().any(|name| name == "task"),
+            "task must disappear from the request tool list at the depth cap"
+        );
+        assert!(!instance.allowed_tool_set().await.contains("task"));
+        // Other tools stay untouched.
+        assert!(names.iter().any(|name| name == "read"));
+
+        // A call that slips through anyway gets the specific depth error,
+        // which names the setting, rather than the generic not-allowed text.
+        let result = instance.suppressed_task_tool_result();
+        assert!(result.is_error);
+        assert!(result.output.contains("subagent depth 1"));
+        assert!(result.output.contains("Subagent max depth"));
+    }
+
+    #[test]
+    fn plan_reminder_renders_file_info_and_turn_contract() {
+        let missing = std::env::temp_dir().join("locus-test-plan-does-not-exist.md");
+        let rendered = AgentInstance::render_plan_reminder(&missing);
+        assert!(!rendered.contains("{plan_file_info}"));
+        assert!(rendered.contains("No plan file exists yet."));
+        assert!(rendered.contains(&missing.to_string_lossy().to_string()));
+        assert!(rendered.contains("exit_plan_mode"));
+        assert!(rendered.contains("ask_user_question"));
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let existing = dir.path().join("sess.md");
+        std::fs::write(&existing, "# Plan\n- step").expect("write plan");
+        let rendered = AgentInstance::render_plan_reminder(&existing);
+        assert!(rendered.contains("A plan file already exists"));
+        assert!(rendered.contains("refine it if this continues the same task"));
+    }
+
+    #[test]
+    fn subagent_slot_guard_enforces_limit_and_releases_on_drop() {
+        use std::sync::atomic::AtomicU32;
+        use std::sync::Arc;
+
+        let counter = Arc::new(AtomicU32::new(0));
+
+        let first = super::SubagentSlotGuard::try_acquire(&counter, 2).expect("first slot");
+        let second = super::SubagentSlotGuard::try_acquire(&counter, 2).expect("second slot");
+        assert!(
+            super::SubagentSlotGuard::try_acquire(&counter, 2).is_none(),
+            "third acquire must fail at limit 2"
+        );
+
+        drop(second);
+        let reclaimed =
+            super::SubagentSlotGuard::try_acquire(&counter, 2).expect("slot freed by drop");
+
+        drop(first);
+        drop(reclaimed);
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "all slots released"
+        );
     }
 }

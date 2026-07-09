@@ -2,15 +2,12 @@
 <script setup lang="ts">
 import { computed, getCurrentInstance, h, nextTick, onBeforeUnmount, ref, render, watch } from "vue";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { Marked } from "marked";
-import { markedHighlight } from "marked-highlight";
-import hljs from "../hljs";
 import {
   markdownImageDirectSrc,
   prepareMarkdownImages,
   shouldResolveMarkdownImageSource,
 } from "../composables/markdownImages";
-import { renderHighlightedCodeLines } from "../composables/markdownCodeLines";
+import { escapeMarkdownHtml, markdownEngine } from "../composables/markdownEngine";
 import { normalizeExternalMarkdownHref } from "../composables/markdownExternalLinks";
 import {
   collectInlineCodePathCandidates,
@@ -20,14 +17,12 @@ import {
   injectUnityPropertyFenceRefs,
   injectViewRefs,
   injectWorkspaceMentions,
-  isMarkdownUnityObjectFenceLanguage,
-  isMarkdownUnityPropertyFenceLanguage,
   normalizeMarkdownPathStatusKey,
   type MarkdownPathStatus,
 } from "../composables/markdownInject";
+import { resolveMathSentinels } from "../composables/markdownMath";
 import { normalizeMarkdownForRender } from "../composables/markdownRender";
 import { sanitizeRenderedMarkdownHtml } from "../composables/markdownSanitize";
-import { wrapMarkdownTables } from "../composables/markdownTableHtml";
 import {
   armLocusFilePointerDrag,
   armUnityReferencePointerDrag,
@@ -72,13 +67,6 @@ let markdownViewRefLoadRun = 0;
 let markdownInlinePathStatusLoadRun = 0;
 let markdownInlinePathStatusKey = "";
 
-function escapeHtml(source: string): string {
-  return source
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
-}
-
 function escapeRegExp(source: string): string {
   return source.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
@@ -122,6 +110,8 @@ function highlightHtml(html: string, terms: string[]): string {
     acceptNode(node) {
       if (!(node instanceof Text)) return NodeFilter.FILTER_REJECT;
       if (!node.nodeValue?.trim()) return NodeFilter.FILTER_REJECT;
+      // A <mark> inserted inside a math sentinel would break its expansion.
+      if (node.nodeValue.includes("")) return NodeFilter.FILTER_REJECT;
       if (shouldSkipHighlight(node)) return NodeFilter.FILTER_REJECT;
       return NodeFilter.FILTER_ACCEPT;
     },
@@ -164,42 +154,9 @@ function highlightHtml(html: string, terms: string[]): string {
   return root.innerHTML;
 }
 
-const md = new Marked(
-  markedHighlight({
-    langPrefix: "hljs language-",
-    highlight(code: string, lang: string) {
-      const normalizedLang = lang.trim().toLowerCase();
-      if (
-        isMarkdownUnityObjectFenceLanguage(normalizedLang)
-        || isMarkdownUnityPropertyFenceLanguage(normalizedLang)
-      ) {
-        return escapeHtml(code);
-      }
-      if (normalizedLang === "tree") {
-        return renderHighlightedCodeLines(escapeHtml(code), false);
-      }
-
-      let highlighted = escapeHtml(code);
-      if (normalizedLang && hljs.getLanguage(normalizedLang)) {
-        highlighted = hljs.highlight(code, { language: normalizedLang }).value;
-      }
-      return renderHighlightedCodeLines(highlighted);
-    },
-  }),
-  {
-    breaks: true,
-    gfm: true,
-    hooks: {
-      postprocess(html) {
-        return wrapMarkdownTables(html);
-      },
-    },
-  }
-);
-
 const parsedMarkdownHtml = computed(() => {
   if (!props.content) return "";
-  return md.parse(normalizeMarkdownForRender(props.content)) as string;
+  return markdownEngine.parse(normalizeMarkdownForRender(props.content)) as string;
 });
 
 function markdownPathStatusFromEntry(entry: WorkspaceEntryStat): MarkdownPathStatus {
@@ -281,9 +238,11 @@ const renderedHtml = computed(() => {
     if (highlightTerms.length) {
       html = highlightHtml(html, highlightTerms);
     }
-    return sanitizeRenderedMarkdownHtml(html);
+    // Math sentinels expand after sanitize: formula HTML is sanitized by its
+    // own formula-scoped pass inside the resolver (see markdownMath.ts).
+    return resolveMathSentinels(sanitizeRenderedMarkdownHtml(html));
   } catch {
-    return sanitizeRenderedMarkdownHtml(escapeHtml(props.content));
+    return sanitizeRenderedMarkdownHtml(escapeMarkdownHtml(props.content));
   }
 });
 
@@ -1081,6 +1040,30 @@ function handleMarkdownPointerDown(event: PointerEvent) {
   width: 100%;
   min-height: 110px;
   cursor: default;
+}
+
+.markdown-body .katex {
+  font-size: 1.16em;
+}
+
+/* KaTeX displayMode roots are span.katex-display (block via CSS), so they
+ * stay legal inside <p> while still needing the paragraph rhythm. */
+.markdown-body .katex-display {
+  margin: 4px 0 12px;
+  padding: 2px 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+
+.markdown-body .md-math-pending,
+.markdown-body .md-math-error {
+  font-family: var(--font-mono-inline);
+  font-size: 0.92em;
+  color: var(--text-secondary);
+}
+
+.markdown-body .md-math-error {
+  color: var(--danger, #d73a49);
 }
 
 .markdown-body strong {

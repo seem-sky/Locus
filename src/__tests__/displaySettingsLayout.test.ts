@@ -485,8 +485,18 @@ describe("display settings transcript alignment", () => {
     expect(displayPanel).toContain(":disabled=\"!display.showThinkingProcess\"");
     expect(displayPanel).toContain(":class=\"{ disabled: !display.showThinkingProcess }\"");
 
-    expect(transcript).toContain("function shouldAutoExpandThinking()");
-    expect(transcript).toContain("displaySettings.thinkingAutoExpand !== false");
+    expect(transcript).toContain("function shouldHideThinkingBlocks()");
+    expect(transcript).toContain("return displaySettings.hideThinkingBlocks !== false;");
+    expect(transcript).toContain("return !shouldHideThinkingBlocks() && !!item.message.thinkingContent?.trim();");
+    expect(transcript).toContain("const hasVisibleCompletedThinkingContent = computed(() =>");
+    expect(transcript).toContain("&& canonicalLiveRenderParts.value.some((part) =>");
+    expect(transcript).toContain("const hasVisibleActiveThinkingBlock = computed(() =>");
+    expect(transcript).toContain("part.kind === \"thinking\" && part.active");
+    expect(transcript).toContain("hasVisibleActiveThinkingBlock.value || hasVisibleCompletedThinkingContent.value");
+    expect(transcript).toContain("hasThinkingContent: hasVisibleCompletedThinkingContent.value,");
+    expect(transcript).toContain("function shouldRenderTransientThinkingSegment(");
+    expect(transcript).toContain("return !!part.active || (!shouldHideThinkingBlocks() && livePartHasContent(part));");
+    expect(transcript).toMatch(/if \(part\.kind === "thinking"\) \{\s+if \(!shouldRenderTransientThinkingSegment\(part\)\) continue;\s+flushPendingTools\(\);/);
 
     expect(zh).toContain('"settings.display.thinkingAutoExpand": "自动展开会话中的思考过程"');
     expect(en).toContain('"settings.display.thinkingAutoExpand": "Auto-expand thinking content in the chat transcript"');

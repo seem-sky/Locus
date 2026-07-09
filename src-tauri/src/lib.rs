@@ -35,6 +35,7 @@ pub mod dotnet_runtime;
 pub(crate) mod eol;
 pub mod error;
 mod feishu_docs;
+pub mod file_log;
 pub mod keychain;
 pub mod knowledge_index;
 pub mod knowledge_store;
@@ -43,6 +44,7 @@ mod codegraph_watcher;
 pub mod agentmemory;
 pub mod memory;
 mod llm;
+mod local_docs;
 pub(crate) mod merge;
 pub mod network;
 pub mod plugin;
@@ -334,6 +336,15 @@ pub fn run() {
             .unwrap_or(false),
     ));
     let log_store = Arc::new(logging::AppLogStore::new(logging::DEFAULT_LOG_CAPACITY));
+    match file_log::FileLogSink::init_default() {
+        Ok(sink) => {
+            log_store.attach_file_sink(sink.clone());
+            file_log::install_panic_hook(sink);
+        }
+        Err(error) => {
+            std::eprintln!("[FileLog] persistent file logging disabled: {error}");
+        }
+    }
     logging::init_tracing(shared_debug_flag.clone(), log_store.clone());
     startup_trace.mark("tracing_ready");
     let binary_cache: Arc<binary_cache::BinaryCache> = Arc::new(binary_cache::BinaryCache::new());
@@ -476,6 +487,8 @@ pub fn run() {
                 config.unity_inline_force_evaluate_enabled(),
             );
             code_tools::initialize(config.code_analysis_tools());
+            llm::retry::initialize(config.llm_retry_max_attempts());
+            llm::think_tag_filter::initialize(config.llm_strip_inline_think_tags());
             startup_for_setup.mark("setup_config_ready");
 
             // Load OpenRouter API key from OS keychain only.
@@ -627,6 +640,8 @@ pub fn run() {
                 ));
             let unity_reference_import_state = unity_docs::UnityReferenceImportState::default();
             let feishu_reference_import_state = feishu_docs::FeishuReferenceImportState::default();
+            let local_reference_import_state = local_docs::LocalReferenceImportState::default();
+            let local_reference_watcher_state = local_docs::LocalReferenceWatcherState::default();
             startup_for_setup.mark("setup_knowledge_runtime_ready");
 
             let mut tool_registry = ToolRegistry::with_builtins();
@@ -945,6 +960,20 @@ pub fn run() {
                         );
                     }
                 }
+                {
+                    let app_handle = app.handle().clone();
+                    let working_dir = initial_working_dir_copy.clone();
+                    let knowledge_index_state = knowledge_index_state.clone();
+                    let watcher_state = local_reference_watcher_state.clone();
+                    tauri::async_runtime::spawn_blocking(move || {
+                        local_docs::restore_live_watchers(
+                            app_handle,
+                            working_dir,
+                            knowledge_index_state,
+                            watcher_state,
+                        );
+                    });
+                }
             }
 
             if !initial_working_dir_copy.trim().is_empty() {
@@ -1011,6 +1040,8 @@ pub fn run() {
             app.manage(knowledge_index_state.clone());
             app.manage(unity_reference_import_state);
             app.manage(feishu_reference_import_state);
+            app.manage(local_reference_import_state);
+            app.manage(local_reference_watcher_state.clone());
             app.manage(log_store_for_setup.clone());
             startup_for_setup.mark("setup_state_managed");
 
@@ -1352,6 +1383,12 @@ pub fn run() {
             commands::knowledge_import_feishu_reference_docs,
             commands::knowledge_delete_unity_reference_docs,
             commands::knowledge_delete_feishu_reference_docs,
+            commands::knowledge_preview_local_reference_import,
+            commands::knowledge_import_local_reference_docs,
+            commands::knowledge_get_local_reference_import_status,
+            commands::knowledge_cancel_local_reference_import,
+            commands::knowledge_sync_local_reference_docs,
+            commands::knowledge_delete_local_reference_docs,
             commands::knowledge_delete_external_reference_directory,
             commands::knowledge_preview_webpage,
             commands::knowledge_import_webpage,
@@ -1430,12 +1467,19 @@ pub fn run() {
             commands::rollback_session_to_message,
             commands::undo_perform,
             commands::undo_perform_to_message,
+            commands::undo_revert_file,
             commands::undo_preview,
             commands::undo_list,
             commands::undo_check_conflicts,
             commands::undo_check_dirty,
             commands::get_debug_mode,
             commands::set_debug_mode,
+            commands::get_llm_retry_max_attempts,
+            commands::set_llm_retry_max_attempts,
+            commands::get_subagent_max_depth,
+            commands::set_subagent_max_depth,
+            commands::get_subagent_max_concurrent,
+            commands::set_subagent_max_concurrent,
             commands::get_file_tool_workspace_boundary,
             commands::set_file_tool_workspace_boundary,
             commands::get_tool_permission_mode,
@@ -1445,7 +1489,8 @@ pub fn run() {
             commands::get_workflow_tool_whitelist,
             commands::save_workflow_tool_whitelist,
             commands::reset_all_config,
-            commands::save_plan_artifact,
+            commands::get_session_plan_state,
+            commands::set_session_plan_mode,
             commands::get_system_fonts,
             commands::get_system_locale,
             commands::get_close_behavior,
@@ -1501,6 +1546,8 @@ pub fn run() {
             commands::get_log_entries,
             commands::clear_log_entries,
             commands::save_log_export,
+            commands::append_frontend_logs,
+            commands::reveal_log_file,
             commands::unity_embed_status,
             commands::unity_embed_open_frontend_window,
             commands::unity_embed_set_mouse_activation_suppressed,

@@ -1,12 +1,12 @@
 {
-  "version": "0.5.3",
-  "releasedAt": "2026-06-27",
+  "version": "0.5.6",
+  "releasedAt": "2026-07-07",
   "channel": "stable",
   "installers": [
     {
       "id": "windows-x64",
       "label": "Windows x64",
-      "url": "https://github.com/r1n7aro/Locus/releases/download/v0.5.3/locus_0.5.3_x64-setup.exe",
+      "url": "https://github.com/r1n7aro/Locus/releases/download/v0.5.6/locus_0.5.6_x64-setup.exe",
       "platform": "windows",
       "arch": "x64",
       "includesManagedPython": true,
@@ -17,7 +17,7 @@
     {
       "id": "windows-x64-without-embed-python-git",
       "label": "Windows x64 - system Python/Git",
-      "url": "https://github.com/r1n7aro/Locus/releases/download/v0.5.3/locus_0.5.3_x64-without_embed_python_git-setup.exe",
+      "url": "https://github.com/r1n7aro/Locus/releases/download/v0.5.6/locus_0.5.6_x64-without_embed_python_git-setup.exe",
       "platform": "windows",
       "arch": "x64",
       "includesManagedPython": false,
@@ -29,9 +29,71 @@
   "locales": {
     "zh": {
       "title": "发现新版本",
-      "summary": "Locus v0.5.3 (2026-06-27)",
+      "summary": "Locus v0.5.6 (2026-07-07)",
       "changelogUrl": "/overview/latest-version",
       "changes": [
+        {
+          "title": "v0.5.6（新增）",
+          "items": [
+            "**本地文件导入知识库。** 外部源支持把本地文件或文件夹导入为引用文件夹，两种模式：**实时链接**通过操作系统链接（junction/symlink）直接挂载本地路径，内容始终是磁盘上的最新状态、文档保持只读；**快照导入**一次性复制当前内容，可选择允许 AI 编辑，并支持手动同步源路径变化。其中 Markdown / 文本文档（`.md` / `.markdown` / `.txt`）会进入知识检索。删除实时链接引用只解除链接，不改动源文件。(#85)",
+            "**聊天 LaTeX 公式渲染。** 消息中的 LaTeX 公式以 KaTeX 渲染，识别 `$…$`、`$$…$$`、`\\(…\\)`、`\\[…\\]` 定界符。"
+          ]
+        },
+        {
+          "title": "v0.5.6（修复）",
+          "items": [
+            "chat-completions 请求按序列化后的字节原样发送，请求日志记录的也是同一份字节；当服务商以 JSON 解析错误拒绝请求时，报错会说明请求体很可能在传输途中被损坏（代理、VPN、安全软件或网关），并建议用 curl 重放确认。(#106)",
+            "长流式回复不再随内容增长越来越卡：正文、思考过程与打字机改为增量追加新内容，不再整段重渲染。",
+            "流式回复结束的瞬间消息列表不再闪烁。"
+          ]
+        },
+        {
+          "title": "v0.5.5（新增）",
+          "items": [
+            "**按文件撤回。** 变更面板、diff 审查窗口及新增的行右键菜单支持把单个文件恢复到本轮修改前的快照，不影响撤销栈；若该文件之后还有编辑，会先询问再回滚。(#100)",
+            "**模型请求自动重试。** 连接错误、超时、HTTP 5xx 与 429 限流自动重试，429 遵循 `Retry-After`；仅在尚未流式产出任何内容前重试；次数可在通用设置调整（默认 3，设 0 关闭）。(#101)",
+            "**内联 `<think>` 标签转入思考通道。** chat-completions 与 OpenRouter 路径上，流式正文中的 `<think>…</think>` 片段会从消息正文剥离并作为思考过程展示（默认开启）。",
+            "**子代理限制。** 通用设置新增 `task` 子代理最大嵌套深度与单会话最大并发（默认深度 1）；超限调用会返回错误并说明当前限制。",
+            "**`/dream` 记忆整理技能。** 内置技能：合并重复记忆、修正过期事实、精简记忆索引。"
+          ]
+        },
+        {
+          "title": "v0.5.5（修复）",
+          "items": [
+            "自动压缩的保留与请求预算按模型上下文窗口缩放，并识别更多供应商的「prompt 过长」报错，小上下文模型上的压缩现在能收敛。",
+            "回放历史工具调用时规范化 arguments：空或非法 JSON 变为 `{}` 再发给 chat-completions/OpenRouter 供应商；Codex 路径保持逐字不变。(#94)",
+            "工作区文件路径改为词法解析，符号链接文件现在能正常打开与定位。(#100)",
+            "更流畅的长回复流式渲染：已完成的 markdown 块被冻结，流式期间仅重解析尾部。",
+            "上下文 token 估算不再低估中日韩文本。",
+            "登录态复查不再重建已打开的标签页；视图预加载，消除首次切换时的闪烁。"
+          ]
+        },
+        {
+          "title": "v0.5.4（新增）",
+          "items": [
+            "**粘性计划模式。** 计划模式现在是按会话持续的只读模式：Agent 可调研并撰写计划，但在你于对话卡片上批准前不能编辑文件或调用非只读工具。顶部状态栏显示计划模式已启用并提供一键退出；计划期间派生的子代理同样继承只读限制。",
+            "**主日志落盘。** Locus 会把日志（含前端控制台）同时写入滚动文件 `%APPDATA%\\locus\\logs\\locus.log`，崩溃时刷盘。控制台设置新增「定位日志文件」按钮。",
+            "**模型目录更新。** 新增 Fable 5 与 Sonnet 5（1M 上下文），并将 Opus 4.8 设为默认；移除较旧的 Sonnet 4.6、Haiku 4.5 与 Opus 4.7。"
+          ]
+        },
+        {
+          "title": "v0.5.4（修复）",
+          "items": [
+            "模型选择器不再显示内部的 `[1m]` 上下文窗口标记。",
+            "解析 Unity YAML 时，GUID 后紧跟多字节字符不再触发 panic；单引号包裹的标量名称现在能被正确去引号。",
+            "场景 diff 现在能识别预制体换源与重新挂父级（不再误判为未变化），并跳过逐字节相同的场景目标重建。",
+            "更快的资产重扫：watcher 对账时不再重新解析未变化的文件；更新后首次启动会重建一次资产数据库（schema v13）。",
+            "更顺畅的流式输出：缓存诊断/trace 判定、改用更浅的工具调用 watch、批量应用工具结果、稳定消息分组，减少 transcript 的冗余计算。",
+            "热更新对不安全的改动改为 fail-closed：ref struct 的实例成员、在表达式树内引用的成员、命名空间级 `using` 变更，以及冷 diff 回退。",
+            "加固 Unity 热更新桥接：应用失败时回滚已下的 detour；重编译完成以编译 epoch 门控，避免请求前的编译误判完成；对正在销毁的 GameObject 跳过组件；并修复收敛竞态与 monitor 停止时的账本交接。"
+          ]
+        },
+        {
+          "title": "v0.5.4（移除）",
+          "items": [
+            "移除旧的一次性「计划 → 继续实现」确认卡片；由上述粘性、需批准的计划模式取代。"
+          ]
+        },
         {
           "title": "v0.5.3（新增）",
           "items": [
@@ -97,11 +159,11 @@
       "downloadChannels": [
         {
           "label": "Windows x64",
-          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.5.3/locus_0.5.3_x64-setup.exe"
+          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.5.6/locus_0.5.6_x64-setup.exe"
         },
         {
           "label": "Windows x64（系统 Python/Git）",
-          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.5.3/locus_0.5.3_x64-without_embed_python_git-setup.exe"
+          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.5.6/locus_0.5.6_x64-without_embed_python_git-setup.exe"
         },
         {
           "label": "GitHub Releases",
@@ -111,9 +173,71 @@
     },
     "en": {
       "title": "Update available",
-      "summary": "Locus v0.5.3 (2026-06-27)",
+      "summary": "Locus v0.5.6 (2026-07-07)",
       "changelogUrl": "/en/overview/latest-version",
       "changes": [
+        {
+          "title": "v0.5.6 (Added)",
+          "items": [
+            "**Import local files as knowledge references.** External sources can now import a local file or folder as a reference folder, in two modes: *live link* mounts the path through an OS link (junction/symlink), so content always reflects the latest files on disk and stays read-only; *snapshot* copies the current content once, with optional AI editing and a manual re-sync action. Markdown and text documents (`.md` / `.markdown` / `.txt`) become searchable in knowledge. Deleting a live-linked reference only detaches the link — source files are never touched. (#85)",
+            "**LaTeX math in chat.** Messages render LaTeX formulas with KaTeX, recognizing `$…$`, `$$…$$`, `\\(…\\)`, and `\\[…\\]` delimiters."
+          ]
+        },
+        {
+          "title": "v0.5.6 (Fixed)",
+          "items": [
+            "Chat-completions requests are sent byte-for-byte as serialized, and request logs capture the same bytes that went on the wire. When a provider rejects a request with a JSON parse error, the message now explains that the body was most likely corrupted in transit (proxy, VPN, security software, or a gateway) and suggests a curl replay to confirm. (#106)",
+            "Long streaming replies no longer slow down as they grow: live text, thinking, and the typewriter append new chunks instead of re-rendering the whole message.",
+            "The message list no longer flashes for a frame when a streaming reply finishes."
+          ]
+        },
+        {
+          "title": "v0.5.5 (Added)",
+          "items": [
+            "**Per-file revert.** The changes panel, the diff review window, and a new row context menu can restore a single file to its snapshot from before the current round, without popping the undo stack. If the file has later edits, Locus asks before rolling them back. (#100)",
+            "**Automatic retry for model requests.** Connection errors, timeouts, HTTP 5xx, and 429 rate limits retry automatically, honoring `Retry-After` on 429. Retries only happen before any output has streamed; the attempt cap is adjustable in General settings (default 3, 0 disables). (#101)",
+            "**Inline `<think>` tags routed to the thinking channel.** On the chat-completions and OpenRouter paths, inline `<think>…</think>` segments in streamed replies are stripped from the message body and shown as thinking instead (enabled by default).",
+            "**Subagent limits.** General settings now cap `task` subagent nesting depth and per-session concurrency (default depth 1). Calls over the limit return an error explaining the current caps.",
+            "**`/dream` memory consolidation skill.** A built-in skill that merges duplicate memories, fixes stale facts, and prunes the Memory index."
+          ]
+        },
+        {
+          "title": "v0.5.5 (Fixed)",
+          "items": [
+            "Auto-compaction scales its retention and request budgets to the model's context window and recognizes more provider \"prompt too long\" errors, so compaction converges on small-context models.",
+            "Replayed tool-call arguments are normalized before being resent to chat-completions/OpenRouter providers — empty or malformed JSON becomes `{}`; Codex replays stay verbatim. (#94)",
+            "Workspace file paths resolve lexically, so symlinked files open and reveal correctly. (#100)",
+            "Smoother streaming of long replies: finished markdown blocks are frozen and only the tail re-parses during streaming.",
+            "Context token estimates no longer undercount CJK text.",
+            "Auth re-checks no longer tear down open tabs, and views preload to avoid a flash on first visit."
+          ]
+        },
+        {
+          "title": "v0.5.4 (Added)",
+          "items": [
+            "**Sticky plan mode.** Plan mode is now a persistent, per-session read-only mode: the agent researches and writes the plan but cannot edit files or run non-read-only tools until you approve it from an in-chat card. A status bar shows plan mode is active with a one-click exit, and subagents spawned during planning inherit the read-only restriction.",
+            "**Main log written to a file.** Locus mirrors its log (including the frontend console) to a rotating file at `%APPDATA%\\locus\\logs\\locus.log`, flushed on crash. Console settings has a new \"Locate Log File\" button.",
+            "**Model catalog refresh.** Added Fable 5 and Sonnet 5 (1M context) and made Opus 4.8 the default; removed the older Sonnet 4.6, Haiku 4.5, and Opus 4.7 entries."
+          ]
+        },
+        {
+          "title": "v0.5.4 (Fixed)",
+          "items": [
+            "Model names no longer show the internal `[1m]` context-window marker in the pickers.",
+            "Unity YAML parsing no longer panics on a multi-byte character right after a GUID, and single-quoted scalar names are unquoted correctly.",
+            "Scene diffing now detects prefab source swaps and reparenting instead of reporting them unchanged, and skips rebuilding byte-identical scene targets.",
+            "Faster asset re-scans: unchanged files are no longer re-parsed during watcher reconciliation, and the asset database rebuilds once on first launch after updating (schema v13).",
+            "Smoother response streaming: cached diagnostics/trace checks, shallower tool-call watches, batched tool-result updates, and stabilized message groups cut redundant transcript work.",
+            "Hot reload now fails closed on unsafe edits: ref-struct instance members, members referenced inside expression trees, namespace-scoped `using` changes, and cold-diff reverts.",
+            "Hardened the Unity hot-reload bridge: applied detours roll back on apply failure, recompile completion is gated on a compile epoch so pre-request compiles can't finish the request, components are skipped on GameObjects being destroyed, and convergence races / monitor-stop handoff are fixed."
+          ]
+        },
+        {
+          "title": "v0.5.4 (Removed)",
+          "items": [
+            "Removed the old one-shot \"plan → continue implementation\" confirmation card; it's replaced by the sticky, approval-gated plan mode above."
+          ]
+        },
         {
           "title": "v0.5.3 (Added)",
           "items": [
@@ -179,11 +303,11 @@
       "downloadChannels": [
         {
           "label": "Windows x64",
-          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.5.3/locus_0.5.3_x64-setup.exe"
+          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.5.6/locus_0.5.6_x64-setup.exe"
         },
         {
           "label": "Windows x64 (system Python/Git)",
-          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.5.3/locus_0.5.3_x64-without_embed_python_git-setup.exe"
+          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.5.6/locus_0.5.6_x64-without_embed_python_git-setup.exe"
         },
         {
           "label": "GitHub Releases",

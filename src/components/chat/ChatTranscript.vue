@@ -45,12 +45,15 @@ import {
   type UserLocalFileEntryDisplay,
 } from "../../composables/chatUserMessageDisplay";
 import { TRANSIENT_CHAT_MESSAGE_ID } from "../../composables/chatMessageCopy";
-import { logToolCollapseTrace, previewTraceText } from "../../services/toolCollapseTrace";
+import { isToolCollapseTraceEnabled, logToolCollapseTrace, previewTraceText } from "../../services/toolCollapseTrace";
 import {
+  isLayoutDiagnosticsEnabled,
   traceToolBlockLayoutChange,
   traceTranscriptPaintOcclusion,
 } from "../../services/layoutDiagnostics";
 import MarkdownRenderer from "../MarkdownRenderer.vue";
+import StreamingMarkdownRenderer from "./StreamingMarkdownRenderer.vue";
+import type { StreamingTextSource } from "../../composables/streamingTextChunks";
 import ToolCallCollection from "../ToolCallCollection.vue";
 import ToolCallBlock from "../ToolCallBlock.vue";
 import KnowledgeProposalCard from "./KnowledgeProposalCard.vue";
@@ -101,6 +104,12 @@ interface PromotedHistoryToolCallsState {
 const props = withDefaults(defineProps<{
   messages: ChatMessage[];
   streamingText: string;
+  /** Typewriter output as a chunk stream. When set, single-part rounds render
+   * it incrementally and `streamingText` is expected to stay empty — growing
+   * text then never transits this component's props. */
+  typedTextStream?: StreamingTextSource | null;
+  /** Stable "round has visible text" flag accompanying typedTextStream. */
+  hasStreamingText?: boolean;
   streamingTextOrder?: number;
   isStreaming: boolean;
   isCompacting?: boolean;
@@ -110,6 +119,10 @@ const props = withDefaults(defineProps<{
   thinkingOrder?: number;
   thinkingDuration?: number;
   liveRenderParts?: AssistantRenderPart[];
+  /** Chunk streams carrying live text/thinking growth per render part. The
+   * map identity is stable; renderers subscribe to each stream's version, so
+   * per-delta growth bypasses this component's props entirely. */
+  livePartStreams?: ReadonlyMap<string, StreamingTextSource> | null;
   activeToolCalls: ToolCallDisplay[];
   variant?: TranscriptVariant;
   emptyTitle?: string;
@@ -131,12 +144,15 @@ const props = withDefaults(defineProps<{
 }>(), {
   variant: "embedded",
   hasThinking: undefined,
+  typedTextStream: null,
+  hasStreamingText: undefined,
   streamingTextOrder: 0,
   isCompacting: false,
   thinkingText: "",
   thinkingOrder: 0,
   thinkingDuration: 0,
   liveRenderParts: () => [],
+  livePartStreams: null,
   emptyTitle: "",
   emptyHint: "",
   userLabel: "User",
@@ -370,8 +386,18 @@ function cloneToolCallDisplays(toolCalls: ToolCallDisplay[]) {
   return toolCalls.map((toolCall) => cloneToolCallDisplay(toolCall));
 }
 
-function traceToolCollapse(event: string, detail?: Record<string, unknown>) {
+function traceToolCollapse(event: string, detail?: Record<string, unknown> | (() => Record<string, unknown>)) {
   logToolCollapseTrace(`transcript:${props.variant}`, event, detail);
+}
+
+// Diagnostics-only observers walk every message group and JSON.stringify the
+// result on each reactive tick, which is far too expensive to run in normal
+// sessions. They are wired at setup time only when tracing is already on, so
+// enabling the sessionStorage/query flags requires a reload — same workflow as
+// the query-parameter toggles.
+function transcriptTraceWatchEnabled(...traceEvents: string[]) {
+  return isLayoutDiagnosticsEnabled()
+    || traceEvents.some((traceEvent) => isToolCollapseTraceEnabled(traceEvent));
 }
 
 function toolLayoutToolCallIds(toolCalls: ToolCallDisplay[]) {
@@ -525,7 +551,9 @@ watch(
   { flush: "sync" },
 );
 
-const hasVisibleStreamingText = computed(() => props.streamingText.trim().length > 0);
+const hasVisibleStreamingText = computed(() =>
+  props.hasStreamingText ?? (props.streamingText.trim().length > 0),
+);
 const hasVisibleStreamingTextAfterToolHandoff = computed(() => {
   const handoff = toolCallHandoff.value;
   if (!handoff) return hasVisibleStreamingText.value;
@@ -809,32 +837,36 @@ watch(shouldArmToolCallHandoffCollapse, (shouldArm) => {
   }
 });
 
+const shouldTraceMessagesOrderChanges = transcriptTraceWatchEnabled("messagesOrderChanged");
+
 watch(
   () => props.messages,
   (messages, previous) => {
     if (messages === previous) return;
     const hasHandoff = !!toolCallHandoff.value;
-    traceToolLayoutChange(hasHandoff ? "messagesChangedDuringToolHandoff" : "messagesChanged", {
-      previousCount: previous?.length ?? 0,
-      nextCount: messages.length,
-      previousMessages: messageListLayoutSnapshot(previous),
-      nextMessages: messageListLayoutSnapshot(messages),
-      streamingTextLen: props.streamingText.length,
-      isStreaming: props.isStreaming,
-      hasHandoff,
-      handoffRenderKey: toolCallHandoff.value?.renderKey ?? "",
-      handoffToolCallIds: toolCallHandoff.value ? Array.from(toolCallHandoff.value.toolCallIds) : [],
-    });
-    traceToolCollapse("messagesOrderChanged", {
-      previous: messageOrderTraceSnapshot(previous),
-      next: messageOrderTraceSnapshot(messages),
-      isStreaming: props.isStreaming,
-      activeToolCallCount: props.activeToolCalls.length,
-      activeToolCallIds: props.activeToolCalls.map((toolCall) => toolCall.id),
-      hasHandoff,
-      handoffRenderKey: toolCallHandoff.value?.renderKey ?? "",
-      handoffToolCallIds: toolCallHandoff.value ? Array.from(toolCallHandoff.value.toolCallIds) : [],
-    });
+    if (shouldTraceMessagesOrderChanges) {
+      traceToolLayoutChange(hasHandoff ? "messagesChangedDuringToolHandoff" : "messagesChanged", {
+        previousCount: previous?.length ?? 0,
+        nextCount: messages.length,
+        previousMessages: messageListLayoutSnapshot(previous),
+        nextMessages: messageListLayoutSnapshot(messages),
+        streamingTextLen: props.streamingText.length,
+        isStreaming: props.isStreaming,
+        hasHandoff,
+        handoffRenderKey: toolCallHandoff.value?.renderKey ?? "",
+        handoffToolCallIds: toolCallHandoff.value ? Array.from(toolCallHandoff.value.toolCallIds) : [],
+      });
+      traceToolCollapse("messagesOrderChanged", () => ({
+        previous: messageOrderTraceSnapshot(previous),
+        next: messageOrderTraceSnapshot(messages),
+        isStreaming: props.isStreaming,
+        activeToolCallCount: props.activeToolCalls.length,
+        activeToolCallIds: props.activeToolCalls.map((toolCall) => toolCall.id),
+        hasHandoff,
+        handoffRenderKey: toolCallHandoff.value?.renderKey ?? "",
+        handoffToolCallIds: toolCallHandoff.value ? Array.from(toolCallHandoff.value.toolCallIds) : [],
+      }));
+    }
     if (!toolCallHandoff.value) return;
     if (hasVisibleUserMessageAfterToolCallMatch(messages, toolCallHandoff.value.toolCallMatchState)) {
       clearToolCallHandoff("handoff-history-before-inserted-user");
@@ -852,20 +884,22 @@ watch(
   { flush: "sync" },
 );
 
-watch(hasVisibleStreamingText, (visible, previousVisible) => {
-  traceToolLayoutChange("visibleStreamingTextChanged", {
-    previous: previousVisible,
-    next: visible,
-    streamingTextLen: props.streamingText.length,
+if (transcriptTraceWatchEnabled("hasVisibleStreamingTextChanged")) {
+  watch(hasVisibleStreamingText, (visible, previousVisible) => {
+    traceToolLayoutChange("visibleStreamingTextChanged", {
+      previous: previousVisible,
+      next: visible,
+      streamingTextLen: props.streamingText.length,
+    });
+    traceToolCollapse("hasVisibleStreamingTextChanged", () => ({
+      previous: previousVisible,
+      next: visible,
+      streamingTextLen: props.streamingText.length,
+      streamingTextPreview: props.streamingText ? previewTraceText(props.streamingText, 64) : "",
+      isStreaming: props.isStreaming,
+    }));
   });
-  traceToolCollapse("hasVisibleStreamingTextChanged", {
-    previous: previousVisible,
-    next: visible,
-    streamingTextLen: props.streamingText.length,
-    streamingTextPreview: props.streamingText ? previewTraceText(props.streamingText, 64) : "",
-    isStreaming: props.isStreaming,
-  });
-});
+}
 
 watch(
   () => props.isStreaming,
@@ -933,8 +967,26 @@ function shouldRenderHistoryThinkingBlock(item: Pick<MessageRenderItem, "message
   return !shouldHideThinkingBlocks() && !!item.message.thinkingContent?.trim();
 }
 
+function livePartStream(partId: string): StreamingTextSource | null {
+  return props.livePartStreams?.get(partId) ?? null;
+}
+
+/** Live part content is split between the frozen baseline on the part and
+ * growth in its chunk stream; either side counts as visible content.
+ *
+ * `hasNonWhitespace` is deliberately read without registering a reactive
+ * dependency (subscribing to the stream's version here would re-run the
+ * enclosing computeds once per delta — the exact cost this design removes).
+ * Correctness rides on the reducer contract that every
+ * appendLiveRenderPartContent batch also upserts its part, which swaps the
+ * liveRenderParts array identity and re-runs those computeds. */
+function livePartHasContent(part: Extract<AssistantRenderPart, { kind: "thinking" | "text" }>): boolean {
+  if (part.content.trim().length > 0) return true;
+  return livePartStream(part.id)?.hasNonWhitespace ?? false;
+}
+
 function shouldRenderTransientThinkingSegment(part: Extract<AssistantRenderPart, { kind: "thinking" }>) {
-  return !!part.active || (!shouldHideThinkingBlocks() && part.content.trim().length > 0);
+  return !!part.active || (!shouldHideThinkingBlocks() && livePartHasContent(part));
 }
 
 function shouldShowInlineThinkingContent(options: { active?: boolean; content: string; expanded: boolean }) {
@@ -1131,7 +1183,138 @@ function buildGroupedMessages(hiddenToolCallMatchState: ToolCallMatchState): Mes
     .filter((group) => group.items.length > 0);
 }
 
-const baseGroupedMessages = computed<MessageGroup[]>(() => buildGroupedMessages(activeToolCallMatchState.value));
+// -- Group identity stabilization --
+// buildGroupedMessages() creates fresh group objects on every run, which would
+// defeat the template's v-memo (it compares the group by reference). Reusing
+// the previous group object whenever a group is provably unchanged lets v-memo
+// skip re-rendering untouched history. Equality is conservative: any field the
+// grouped render reads must match by reference, including the tool outputs the
+// group's segments resolve through toolOutputMap — otherwise fall back to the
+// fresh object (same behavior as before this optimization).
+
+interface GroupStabilizationCache {
+  groups: MessageGroup[];
+  toolOutputs: Record<string, string>;
+  toolImages: Record<string, ImageAttachment[]>;
+}
+
+function toolCallInfoListEqual(a: ToolCallInfo[] | undefined, b: ToolCallInfo[] | undefined): boolean {
+  if (a === b) return true;
+  if (!a || !b || a.length !== b.length) return false;
+  for (let index = 0; index < a.length; index += 1) {
+    if (a[index] !== b[index]) return false;
+  }
+  return true;
+}
+
+function chatMessageListEqual(a: ChatMessage[], b: ChatMessage[]): boolean {
+  if (a === b) return true;
+  if (a.length !== b.length) return false;
+  for (let index = 0; index < a.length; index += 1) {
+    if (a[index] !== b[index]) return false;
+  }
+  return true;
+}
+
+function renderItemEqual(a: MessageRenderItem, b: MessageRenderItem): boolean {
+  return a.id === b.id
+    && a.order === b.order
+    && a.message === b.message
+    && a.hidden === b.hidden
+    && chatMessageListEqual(a.attachedKnowledgeProposals, b.attachedKnowledgeProposals)
+    && hasExplicitDisplayToolCalls(a) === hasExplicitDisplayToolCalls(b)
+    && toolCallInfoListEqual(a.displayToolCalls, b.displayToolCalls)
+    && toolCallInfoListEqual(a.displayToolCallsBeforeContent, b.displayToolCallsBeforeContent)
+    && toolCallInfoListEqual(a.displayToolCallsAfterContent, b.displayToolCallsAfterContent);
+}
+
+function messageGroupEqual(a: MessageGroup, b: MessageGroup): boolean {
+  if (a.id !== b.id || a.role !== b.role || a.items.length !== b.items.length) return false;
+  for (let index = 0; index < a.items.length; index += 1) {
+    if (!renderItemEqual(a.items[index]!, b.items[index]!)) return false;
+  }
+  return true;
+}
+
+function toolCallOutputsEqualForInfo(
+  toolCall: ToolCallInfo,
+  previousOutputs: Record<string, string>,
+  nextOutputs: Record<string, string>,
+  previousImages: Record<string, ImageAttachment[]>,
+  nextImages: Record<string, ImageAttachment[]>,
+): boolean {
+  if (previousOutputs[toolCall.id] !== nextOutputs[toolCall.id]) return false;
+  if (previousImages[toolCall.id] !== nextImages[toolCall.id]) return false;
+  for (const nestedToolCall of toolCall.nestedToolCalls ?? []) {
+    if (!toolCallOutputsEqualForInfo(nestedToolCall, previousOutputs, nextOutputs, previousImages, nextImages)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function renderItemToolInfosForOutputComparison(item: MessageRenderItem): ToolCallInfo[] {
+  const infos: ToolCallInfo[] = [];
+  if (item.displayToolCalls) infos.push(...item.displayToolCalls);
+  if (item.displayToolCallsBeforeContent) infos.push(...item.displayToolCallsBeforeContent);
+  if (item.displayToolCallsAfterContent) infos.push(...item.displayToolCallsAfterContent);
+  const messageInfos = toolCallInfosForMessage(item.message);
+  if (messageInfos) infos.push(...messageInfos);
+  return infos;
+}
+
+function messageGroupOutputsEqual(
+  group: MessageGroup,
+  previousOutputs: Record<string, string>,
+  nextOutputs: Record<string, string>,
+  previousImages: Record<string, ImageAttachment[]>,
+  nextImages: Record<string, ImageAttachment[]>,
+): boolean {
+  for (const item of group.items) {
+    for (const toolCall of renderItemToolInfosForOutputComparison(item)) {
+      if (!toolCallOutputsEqualForInfo(toolCall, previousOutputs, nextOutputs, previousImages, nextImages)) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+function stabilizeGroupedMessages(
+  nextGroups: MessageGroup[],
+  cache: { current: GroupStabilizationCache | null },
+): MessageGroup[] {
+  const outputs = toolOutputMap.value;
+  const images = toolOutputImageMap.value;
+  const previous = cache.current;
+  let result = nextGroups;
+  if (previous) {
+    const outputsUnchanged = previous.toolOutputs === outputs && previous.toolImages === images;
+    const previousById = new Map(previous.groups.map((group) => [group.id, group]));
+    result = nextGroups.map((group) => {
+      const previousGroup = previousById.get(group.id);
+      if (!previousGroup || !messageGroupEqual(previousGroup, group)) return group;
+      if (
+        !outputsUnchanged
+        && !messageGroupOutputsEqual(group, previous.toolOutputs, outputs, previous.toolImages, images)
+      ) {
+        return group;
+      }
+      return previousGroup;
+    });
+  }
+  cache.current = { groups: result, toolOutputs: outputs, toolImages: images };
+  return result;
+}
+
+const baseGroupedMessagesStabilization: { current: GroupStabilizationCache | null } = { current: null };
+const historyGroupedMessagesStabilization: { current: GroupStabilizationCache | null } = { current: null };
+
+const baseGroupedMessages = computed<MessageGroup[]>(() =>
+  stabilizeGroupedMessages(
+    buildGroupedMessages(activeToolCallMatchState.value),
+    baseGroupedMessagesStabilization,
+  ));
 
 const shouldPromoteHistoryToolCalls = computed(
   () => !!toolCallHandoff.value || props.activeToolCalls.length > 0,
@@ -1213,27 +1396,29 @@ const shouldHidePromotedHistoryToolCalls = computed(() =>
   && shouldKeepPromotedHistoryToolCallsInTransient.value,
 );
 
-watch(shouldHidePromotedHistoryToolCalls, (next, previous) => {
-  traceToolLayoutChange("promotedHistoryToolCallsVisibilityChanged", {
-    previous,
-    next,
-    promotedToolCallCount: promotableHistoryToolCalls.value.toolCalls.length,
-    promotedToolCallIds: promotableHistoryToolCalls.value.toolCalls.map((toolCall) => toolCall.id),
-    keepPromotedInTransient: shouldKeepPromotedHistoryToolCallsInTransient.value,
+if (transcriptTraceWatchEnabled("promotedHistoryToolCallsVisibilityChanged")) {
+  watch(shouldHidePromotedHistoryToolCalls, (next, previous) => {
+    traceToolLayoutChange("promotedHistoryToolCallsVisibilityChanged", {
+      previous,
+      next,
+      promotedToolCallCount: promotableHistoryToolCalls.value.toolCalls.length,
+      promotedToolCallIds: promotableHistoryToolCalls.value.toolCalls.map((toolCall) => toolCall.id),
+      keepPromotedInTransient: shouldKeepPromotedHistoryToolCallsInTransient.value,
+    });
+    traceToolCollapse("promotedHistoryToolCallsVisibilityChanged", {
+      previous,
+      next,
+      promotedToolCallCount: promotableHistoryToolCalls.value.toolCalls.length,
+      promotedToolCallIds: promotableHistoryToolCalls.value.toolCalls.map((toolCall) => toolCall.id),
+      activeToolCallCount: props.activeToolCalls.length,
+      activeToolCallIds: props.activeToolCalls.map((toolCall) => toolCall.id),
+      hasHandoff: !!toolCallHandoff.value,
+      handoffCollapseArmed: toolCallHandoff.value?.collapseArmed ?? false,
+      keepPromotedInTransient: shouldKeepPromotedHistoryToolCallsInTransient.value,
+      isStreaming: props.isStreaming,
+    });
   });
-  traceToolCollapse("promotedHistoryToolCallsVisibilityChanged", {
-    previous,
-    next,
-    promotedToolCallCount: promotableHistoryToolCalls.value.toolCalls.length,
-    promotedToolCallIds: promotableHistoryToolCalls.value.toolCalls.map((toolCall) => toolCall.id),
-    activeToolCallCount: props.activeToolCalls.length,
-    activeToolCallIds: props.activeToolCalls.map((toolCall) => toolCall.id),
-    hasHandoff: !!toolCallHandoff.value,
-    handoffCollapseArmed: toolCallHandoff.value?.collapseArmed ?? false,
-    keepPromotedInTransient: shouldKeepPromotedHistoryToolCallsInTransient.value,
-    isStreaming: props.isStreaming,
-  });
-});
+}
 
 // Fail-open: only hide promoted history tool calls that the transient region
 // actually renders this tick. Anything transient drops stays in history, so the
@@ -1260,7 +1445,19 @@ const historyHiddenToolCallMatchState = computed<ToolCallMatchState>(() => {
   );
 });
 
-const groupedMessages = computed<MessageGroup[]>(() => buildGroupedMessages(historyHiddenToolCallMatchState.value));
+const groupedMessages = computed<MessageGroup[]>(() => {
+  const hiddenMatchState = historyHiddenToolCallMatchState.value;
+  // Outside an active promoted-tool window the hidden state IS the active
+  // match state, so the base grouping already answers this — skip the second
+  // full O(messages) rebuild.
+  if (hiddenMatchState === activeToolCallMatchState.value) {
+    return baseGroupedMessages.value;
+  }
+  return stabilizeGroupedMessages(
+    buildGroupedMessages(hiddenMatchState),
+    historyGroupedMessagesStabilization,
+  );
+});
 
 const shouldRenderPromotedHistoryToolCallsInTransient = computed(() =>
   promotableHistoryToolCalls.value.toolCalls.length > 0
@@ -1336,36 +1533,40 @@ const transientToolCallsCollapseEnabled = computed(
   () => !!toolCallHandoff.value?.collapseArmed && transientToolCallsCanCollapse.value,
 );
 
-watch(promotableHistoryToolCalls, (nextState, previousState) => {
-  traceToolLayoutChange("promotableHistoryToolCallsChanged", {
-    previousItemCount: previousState?.itemIds.size ?? 0,
-    nextItemCount: nextState.itemIds.size,
-    nextToolCallCount: nextState.toolCalls.length,
-    nextToolCallIds: Array.from(nextState.toolCallIds),
+if (transcriptTraceWatchEnabled("promotableHistoryToolCallsChanged")) {
+  watch(promotableHistoryToolCalls, (nextState, previousState) => {
+    traceToolLayoutChange("promotableHistoryToolCallsChanged", {
+      previousItemCount: previousState?.itemIds.size ?? 0,
+      nextItemCount: nextState.itemIds.size,
+      nextToolCallCount: nextState.toolCalls.length,
+      nextToolCallIds: Array.from(nextState.toolCallIds),
+    });
+    traceToolCollapse("promotableHistoryToolCallsChanged", {
+      previousItemCount: previousState?.itemIds.size ?? 0,
+      nextItemCount: nextState.itemIds.size,
+      nextToolCallCount: nextState.toolCalls.length,
+      nextToolCallIds: Array.from(nextState.toolCallIds),
+      hasHandoff: !!toolCallHandoff.value,
+    });
   });
-  traceToolCollapse("promotableHistoryToolCallsChanged", {
-    previousItemCount: previousState?.itemIds.size ?? 0,
-    nextItemCount: nextState.itemIds.size,
-    nextToolCallCount: nextState.toolCalls.length,
-    nextToolCallIds: Array.from(nextState.toolCallIds),
-    hasHandoff: !!toolCallHandoff.value,
-  });
-});
+}
 
-watch(transientToolCallsCollapseEnabled, (enabled, previousEnabled) => {
-  traceToolLayoutChange("transientToolCallsCollapseEnabledChanged", {
-    previous: previousEnabled,
-    next: enabled,
-    transientToolCallCount: transientToolCalls.value.length,
-    transientToolCallIds: transientToolCalls.value.map((toolCall) => toolCall.id),
+if (transcriptTraceWatchEnabled("transientToolCallsCollapseEnabledChanged")) {
+  watch(transientToolCallsCollapseEnabled, (enabled, previousEnabled) => {
+    traceToolLayoutChange("transientToolCallsCollapseEnabledChanged", {
+      previous: previousEnabled,
+      next: enabled,
+      transientToolCallCount: transientToolCalls.value.length,
+      transientToolCallIds: transientToolCalls.value.map((toolCall) => toolCall.id),
+    });
+    traceToolCollapse("transientToolCallsCollapseEnabledChanged", {
+      previous: previousEnabled,
+      next: enabled,
+      transientToolCallCount: transientToolCalls.value.length,
+      hasHandoff: !!toolCallHandoff.value,
+    });
   });
-  traceToolCollapse("transientToolCallsCollapseEnabledChanged", {
-    previous: previousEnabled,
-    next: enabled,
-    transientToolCallCount: transientToolCalls.value.length,
-    hasHandoff: !!toolCallHandoff.value,
-  });
-});
+}
 
 function onTransientToolCallsCollapseFinished() {
   if (!toolCallHandoff.value?.collapseArmed) return;
@@ -1437,7 +1638,7 @@ const canonicalLiveRenderParts = computed(() => {
 const hasVisibleCompletedThinkingContent = computed(() =>
   !shouldHideThinkingBlocks()
   && canonicalLiveRenderParts.value.some((part) =>
-    part.kind === "thinking" && !part.active && part.content.trim(),
+    part.kind === "thinking" && !part.active && livePartHasContent(part),
   ),
 );
 const hasLiveToolCalls = computed(() => props.activeToolCalls.length > 0);
@@ -1478,32 +1679,34 @@ const hasTransientAssistantMessage = computed(
     || hasStandaloneCompactingPlaceholder.value,
 );
 
-watch(
-  () => `${Number(isStandaloneWaitingPlaceholder.value)}:${Number(isToolWaitingForResponse.value)}:${Number(isToolWaitingRowVisible.value)}:${Number(isToolWaitingStatusVisible.value)}:${transientToolCalls.value.length}`,
-  (next, previous) => {
-    traceToolLayoutChange("waitingLayoutStateChanged", {
-      previous,
-      next,
-      standaloneWaiting: isStandaloneWaitingPlaceholder.value,
-      toolWaiting: isToolWaitingForResponse.value,
-      toolWaitingRowVisible: isToolWaitingRowVisible.value,
-      toolWaitingStatusVisible: isToolWaitingStatusVisible.value,
-      transientToolCallCount: transientToolCalls.value.length,
-    });
-    traceToolCollapse("waitingLayoutStateChanged", {
-      previous,
-      next,
-      standaloneWaiting: isStandaloneWaitingPlaceholder.value,
-      toolWaiting: isToolWaitingForResponse.value,
-      toolWaitingRowVisible: isToolWaitingRowVisible.value,
-      toolWaitingStatusVisible: isToolWaitingStatusVisible.value,
-      transientToolCallCount: transientToolCalls.value.length,
-      hasHandoff: !!toolCallHandoff.value,
-      streamingTextLen: props.streamingText.length,
-      isStreaming: props.isStreaming,
-    });
-  },
-);
+if (transcriptTraceWatchEnabled("waitingLayoutStateChanged")) {
+  watch(
+    () => `${Number(isStandaloneWaitingPlaceholder.value)}:${Number(isToolWaitingForResponse.value)}:${Number(isToolWaitingRowVisible.value)}:${Number(isToolWaitingStatusVisible.value)}:${transientToolCalls.value.length}`,
+    (next, previous) => {
+      traceToolLayoutChange("waitingLayoutStateChanged", {
+        previous,
+        next,
+        standaloneWaiting: isStandaloneWaitingPlaceholder.value,
+        toolWaiting: isToolWaitingForResponse.value,
+        toolWaitingRowVisible: isToolWaitingRowVisible.value,
+        toolWaitingStatusVisible: isToolWaitingStatusVisible.value,
+        transientToolCallCount: transientToolCalls.value.length,
+      });
+      traceToolCollapse("waitingLayoutStateChanged", {
+        previous,
+        next,
+        standaloneWaiting: isStandaloneWaitingPlaceholder.value,
+        toolWaiting: isToolWaitingForResponse.value,
+        toolWaitingRowVisible: isToolWaitingRowVisible.value,
+        toolWaitingStatusVisible: isToolWaitingStatusVisible.value,
+        transientToolCallCount: transientToolCalls.value.length,
+        hasHandoff: !!toolCallHandoff.value,
+        streamingTextLen: props.streamingText.length,
+        isStreaming: props.isStreaming,
+      });
+    },
+  );
+}
 
 const isStreamingContinuation = computed(() => {
   const groups = groupedMessages.value;
@@ -1555,31 +1758,33 @@ function pendingContinuationSegmentSnapshot() {
   };
 }
 
-watch(
-  () => Array.from(pendingContinuationToolItemIds.value).join("\u241f"),
-  (next, previous) => {
-    const snapshot = pendingContinuationSegmentSnapshot();
-    traceToolLayoutChange("pendingContinuationToolItemIdsChanged", {
-      previous: previous ? previous.split("\u241f") : [],
-      next: next ? next.split("\u241f") : [],
-      lastGroupRole: snapshot.lastGroupRole,
-      historySegments: snapshot.segments,
-    });
-    traceToolCollapse("pendingContinuationToolItemIdsChanged", {
-      previous: previous ? previous.split("\u241f") : [],
-      next: next ? next.split("\u241f") : [],
-      isStreaming: props.isStreaming,
-      hasTransientAssistantMessage: hasTransientAssistantMessage.value,
-      activeToolCallCount: props.activeToolCalls.length,
-      activeToolCallIds: props.activeToolCalls.map((toolCall) => toolCall.id),
-      hasHandoff: !!toolCallHandoff.value,
-      handoffCollapseArmed: toolCallHandoff.value?.collapseArmed ?? false,
-      handoffCollapseFinished: toolCallHandoff.value?.collapseFinished ?? false,
-      lastGroupRole: snapshot.lastGroupRole,
-      historySegments: snapshot.segments,
-    });
-  },
-);
+if (transcriptTraceWatchEnabled("pendingContinuationToolItemIdsChanged")) {
+  watch(
+    () => Array.from(pendingContinuationToolItemIds.value).join("\u241f"),
+    (next, previous) => {
+      const snapshot = pendingContinuationSegmentSnapshot();
+      traceToolLayoutChange("pendingContinuationToolItemIdsChanged", {
+        previous: previous ? previous.split("\u241f") : [],
+        next: next ? next.split("\u241f") : [],
+        lastGroupRole: snapshot.lastGroupRole,
+        historySegments: snapshot.segments,
+      });
+      traceToolCollapse("pendingContinuationToolItemIdsChanged", {
+        previous: previous ? previous.split("\u241f") : [],
+        next: next ? next.split("\u241f") : [],
+        isStreaming: props.isStreaming,
+        hasTransientAssistantMessage: hasTransientAssistantMessage.value,
+        activeToolCallCount: props.activeToolCalls.length,
+        activeToolCallIds: props.activeToolCalls.map((toolCall) => toolCall.id),
+        hasHandoff: !!toolCallHandoff.value,
+        handoffCollapseArmed: toolCallHandoff.value?.collapseArmed ?? false,
+        handoffCollapseFinished: toolCallHandoff.value?.collapseFinished ?? false,
+        lastGroupRole: snapshot.lastGroupRole,
+        historySegments: snapshot.segments,
+      });
+    },
+  );
+}
 
 const nonCollapsibleToolItemIds = computed(() => {
   return new Set(pendingContinuationToolItemIds.value);
@@ -1618,7 +1823,14 @@ type TransientRenderSegment =
       animateCollapseOnMount: boolean;
     }
   | { type: "waiting"; key: string; label: string }
-  | { type: "content"; key: string; part: AssistantRenderPart; content: string };
+  | {
+      type: "content";
+      key: string;
+      part: AssistantRenderPart;
+      content: string;
+      stream?: StreamingTextSource | null;
+      streamInitial?: string;
+    };
 
 function renderPartsForMessage(item: MessageRenderItem): AssistantRenderPart[] {
   const hasToolFilter = hasExplicitDisplayToolCalls(item) || !!toolCallInfosForMessage(item.message);
@@ -1777,7 +1989,7 @@ function historyRenderSegments(item: MessageRenderItem): HistoryRenderSegment[] 
   return segments;
 }
 
-function historyRenderSegmentsForGroup(group: MessageGroup): HistoryRenderSegment[] {
+function buildHistoryRenderSegmentsForGroup(group: MessageGroup): HistoryRenderSegment[] {
   if (group.role !== "assistant") return [];
 
   const segments: HistoryRenderSegment[] = [];
@@ -1820,6 +2032,28 @@ function historyRenderSegmentsForGroup(group: MessageGroup): HistoryRenderSegmen
   return segments;
 }
 
+/**
+ * Segment construction is O(group items) and the template calls it once per
+ * group per render, so an uncached implementation makes every transcript
+ * re-render O(history). The cache keys off group identity: groupedMessages
+ * is stabilized (groups keep identity while their content is unchanged), so
+ * during streaming this map rebuilds only when history actually changes,
+ * and reactive dependencies (display settings, message data) still register
+ * through the computed.
+ */
+const historyRenderSegmentsByGroup = computed(() => {
+  const map = new Map<MessageGroup, HistoryRenderSegment[]>();
+  for (const group of groupedMessages.value) {
+    if (group.role !== "assistant") continue;
+    map.set(group, buildHistoryRenderSegmentsForGroup(group));
+  }
+  return map;
+});
+
+function historyRenderSegmentsForGroup(group: MessageGroup): HistoryRenderSegment[] {
+  return historyRenderSegmentsByGroup.value.get(group) ?? buildHistoryRenderSegmentsForGroup(group);
+}
+
 function isToolOnlyMessageGroup(group: MessageGroup) {
   if (group.role !== "assistant") return false;
   const segments = historyRenderSegmentsForGroup(group);
@@ -1851,28 +2085,30 @@ function historyToolSegmentPinnedSnapshot() {
   });
 }
 
-watch(
-  () => JSON.stringify(historyToolSegmentPinnedSnapshot()),
-  (next, previous) => {
-    traceToolLayoutChange("historyToolSegmentPinnedStateChanged", {
-      previous: previous ? JSON.parse(previous) : [],
-      next: next ? JSON.parse(next) : [],
-      pendingItemIds: Array.from(pendingContinuationToolItemIds.value),
-    });
-    traceToolCollapse("historyToolSegmentPinnedStateChanged", {
-      previous: previous ? JSON.parse(previous) : [],
-      next: next ? JSON.parse(next) : [],
-      pendingItemIds: Array.from(pendingContinuationToolItemIds.value),
-      isStreaming: props.isStreaming,
-      hasTransientAssistantMessage: hasTransientAssistantMessage.value,
-      activeToolCallCount: props.activeToolCalls.length,
-      activeToolCallIds: props.activeToolCalls.map((toolCall) => toolCall.id),
-      hasHandoff: !!toolCallHandoff.value,
-      handoffCollapseArmed: toolCallHandoff.value?.collapseArmed ?? false,
-      handoffCollapseFinished: toolCallHandoff.value?.collapseFinished ?? false,
-    });
-  },
-);
+if (transcriptTraceWatchEnabled("historyToolSegmentPinnedStateChanged")) {
+  watch(
+    () => JSON.stringify(historyToolSegmentPinnedSnapshot()),
+    (next, previous) => {
+      traceToolLayoutChange("historyToolSegmentPinnedStateChanged", {
+        previous: previous ? JSON.parse(previous) : [],
+        next: next ? JSON.parse(next) : [],
+        pendingItemIds: Array.from(pendingContinuationToolItemIds.value),
+      });
+      traceToolCollapse("historyToolSegmentPinnedStateChanged", {
+        previous: previous ? JSON.parse(previous) : [],
+        next: next ? JSON.parse(next) : [],
+        pendingItemIds: Array.from(pendingContinuationToolItemIds.value),
+        isStreaming: props.isStreaming,
+        hasTransientAssistantMessage: hasTransientAssistantMessage.value,
+        activeToolCallCount: props.activeToolCalls.length,
+        activeToolCallIds: props.activeToolCalls.map((toolCall) => toolCall.id),
+        hasHandoff: !!toolCallHandoff.value,
+        handoffCollapseArmed: toolCallHandoff.value?.collapseArmed ?? false,
+        handoffCollapseFinished: toolCallHandoff.value?.collapseFinished ?? false,
+      });
+    },
+  );
+}
 
 function historyToolSegmentExpansionSnapshot() {
   return groupedMessages.value.flatMap((group, groupIndex) => {
@@ -1899,29 +2135,31 @@ function historyToolSegmentExpansionSnapshot() {
   });
 }
 
-watch(
-  () => JSON.stringify(historyToolSegmentExpansionSnapshot()),
-  (next, previous) => {
-    traceToolLayoutChange("historyToolSegmentExpansionDecision", {
-      previous: previous ? JSON.parse(previous) : [],
-      next: next ? JSON.parse(next) : [],
-      retainedEntryCount: toolCallMatchEntryCount(retainedCollapsedToolCallMatchState.value),
-    });
-    traceToolCollapse("historyToolSegmentExpansionDecision", {
-      previous: previous ? JSON.parse(previous) : [],
-      next: next ? JSON.parse(next) : [],
-      pendingItemIds: Array.from(pendingContinuationToolItemIds.value),
-      retainedEntryCount: toolCallMatchEntryCount(retainedCollapsedToolCallMatchState.value),
-      isStreaming: props.isStreaming,
-      hasTransientAssistantMessage: hasTransientAssistantMessage.value,
-      activeToolCallCount: props.activeToolCalls.length,
-      activeToolCallIds: props.activeToolCalls.map((toolCall) => toolCall.id),
-      hasHandoff: !!toolCallHandoff.value,
-      handoffCollapseArmed: toolCallHandoff.value?.collapseArmed ?? false,
-      handoffCollapseFinished: toolCallHandoff.value?.collapseFinished ?? false,
-    });
-  },
-);
+if (transcriptTraceWatchEnabled("historyToolSegmentExpansionDecision")) {
+  watch(
+    () => JSON.stringify(historyToolSegmentExpansionSnapshot()),
+    (next, previous) => {
+      traceToolLayoutChange("historyToolSegmentExpansionDecision", {
+        previous: previous ? JSON.parse(previous) : [],
+        next: next ? JSON.parse(next) : [],
+        retainedEntryCount: toolCallMatchEntryCount(retainedCollapsedToolCallMatchState.value),
+      });
+      traceToolCollapse("historyToolSegmentExpansionDecision", {
+        previous: previous ? JSON.parse(previous) : [],
+        next: next ? JSON.parse(next) : [],
+        pendingItemIds: Array.from(pendingContinuationToolItemIds.value),
+        retainedEntryCount: toolCallMatchEntryCount(retainedCollapsedToolCallMatchState.value),
+        isStreaming: props.isStreaming,
+        hasTransientAssistantMessage: hasTransientAssistantMessage.value,
+        activeToolCallCount: props.activeToolCalls.length,
+        activeToolCallIds: props.activeToolCalls.map((toolCall) => toolCall.id),
+        hasHandoff: !!toolCallHandoff.value,
+        handoffCollapseArmed: toolCallHandoff.value?.collapseArmed ?? false,
+        handoffCollapseFinished: toolCallHandoff.value?.collapseFinished ?? false,
+      });
+    },
+  );
+}
 
 const transientRenderSegments = computed<TransientRenderSegment[]>(() => {
   const segments: TransientRenderSegment[] = [];
@@ -1961,14 +2199,48 @@ const transientRenderSegments = computed<TransientRenderSegment[]>(() => {
       });
     } else if (part.kind === "text") {
       flushPendingTools();
-      const content = displayedLiveRenderParts.value.length <= 1 && props.streamingText ? props.streamingText : part.content;
-      if (content) {
+      if (displayedLiveRenderParts.value.length <= 1 && props.typedTextStream && hasVisibleStreamingText.value) {
+        // Single-part rounds render the typewriter's chunk stream: the
+        // animation advances inside the renderer without any growing prop.
         segments.push({
           type: "content",
           key: `transient:${part.id}`,
           part,
-          content,
+          content: "",
+          stream: props.typedTextStream,
+          streamInitial: "",
         });
+      } else if (displayedLiveRenderParts.value.length <= 1 && props.streamingText) {
+        // Legacy string path (embedded panes): throttled typewriter text.
+        segments.push({
+          type: "content",
+          key: `transient:${part.id}`,
+          part,
+          content: props.streamingText,
+        });
+      } else {
+        // Multi-part rounds render the part's chunk stream on top of its
+        // baseline. The segment must exist as soon as the stream does — the
+        // renderer subscribes to growth itself, and this computed only
+        // re-runs on structural changes.
+        const stream = livePartStream(part.id);
+        if (stream) {
+          segments.push({
+            type: "content",
+            key: `transient:${part.id}`,
+            part,
+            content: part.content,
+            stream,
+            streamInitial: part.content,
+          });
+        } else if (part.content) {
+          segments.push({
+            type: "content",
+            key: `transient:${part.id}`,
+            part,
+            content: part.content,
+          });
+        }
       }
     } else if (part.kind === "toolCall") {
       const toolCall = transientById.get(part.toolCall.id) ?? toolCallDisplayForPart(part);
@@ -2247,46 +2519,52 @@ function transcriptBlockOrderState() {
   };
 }
 
-watch(
-  () => JSON.stringify(historyToolBlockOrderState()),
-  (next, previous) => {
-    traceToolCollapse("historyToolBlockOrderChanged", {
-      previous: parseTraceJson(previous),
-      next: parseTraceJson(next),
-      blockOrder: parseTraceJson(next),
-      transcriptOrder: transcriptBlockOrderState(),
-    });
-  },
-  { flush: "post", immediate: true },
-);
+if (transcriptTraceWatchEnabled("historyToolBlockOrderChanged")) {
+  watch(
+    () => JSON.stringify(historyToolBlockOrderState()),
+    (next, previous) => {
+      traceToolCollapse("historyToolBlockOrderChanged", {
+        previous: parseTraceJson(previous),
+        next: parseTraceJson(next),
+        blockOrder: parseTraceJson(next),
+        transcriptOrder: transcriptBlockOrderState(),
+      });
+    },
+    { flush: "post", immediate: true },
+  );
+}
 
-watch(
-  () => JSON.stringify(transientSegmentPaintState()),
-  (next, previous) => {
-    traceToolCollapse("transientRenderSegmentsChanged", {
-      previous: parseTraceJson(previous),
-      next: parseTraceJson(next),
-      transcriptOrder: transcriptBlockOrderState(),
-    });
-  },
-  { flush: "post", immediate: true },
-);
+if (transcriptTraceWatchEnabled("transientRenderSegmentsChanged")) {
+  watch(
+    () => JSON.stringify(transientSegmentPaintState()),
+    (next, previous) => {
+      traceToolCollapse("transientRenderSegmentsChanged", {
+        previous: parseTraceJson(previous),
+        next: parseTraceJson(next),
+        transcriptOrder: transcriptBlockOrderState(),
+      });
+    },
+    { flush: "post", immediate: true },
+  );
+}
 
-watch(
-  () => JSON.stringify(transcriptBlockOrderState()),
-  (next, previous) => {
-    const nextState = parseTraceJson(next);
-    traceToolLayoutChange("transcriptBlockOrderChanged", {
-      previous: parseTraceJson(previous),
-      next: nextState,
-    });
-    traceToolCollapse("transcriptBlockOrderChanged", {
-      previous: parseTraceJson(previous),
-      next: nextState,
-    });
-  },
-  { flush: "post", immediate: true },
-);
+if (transcriptTraceWatchEnabled("transcriptBlockOrderChanged")) {
+  watch(
+    () => JSON.stringify(transcriptBlockOrderState()),
+    (next, previous) => {
+      const nextState = parseTraceJson(next);
+      traceToolLayoutChange("transcriptBlockOrderChanged", {
+        previous: parseTraceJson(previous),
+        next: nextState,
+      });
+      traceToolCollapse("transcriptBlockOrderChanged", {
+        previous: parseTraceJson(previous),
+        next: nextState,
+      });
+    },
+    { flush: "post", immediate: true },
+  );
+}
 
 function hasTransientStatusPaintTarget() {
   return hasVisibleActiveThinkingBlock.value
@@ -2330,26 +2608,28 @@ function traceTransientStatusPaint(reason: string, detail: Record<string, unknow
   });
 }
 
-watch(
-  () => [
-    Number(hasVisibleActiveThinkingBlock.value),
-    Number(props.isThinking),
-    Number(isStandaloneWaitingPlaceholder.value),
-    Number(hasStandaloneCompactingPlaceholder.value),
-    Number(isToolWaitingForResponse.value),
-    Number(isToolWaitingRowVisible.value),
-    Number(isToolWaitingStatusVisible.value),
-    props.activeToolCalls.map((toolCall) => `${toolCall.id}:${toolCall.status}`).join(","),
-    transientSegmentPaintState().map((segment) => JSON.stringify(segment)).join("|"),
-  ].join("::"),
-  (next, previous) => {
-    traceTransientStatusPaint("transientStatusPaintStateChanged", {
-      previous,
-      next,
-    });
-  },
-  { flush: "post", immediate: true },
-);
+if (isLayoutDiagnosticsEnabled()) {
+  watch(
+    () => [
+      Number(hasVisibleActiveThinkingBlock.value),
+      Number(props.isThinking),
+      Number(isStandaloneWaitingPlaceholder.value),
+      Number(hasStandaloneCompactingPlaceholder.value),
+      Number(isToolWaitingForResponse.value),
+      Number(isToolWaitingRowVisible.value),
+      Number(isToolWaitingStatusVisible.value),
+      props.activeToolCalls.map((toolCall) => `${toolCall.id}:${toolCall.status}`).join(","),
+      transientSegmentPaintState().map((segment) => JSON.stringify(segment)).join("|"),
+    ].join("::"),
+    (next, previous) => {
+      traceTransientStatusPaint("transientStatusPaintStateChanged", {
+        previous,
+        next,
+      });
+    },
+    { flush: "post", immediate: true },
+  );
+}
 
 function formatThoughtSummary(duration?: number) {
   if (duration && duration > 0) {
@@ -2921,12 +3201,14 @@ function openImage(src: string) {
                   </div>
                 </div>
 
-                <MarkdownRenderer
+                <StreamingMarkdownRenderer
                   v-else-if="segment.type === 'content'"
                   data-render-part-kind="text"
                   data-render-part-scope="transient"
                   :data-render-part-key="segment.key"
-                  :content="segment.content"
+                  :content="segment.stream ? undefined : segment.content"
+                  :stream="segment.stream"
+                  :stream-initial="segment.streamInitial"
                   :unity-preview-state-scope="markdownUnityPreviewStateScope(segment)"
                   cursor
                   enable-file-refs
@@ -3018,6 +3300,17 @@ function openImage(src: string) {
   .chat-transcript-message.is-session {
     content-visibility: auto;
     contain-intrinsic-size: auto 180px;
+  }
+
+  /* Freshly inserted messages have no last-remembered size, so their first
+     frame lays out at the 180px placeholder. At stream end the transient
+     block (real height) is removed in the same patch, which collapses
+     scrollHeight for one frame, clamps scrollTop, and flashes the viewport.
+     Keep the bottom three messages always laid out: the swap happens at the
+     tail, and viewport-adjacent messages gain nothing from being skippable
+     (-n+3 covers history+transient coexistence and the pending-user swap). */
+  .chat-transcript-content > .chat-transcript-message.is-session:nth-last-child(-n+3 of .chat-transcript-message) {
+    content-visibility: visible;
   }
 
   .chat-transcript-scroll.is-session.is-session-restore-stabilizing .chat-transcript-message.is-session {

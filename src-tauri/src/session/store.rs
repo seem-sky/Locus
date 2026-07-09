@@ -9,7 +9,8 @@ use uuid::Uuid;
 
 use super::models::{
     AssistantRenderPart, ChatMessage, KnowledgeProposal, KnowledgeProposalStatus, MemoryProposal,
-    MessageRole, SessionDetail, SessionEventRecord, SessionRunSummary, SessionRuntimeSnapshot,
+    MessageRole, PlanModeState, SessionDetail, SessionEventRecord, SessionRunSummary,
+    SessionRuntimeSnapshot,
     SessionSummary, TodoItem, TodoSnapshot, ToolCallInfo,
 };
 use super::runtime::SessionRuntimeRegistry;
@@ -76,7 +77,7 @@ const RUN_STATUS_CANCELLING: &str = "cancelling";
 const RUN_STATUS_DONE: &str = "done";
 const RUN_STATUS_CANCELLED: &str = "cancelled";
 const RUN_STATUS_ERROR: &str = "error";
-const CONTEXT_HANDOFF_MARKER: &str = "## Context Handoff";
+use crate::compact::CONTEXT_HANDOFF_MARKER;
 const CONTEXT_COMPACTED_DISPLAY_MARKER: &str = "## Context Handoff\n\nContext compacted.";
 
 impl SessionEventWriter {
@@ -511,7 +512,7 @@ impl SessionStore {
     ///
     /// Do not rely on ad-hoc `ALTER TABLE ... .ok()` fallbacks or silent
     /// schema drift. Session data must migrate deterministically.
-    const SCHEMA_VERSION: i32 = 19;
+    const SCHEMA_VERSION: i32 = 20;
 
     pub fn new(data_dir: &Path) -> Result<Self, String> {
         Self::new_with_tool_results_root(data_dir, data_dir.join("temp").join("tool-results"))
@@ -720,7 +721,23 @@ impl SessionStore {
             })?;
         }
 
-        debug_assert_eq!(Self::SCHEMA_VERSION, 19, "add a new migration block above");
+        if current < 20 {
+            Self::migrate(conn, 20, "add sticky plan mode state to sessions", |conn| {
+                if !Self::table_has_column(conn, "sessions", "plan_mode_active")? {
+                    conn.execute_batch(
+                        "ALTER TABLE sessions ADD COLUMN plan_mode_active INTEGER NOT NULL DEFAULT 0;",
+                    )?;
+                }
+                if !Self::table_has_column(conn, "sessions", "plan_exited_pending_notice")? {
+                    conn.execute_batch(
+                        "ALTER TABLE sessions ADD COLUMN plan_exited_pending_notice INTEGER NOT NULL DEFAULT 0;",
+                    )?;
+                }
+                Ok(())
+            })?;
+        }
+
+        debug_assert_eq!(Self::SCHEMA_VERSION, 20, "add a new migration block above");
         Ok(())
     }
 
@@ -736,6 +753,8 @@ impl SessionStore {
                 archived_at INTEGER,
                 latest_completed_run_id TEXT,
                 latest_todo_run_id TEXT,
+                plan_mode_active INTEGER NOT NULL DEFAULT 0,
+                plan_exited_pending_notice INTEGER NOT NULL DEFAULT 0,
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
             );
@@ -1953,6 +1972,73 @@ impl SessionStore {
             }
         }
         Ok(sessions)
+    }
+
+    /// Sticky plan-mode state for a session. `active` gates the read-only
+    /// enforcement, the plan reminder injection and the exit_plan_mode tool;
+    /// `exited_pending_notice` marks that the next persisted user message
+    /// should carry the one-shot "exited plan mode" reminder.
+    pub fn get_plan_mode_state(&self, session_id: &str) -> Result<PlanModeState, String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        conn.query_row(
+            "SELECT plan_mode_active, plan_exited_pending_notice FROM sessions WHERE id = ?1",
+            params![session_id],
+            |row| {
+                Ok(PlanModeState {
+                    active: row.get::<_, i64>(0)? != 0,
+                    exited_pending_notice: row.get::<_, i64>(1)? != 0,
+                })
+            },
+        )
+        .map_err(|e| format!("Failed to read plan mode state: {}", e))
+    }
+
+    /// Flips the sticky plan-mode flag. Turning it off after it was on arms
+    /// the one-shot exited notice so the next user message tells the model
+    /// it may edit again (and where the plan file lives).
+    pub fn set_plan_mode_active(
+        &self,
+        session_id: &str,
+        active: bool,
+    ) -> Result<PlanModeState, String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let was_active: i64 = conn
+            .query_row(
+                "SELECT plan_mode_active FROM sessions WHERE id = ?1",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("Failed to read plan mode state: {}", e))?;
+        let exited_notice = if active { 0 } else { was_active };
+        conn.execute(
+            "UPDATE sessions SET plan_mode_active = ?1, plan_exited_pending_notice = ?2, updated_at = ?3 WHERE id = ?4",
+            params![active as i64, exited_notice, Self::now_ts(), session_id],
+        )
+        .map_err(|e| format!("Failed to update plan mode state: {}", e))?;
+        Ok(PlanModeState {
+            active,
+            exited_pending_notice: exited_notice != 0,
+        })
+    }
+
+    /// Reads and clears the one-shot exited-plan-mode notice.
+    pub fn take_plan_exited_notice(&self, session_id: &str) -> Result<bool, String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let pending: i64 = conn
+            .query_row(
+                "SELECT plan_exited_pending_notice FROM sessions WHERE id = ?1",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("Failed to read plan exited notice: {}", e))?;
+        if pending != 0 {
+            conn.execute(
+                "UPDATE sessions SET plan_exited_pending_notice = 0 WHERE id = ?1",
+                params![session_id],
+            )
+            .map_err(|e| format!("Failed to clear plan exited notice: {}", e))?;
+        }
+        Ok(pending != 0)
     }
 
     pub fn load_session(&self, id: &str) -> Result<SessionDetail, String> {
@@ -3580,11 +3666,15 @@ impl SessionStore {
         })
     }
 
+    /// `retained_user_budget_tokens` comes from
+    /// `compact::compact_user_message_token_budget(context_limit)` so the
+    /// verbatim retention scales with the caller's context window.
     pub fn compact_messages(
         &self,
         session_id: &str,
         summary_msg: &ChatMessage,
         keep_from_message_id: &str,
+        retained_user_budget_tokens: u32,
     ) -> Result<(u32, u32), String> {
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
 
@@ -3630,7 +3720,7 @@ impl SessionStore {
         let retained_user_ids = compact::select_recent_user_message_ids_for_compact_prompt(
             &prompt_messages,
             prompt_messages.len(),
-            compact::compact_user_message_token_budget(),
+            retained_user_budget_tokens,
         );
 
         conn.execute(
@@ -4271,6 +4361,7 @@ mod tests {
         RUN_STATUS_CANCELLING,
         RUN_STATUS_DONE,
     };
+    use crate::compact;
     use crate::session::models::{
         ChatMessage, KnowledgeProposalStatus, MessageRole, TodoItem, ToolCallInfo,
     };
@@ -4311,6 +4402,60 @@ mod tests {
                 &KnowledgeProposalStatus::Invalidated,
             )
         );
+    }
+
+    #[test]
+    fn plan_mode_state_toggles_and_arms_one_shot_exited_notice() {
+        let dir = tempdir().expect("create temp dir");
+        let store = SessionStore::new(dir.path()).expect("initialize store");
+        let session_id = store
+            .create_session("plan test", None, None, "chat", Some("dev"))
+            .expect("create session");
+
+        let initial = store
+            .get_plan_mode_state(&session_id)
+            .expect("read initial state");
+        assert!(!initial.active);
+        assert!(!initial.exited_pending_notice);
+
+        store
+            .set_plan_mode_active(&session_id, true)
+            .expect("enter plan mode");
+        let entered = store.get_plan_mode_state(&session_id).expect("read state");
+        assert!(entered.active);
+        assert!(!entered.exited_pending_notice);
+
+        // Re-entering while already active must not arm the notice.
+        store
+            .set_plan_mode_active(&session_id, true)
+            .expect("re-enter plan mode");
+        assert!(!store
+            .get_plan_mode_state(&session_id)
+            .expect("read state")
+            .exited_pending_notice);
+
+        store
+            .set_plan_mode_active(&session_id, false)
+            .expect("exit plan mode");
+        let exited = store.get_plan_mode_state(&session_id).expect("read state");
+        assert!(!exited.active);
+        assert!(exited.exited_pending_notice);
+
+        // The notice is one-shot.
+        assert!(store
+            .take_plan_exited_notice(&session_id)
+            .expect("take notice"));
+        assert!(!store
+            .take_plan_exited_notice(&session_id)
+            .expect("take notice again"));
+
+        // Exiting while already inactive must not re-arm it.
+        store
+            .set_plan_mode_active(&session_id, false)
+            .expect("exit again");
+        assert!(!store
+            .take_plan_exited_notice(&session_id)
+            .expect("no notice"));
     }
 
     #[test]
@@ -6130,7 +6275,12 @@ mod tests {
         };
 
         let (count_before, count_after) = store
-            .compact_messages(&session_id, &summary_msg, latest_user_id)
+            .compact_messages(
+                &session_id,
+                &summary_msg,
+                latest_user_id,
+                compact::compact_user_message_token_budget(0),
+            )
             .expect("compact messages");
         assert_eq!(count_before, 4);
         assert_eq!(count_after, 3);
@@ -6233,7 +6383,12 @@ mod tests {
         };
 
         let (count_before, count_after) = store
-            .compact_messages(&session_id, &summary_msg, latest_user_id)
+            .compact_messages(
+                &session_id,
+                &summary_msg,
+                latest_user_id,
+                compact::compact_user_message_token_budget(0),
+            )
             .expect("compact messages");
         assert_eq!(count_before, 4);
         assert_eq!(count_after, 2);
@@ -6257,6 +6412,72 @@ mod tests {
                 .expect("first prompt user"),
             Some(latest_user_id.to_string())
         );
+    }
+
+    #[test]
+    fn compact_messages_scaled_budget_shrinks_retained_user_set() {
+        let dir = tempdir().expect("create temp dir");
+        let store = SessionStore::new(dir.path()).expect("initialize store");
+        let session_id = store
+            .create_session("Compact Scaled Budget Test", None, None, "chat", None)
+            .expect("create session");
+
+        {
+            let conn = store.conn.lock().expect("lock store connection");
+            // Two ~5k-token user messages: together they fit the legacy 20k
+            // budget but exceed the 8k budget of a 32k window.
+            let sized_user_content = "a".repeat(20_000);
+            for (id, role, content, created_at) in [
+                ("user-1", "user", sized_user_content.as_str(), 100i64),
+                ("assistant-1", "assistant", "回答一", 101i64),
+                ("user-2", "user", sized_user_content.as_str(), 102i64),
+                ("assistant-2", "assistant", "回答二", 103i64),
+            ] {
+                conn.execute(
+                    "INSERT INTO messages (id, session_id, role, content, created_at, prompt_prefix, prompt_suffix, tool_calls, tool_call_id, images, thinking_content, thinking_duration, thinking_signature, metadata_json)
+                     VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)",
+                    params![id, session_id, role, content, created_at],
+                )
+                .expect("insert message");
+            }
+        }
+
+        let summary_msg = ChatMessage {
+            id: "handoff-scaled".to_string(),
+            role: MessageRole::Assistant,
+            content: "## Context Handoff\n\n交接摘要".to_string(),
+            created_at: 103,
+            prompt_prefix: None,
+            prompt_suffix: None,
+            response_id: None,
+            content_order: None,
+            thinking_order: None,
+            tool_calls: None,
+            tool_call_id: None,
+            images: None,
+            asset_refs: None,
+            thinking_content: None,
+            thinking_duration: None,
+            thinking_signature: None,
+            knowledge_proposal: None,
+            render_parts: None,
+        };
+
+        let small_window_budget = compact::compact_user_message_token_budget(32_000);
+        assert_eq!(small_window_budget, 8_000);
+        store
+            .compact_messages(&session_id, &summary_msg, "assistant-2", small_window_budget)
+            .expect("compact messages");
+
+        let prompt_ids = store
+            .get_messages_for_prompt(&session_id)
+            .expect("load prompt messages")
+            .iter()
+            .map(|message| message.id.clone())
+            .collect::<Vec<_>>();
+        // The 8k budget keeps only the latest user message; the legacy 20k
+        // budget would have kept both (as the sibling test above shows).
+        assert_eq!(prompt_ids, vec!["user-2", "handoff-scaled"]);
     }
 
     #[test]
@@ -6306,7 +6527,12 @@ mod tests {
         };
 
         store
-            .compact_messages(&session_id, &summary_msg, "assistant-final")
+            .compact_messages(
+                &session_id,
+                &summary_msg,
+                "assistant-final",
+                compact::compact_user_message_token_budget(0),
+            )
             .expect("compact messages");
 
         let all_messages = store.get_messages(&session_id).expect("load all messages");
@@ -6370,7 +6596,12 @@ mod tests {
             render_parts: None,
         };
         store
-            .compact_messages(&session_id, &first_handoff, "assistant-1")
+            .compact_messages(
+                &session_id,
+                &first_handoff,
+                "assistant-1",
+                compact::compact_user_message_token_budget(0),
+            )
             .expect("first compact");
 
         {
@@ -6410,7 +6641,12 @@ mod tests {
             render_parts: None,
         };
         store
-            .compact_messages(&session_id, &second_handoff, "assistant-2")
+            .compact_messages(
+                &session_id,
+                &second_handoff,
+                "assistant-2",
+                compact::compact_user_message_token_budget(0),
+            )
             .expect("second compact");
 
         let all_messages = store.get_messages(&session_id).expect("load all messages");
@@ -6481,7 +6717,12 @@ mod tests {
             render_parts: None,
         };
         store
-            .compact_messages(&session_id, &first_handoff, "user-2")
+            .compact_messages(
+                &session_id,
+                &first_handoff,
+                "user-2",
+                compact::compact_user_message_token_budget(0),
+            )
             .expect("first compact");
 
         {
@@ -6521,7 +6762,12 @@ mod tests {
             render_parts: None,
         };
         store
-            .compact_messages(&session_id, &second_handoff, "user-3")
+            .compact_messages(
+                &session_id,
+                &second_handoff,
+                "user-3",
+                compact::compact_user_message_token_budget(0),
+            )
             .expect("second compact");
 
         let prompt_messages = store
@@ -6587,7 +6833,12 @@ mod tests {
             render_parts: None,
         };
         store
-            .compact_messages(&session_id, &first_handoff, "user-2")
+            .compact_messages(
+                &session_id,
+                &first_handoff,
+                "user-2",
+                compact::compact_user_message_token_budget(0),
+            )
             .expect("first compact");
 
         let second_handoff = ChatMessage {
@@ -6612,7 +6863,12 @@ mod tests {
             render_parts: None,
         };
         store
-            .compact_messages(&session_id, &second_handoff, "handoff-1")
+            .compact_messages(
+                &session_id,
+                &second_handoff,
+                "handoff-1",
+                compact::compact_user_message_token_budget(0),
+            )
             .expect("second compact");
 
         let all_messages = store.get_messages(&session_id).expect("load all messages");

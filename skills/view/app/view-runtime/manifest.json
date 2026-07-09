@@ -309,7 +309,7 @@
     },
     {
       "path": "src/services/diff.ts",
-      "bytes": 4731
+      "bytes": 5486
     },
     {
       "path": "src/services/refGraph.ts",

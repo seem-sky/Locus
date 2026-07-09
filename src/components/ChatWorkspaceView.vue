@@ -20,6 +20,7 @@ import {
 import ChatView from "./ChatView.vue";
 import ChatSidebarPanel from "./ChatSidebarPanel.vue";
 import ChatProjectViewPanel from "./ChatProjectViewPanel.vue";
+import ThinkingPanel from "./ThinkingPanel.vue";
 
 type ChatLayoutMode = "auto" | "horizontal" | "vertical";
 type ResolvedChatLayoutMode = "horizontal" | "vertical";
@@ -371,17 +372,19 @@ onUnmounted(() => {
       :default-session-panel-collapsed="defaultSessionPanelCollapsed"
       :session-panel-storage-scope="sessionPanelStorageScope"
       :messages="chatStore.messages"
-      :streaming-text="chatStore.streamingText"
+      streaming-text=""
+      :typed-text-stream="chatStore.typedStream"
+      :has-streaming-text="chatStore.hasStreamingText"
       :streaming-text-order="chatStore.streamingTextOrder"
       :is-streaming="chatStore.isStreaming"
       :is-cancelling="chatStore.isCancelling"
       :is-compacting="chatStore.isCompacting"
       :is-thinking="chatStore.isThinking"
-      :has-thinking="chatStore.streamingThinking.length > 0"
-      :thinking-text="chatStore.streamingThinking"
+      :has-thinking="chatStore.hasStreamingThinking"
       :thinking-order="chatStore.thinkingOrder"
       :thinking-duration="chatStore.thinkingDuration"
       :live-render-parts="chatStore.liveRenderParts"
+      :live-part-streams="chatStore.livePartStreams"
       :active-tool-calls="chatStore.activeToolCalls"
       :agents="agentStore.agents"
       :selected-agent-id="agentStore.selectedAgentId"
@@ -449,6 +452,13 @@ onUnmounted(() => {
         :working-dir="projectStore.workingDir"
       />
     </Transition>
+    <ThinkingPanel
+      v-if="active && chatStore.showThinkingPanel"
+      :text="chatStore.thinkingPanelContent"
+      :stream="chatStore.thinkingStream"
+      :is-thinking="chatStore.isThinking && !chatStore.thinkingPanelContent"
+      @close="chatStore.showThinkingPanel = false"
+    />
     <Transition
       :css="false"
       @before-enter="beforeEnterSidebarPanel"

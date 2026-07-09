@@ -339,6 +339,7 @@ pub async fn set_working_dir(
     registry: State<'_, crate::AgentDefRegistryState>,
     app_agent_dir: State<'_, crate::AppAgentDir>,
     config: State<'_, Arc<crate::config::AppConfig>>,
+    local_reference_watcher_state: State<'_, crate::local_docs::LocalReferenceWatcherState>,
     app_handle: AppHandle,
 ) -> Result<String, AppError> {
     let switch_started_at = Instant::now();
@@ -534,6 +535,21 @@ pub async fn set_working_dir(
                 );
             }
         }
+        {
+            let app_handle = app_handle.clone();
+            let working_dir = canonical.clone();
+            let knowledge_index_state = knowledge_index_state.inner().clone();
+            let watcher_state = local_reference_watcher_state.inner().clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                crate::local_docs::restore_live_watchers(
+                    app_handle,
+                    working_dir,
+                    knowledge_index_state,
+                    watcher_state,
+                );
+            });
+        }
+        switch_timer.mark("local_reference_watchers_restore_spawned");
     }
 
     if is_real_switch {
@@ -1473,6 +1489,67 @@ pub async fn set_debug_mode(
 ) -> Result<(), AppError> {
     config.set_debug_enabled(value).map_err(AppError::from)?;
     Ok(())
+}
+
+#[tauri::command]
+pub async fn get_llm_retry_max_attempts(
+    config: State<'_, Arc<crate::config::AppConfig>>,
+) -> Result<u32, AppError> {
+    Ok(config.llm_retry_max_attempts())
+}
+
+/// Persist the automatic LLM retry count (0 = disabled, clamped to 10) and
+/// mirror it into the live `llm::retry` global the transports read.
+#[tauri::command]
+pub async fn set_llm_retry_max_attempts(
+    value: u32,
+    config: State<'_, Arc<crate::config::AppConfig>>,
+) -> Result<u32, AppError> {
+    config
+        .set_llm_retry_max_attempts(value)
+        .map_err(AppError::from)?;
+    crate::llm::retry::set_max_retries(value);
+    Ok(config.llm_retry_max_attempts())
+}
+
+#[tauri::command]
+pub async fn get_subagent_max_depth(
+    config: State<'_, Arc<crate::config::AppConfig>>,
+) -> Result<u32, AppError> {
+    Ok(config.subagent_max_depth())
+}
+
+/// Persist the `task` subagent nesting-depth cap (clamped to 1..=8; 1 means
+/// subagents cannot spawn further subagents).
+#[tauri::command]
+pub async fn set_subagent_max_depth(
+    value: u32,
+    config: State<'_, Arc<crate::config::AppConfig>>,
+) -> Result<u32, AppError> {
+    config
+        .set_subagent_max_depth(value)
+        .map_err(AppError::from)?;
+    Ok(config.subagent_max_depth())
+}
+
+#[tauri::command]
+pub async fn get_subagent_max_concurrent(
+    config: State<'_, Arc<crate::config::AppConfig>>,
+) -> Result<u32, AppError> {
+    Ok(config.subagent_max_concurrent())
+}
+
+/// Persist the concurrent `task` subagent cap per top-level agent tree
+/// (clamped to 1..=16).
+#[tauri::command]
+pub async fn set_subagent_max_concurrent(
+    value: u32,
+    config: State<'_, Arc<crate::config::AppConfig>>,
+) -> Result<u32, AppError> {
+    config
+        .set_subagent_max_concurrent(value)
+        .map_err(AppError::from)?;
+    Ok(config.subagent_max_concurrent())
 }
 
 #[tauri::command]
